@@ -149,8 +149,8 @@ export class ToolPermissionResolver {
 	/**
 	 * Build allowed tools list for GitHub-triggered sessions.
 	 *
-	 * GitHub `@mentions` target a single repository via a single PR, so this
-	 * does not perform multi-repo union — it expects exactly one repo. When
+	 * Accepts one or more repositories. Multi-repo issue work uses the union of
+	 * each repository's resolved tools, matching Linear multi-repo behavior. When
 	 * the workspace defines `githubAllowedTools` it is used as the global
 	 * default for resolution (in place of `linearAllowedTools`); otherwise
 	 * we fall back to `GITHUB_DEFAULT_ALLOWED_TOOLS`. Per-repository
@@ -158,7 +158,7 @@ export class ToolPermissionResolver {
 	 * as Linear, just with a different platform default at the bottom.
 	 */
 	public buildGithubAllowedTools(
-		repository: RepositoryConfig,
+		repository: RepositoryConfig | RepositoryConfig[],
 		promptType?: PromptType,
 	): string[] {
 		const platformDefault =

@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -208,10 +208,15 @@ type GitHubIssueWorkItemSession = {
 	workItemId: string;
 	sessionId: string;
 	repository: RepositoryConfig;
+	repositories: RepositoryConfig[];
 	repositoryFullName: string;
+	targetRepositoryFullNames: string[];
 	issueNumber: number;
 	issueIdentifier: string;
 	branchName: string;
+	branchNames: Record<string, string>;
+	prUrls: string[];
+	error?: string;
 	runnerType: RunnerType;
 	issue: IssueMinimal;
 	status: "starting" | "in_progress" | "awaiting_review" | "failed" | "stopped";
@@ -240,6 +245,7 @@ export class EdgeWorker extends EventEmitter {
 	>();
 	private processedGitHubIssueCommentIds = new Set<string>();
 	private gitHubAppTokenProvider: GitHubAppTokenProvider | null = null; // Self-hosted GitHub App token minting
+	private gitHubCliTokenCache?: { token: string; expiresAt: number };
 	private gitLabEventTransport: GitLabEventTransport | null = null; // GitLab event transport for forwarded GitLab webhooks
 	private slackEventTransport: SlackEventTransport | null = null;
 	private chatSessionHandler: ChatSessionHandler<SlackWebhookEvent> | null =
@@ -1241,6 +1247,7 @@ export class EdgeWorker extends EventEmitter {
 	 * 1. Forwarded installation token from CYHOST (cloud/proxy mode)
 	 * 2. Self-minted installation token from GitHub App credentials (self-hosted)
 	 * 3. Personal access token from GITHUB_TOKEN env var (fallback)
+	 * 4. Token from the locally authenticated GitHub CLI (self-hosted fallback)
 	 */
 	private async resolveGitHubTokenValue(
 		installationToken?: string,
@@ -1256,13 +1263,174 @@ export class EdgeWorker extends EventEmitter {
 				);
 			}
 		}
-		return process.env.GITHUB_TOKEN;
+		const environmentToken = process.env.GITHUB_TOKEN?.trim();
+		if (environmentToken) return environmentToken;
+
+		return this.resolveGitHubCliToken();
+	}
+
+	private resolveGitHubCliToken(): string | undefined {
+		if (
+			this.gitHubCliTokenCache &&
+			this.gitHubCliTokenCache.expiresAt > Date.now()
+		) {
+			return this.gitHubCliTokenCache.token;
+		}
+		try {
+			const token = execFileSync("gh", ["auth", "token"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+				timeout: 5_000,
+			}).trim();
+			if (token) {
+				this.gitHubCliTokenCache = {
+					token,
+					expiresAt: Date.now() + 5 * 60_000,
+				};
+				return token;
+			}
+		} catch {
+			this.logger.debug(
+				"No GitHub token available from the locally authenticated gh CLI",
+			);
+		}
+		return undefined;
 	}
 
 	private async resolveGitHubToken(
 		event: GitHubWebhookEvent,
 	): Promise<string | undefined> {
 		return this.resolveGitHubTokenValue(event.installationToken);
+	}
+
+	private parseGitHubIssueReference(reference: string): {
+		repositoryFullName: string;
+		issueNumber: number;
+	} {
+		const trimmed = reference.trim();
+		const urlMatch = trimmed.match(
+			/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:[/?#].*)?$/i,
+		);
+		const shortMatch = trimmed.match(/^([^/\s]+)\/([^#\s]+)#(\d+)$/);
+		const match = urlMatch ?? shortMatch;
+		if (!match) {
+			throw this.gitHubWorkItemError(
+				"Use a GitHub issue URL or owner/repository#number reference",
+				400,
+			);
+		}
+		return {
+			repositoryFullName: `${match[1]}/${match[2]}`.replace(/\.git$/i, ""),
+			issueNumber: Number(match[3]),
+		};
+	}
+
+	private resolveGitHubTargetRepositories(
+		sourceRepositoryFullName: string,
+		targets?: string[],
+	): { repositories: RepositoryConfig[]; fullNames: string[] } {
+		const requested = targets?.length ? targets : [sourceRepositoryFullName];
+		const repositories = requested.map((value) => {
+			const byUrl = this.findRepositoryByGitHubUrl(value);
+			const byName = Array.from(this.repositories.values()).find(
+				(repo) => repo.name.toLowerCase() === value.toLowerCase(),
+			);
+			const repository = byUrl ?? byName;
+			if (!repository || repository.isActive === false) {
+				throw this.gitHubWorkItemError(
+					`Repository '${value}' is not configured and active in Cyrus`,
+					404,
+				);
+			}
+			return repository;
+		});
+		const unique = Array.from(
+			new Map(repositories.map((repo) => [repo.id, repo])).values(),
+		);
+		return {
+			repositories: unique,
+			fullNames: unique.map((repo) => this.configuredRepositoryFullName(repo)),
+		};
+	}
+
+	private githubIssueWorkItemId(
+		repositoryFullName: string,
+		issueNumber: number,
+		targetRepositoryFullNames: string[],
+	): string {
+		const identity = `${repositoryFullName.toLowerCase()}#${issueNumber}|${[
+			...targetRepositoryFullNames,
+		]
+			.sort()
+			.join(",")}`;
+		return `slack-${createHash("sha256").update(identity).digest("hex").slice(0, 20)}`;
+	}
+
+	private githubWorkItemsForReference(
+		reference: string,
+	): GitHubIssueWorkItemSession[] {
+		const parsed = this.parseGitHubIssueReference(reference);
+		return Array.from(this.gitHubIssueWorkItemSessions.values()).filter(
+			(item) =>
+				item.repositoryFullName.toLowerCase() ===
+					parsed.repositoryFullName.toLowerCase() &&
+				item.issueNumber === parsed.issueNumber,
+		);
+	}
+
+	private async inspectGitHubIssue(reference: string): Promise<unknown> {
+		const parsed = this.parseGitHubIssueReference(reference);
+		const token = await this.resolveGitHubTokenValue();
+		if (!token) {
+			throw this.gitHubWorkItemError(
+				"No GitHub authentication is available. Sign in with gh auth login or configure a GitHub token.",
+				401,
+			);
+		}
+		const issue = await this.fetchGitHubIssue(
+			parsed.repositoryFullName,
+			parsed.issueNumber,
+			token,
+		);
+		if (issue.pull_request) {
+			throw this.gitHubWorkItemError(
+				"This URL points to a pull request, not a GitHub issue",
+				400,
+			);
+		}
+		return {
+			repositoryFullName: parsed.repositoryFullName,
+			number: issue.number,
+			title: issue.title,
+			body: issue.body,
+			state: issue.state,
+			url: issue.html_url,
+			labels: (issue.labels ?? []).map((label) => label.name).filter(Boolean),
+			comments: issue.commentsData ?? [],
+			configuredRepositories: Array.from(this.repositories.values())
+				.filter((repo) => repo.isActive !== false && repo.githubUrl)
+				.map((repo) => ({
+					name: repo.name,
+					fullName: this.configuredRepositoryFullName(repo),
+				})),
+			activeWorkItems: this.githubWorkItemsForReference(reference).map((item) =>
+				this.githubWorkItemStatusResult(item),
+			),
+		};
+	}
+
+	private githubWorkItemStatusResult(
+		item: GitHubIssueWorkItemSession,
+	): unknown {
+		return {
+			workItemId: item.workItemId,
+			sessionId: item.sessionId,
+			status: item.status,
+			targetRepositories: item.targetRepositoryFullNames,
+			branches: item.branchNames,
+			prUrls: item.prUrls,
+			error: item.error,
+		};
 	}
 
 	private async startGitHubIssueWorkItem(
@@ -1300,6 +1468,7 @@ export class EdgeWorker extends EventEmitter {
 				const runner = await this.createGitHubIssueRunner(
 					existing,
 					githubIssue,
+					token,
 					this.runnerResumeSessionId(session, existing.runnerType),
 				);
 				this.agentSessionManager.addAgentRunner(existing.sessionId, runner);
@@ -1329,15 +1498,24 @@ export class EdgeWorker extends EventEmitter {
 			);
 		}
 
-		const repository = this.findRepositoryByGitHubUrl(
-			request.repositoryFullName,
+		const targetRepositoryFullNames = Array.from(
+			new Set(
+				request.targetRepositoryFullNames?.length
+					? request.targetRepositoryFullNames
+					: [request.repositoryFullName],
+			),
 		);
-		if (!repository) {
-			throw this.gitHubWorkItemError(
-				`No repository configured for ${request.repositoryFullName}`,
-				404,
-			);
-		}
+		const repositories = targetRepositoryFullNames.map((name) => {
+			const repository = this.findRepositoryByGitHubUrl(name);
+			if (!repository) {
+				throw this.gitHubWorkItemError(
+					`No repository configured for ${name}`,
+					404,
+				);
+			}
+			return repository;
+		});
+		const repository = repositories[0]!;
 
 		const githubIssue = await this.fetchGitHubIssue(
 			request.repositoryFullName,
@@ -1372,9 +1550,10 @@ export class EdgeWorker extends EventEmitter {
 			issueMinimal,
 			githubIssue,
 		);
-		const workspace = await this.gitService.createGitWorktree(syntheticIssue, [
-			repository,
-		]);
+		const workspace = await this.gitService.createGitWorktree(
+			syntheticIssue,
+			repositories,
+		);
 		if (!workspace.isGitWorktree) {
 			throw this.gitHubWorkItemError(
 				`Could not create a Git worktree for ${request.repositoryFullName}#${request.issueNumber}`,
@@ -1389,13 +1568,11 @@ export class EdgeWorker extends EventEmitter {
 			issueMinimal,
 			workspace,
 			"github",
-			[
-				{
-					repositoryId: repository.id,
-					branchName,
-					baseBranchName: repository.baseBranch,
-				},
-			],
+			repositories.map((target) => ({
+				repositoryId: target.id,
+				branchName,
+				baseBranchName: target.baseBranch,
+			})),
 		);
 		this.sessionRepositories.set(sessionId, repository.id);
 		const activitySink = this.getActivitySinkForRepo(repository.id);
@@ -1407,10 +1584,16 @@ export class EdgeWorker extends EventEmitter {
 			workItemId: request.workItemId,
 			sessionId,
 			repository,
+			repositories,
 			repositoryFullName: request.repositoryFullName,
+			targetRepositoryFullNames,
 			issueNumber: request.issueNumber,
 			issueIdentifier,
 			branchName,
+			branchNames: Object.fromEntries(
+				repositories.map((target) => [target.id, branchName]),
+			),
+			prUrls: [],
 			runnerType: request.runnerType,
 			issue: issueMinimal,
 			status: "starting",
@@ -1426,6 +1609,9 @@ export class EdgeWorker extends EventEmitter {
 					issueNumber: request.issueNumber,
 					issueIdentifier,
 					branchName,
+					targetRepositoryFullNames,
+					branchNames: workItemSession.branchNames,
+					prUrls: [],
 					runnerType: request.runnerType,
 					status: "starting",
 				},
@@ -1436,6 +1622,7 @@ export class EdgeWorker extends EventEmitter {
 			const runner = await this.createGitHubIssueRunner(
 				workItemSession,
 				githubIssue,
+				token,
 			);
 			this.agentSessionManager.addAgentRunner(sessionId, runner);
 			await this.savePersistedState();
@@ -1471,7 +1658,7 @@ export class EdgeWorker extends EventEmitter {
 			this.gitHubIssueWorkItemSessions.delete(request.workItemId);
 			this.agentSessionManager.removeSession(sessionId);
 			await this.gitService.deleteWorktree(issueIdentifier, {
-				repositories: [repository],
+				repositories,
 			});
 			throw error;
 		}
@@ -1533,6 +1720,7 @@ export class EdgeWorker extends EventEmitter {
 		const runner = await this.createGitHubIssueRunner(
 			workItem,
 			githubIssue,
+			token,
 			this.runnerResumeSessionId(session, workItem.runnerType),
 		);
 		this.agentSessionManager.addAgentRunner(workItem.sessionId, runner);
@@ -1554,7 +1742,7 @@ export class EdgeWorker extends EventEmitter {
 			this.agentSessionManager.removeSession(workItem.sessionId);
 		}
 		await this.gitService.deleteWorktree(workItem.issueIdentifier, {
-			repositories: [workItem.repository],
+			repositories: workItem.repositories ?? [workItem.repository],
 		});
 		this.gitHubIssueWorkItemSessions.delete(workItemId);
 		await this.savePersistedState();
@@ -1573,6 +1761,7 @@ export class EdgeWorker extends EventEmitter {
 			body: string | null;
 			labels?: Array<{ name?: string }>;
 		},
+		githubToken: string,
 		resumeSessionId?: string,
 	): Promise<IAgentRunner> {
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
@@ -1580,12 +1769,13 @@ export class EdgeWorker extends EventEmitter {
 		const labels = (githubIssue.labels ?? [])
 			.map((label) => label.name)
 			.filter((name): name is string => Boolean(name));
-		const allowedTools = this.toolPermissionResolver.buildGithubAllowedTools(
-			workItem.repository,
-		);
-		const disallowedTools = this.buildDisallowedTools(workItem.repository);
+		const repositories = workItem.repositories ?? [workItem.repository];
+		const allowedTools =
+			this.toolPermissionResolver.buildGithubAllowedTools(repositories);
+		const disallowedTools = this.buildDisallowedTools(repositories);
 		const allowedDirectories = [
-			workItem.repository.repositoryPath,
+			...repositories.map((repository) => repository.repositoryPath),
+			...Object.values(session.workspace.repoPaths ?? {}),
 			...this.gitService.getGitMetadataDirectoriesForWorkspace(
 				session.workspace,
 			),
@@ -1613,6 +1803,14 @@ export class EdgeWorker extends EventEmitter {
 				`Runner selection mismatch: requested ${workItem.runnerType}, resolved ${runnerType}`,
 			);
 		}
+		const runnerConfig = config as AgentRunnerConfig & {
+			additionalEnv?: Record<string, string>;
+		};
+		runnerConfig.additionalEnv = {
+			...runnerConfig.additionalEnv,
+			GH_TOKEN: githubToken,
+			GITHUB_TOKEN: githubToken,
+		};
 		return this.createRunnerForType(runnerType, config);
 	}
 
@@ -1634,29 +1832,31 @@ export class EdgeWorker extends EventEmitter {
 			} else {
 				await runner.start(prompt);
 			}
-			const prUrl = await this.findGitHubIssuePullRequest(workItem, token);
+			const prUrls = await this.findGitHubIssuePullRequests(workItem, token);
 			if (
 				workItem.status === "stopped" ||
 				!this.gitHubIssueWorkItemSessions.has(workItem.workItemId)
 			)
 				return;
-			if (!prUrl) {
+			if (prUrls.length === 0) {
 				throw new Error(
-					"Agent finished without opening a pull request for this issue",
+					"Agent finished without opening a pull request for any changed repository",
 				);
 			}
+			workItem.prUrls = prUrls;
 			await this.gitHubCommentService.postIssueComment({
 				token,
 				owner: workItem.repositoryFullName.split("/")[0]!,
 				repo: workItem.repositoryFullName.split("/")[1]!,
 				issueNumber: workItem.issueNumber,
-				body: `Cyrus finished the implementation. Pull request: ${prUrl}`,
+				body: `Cyrus finished the implementation. Pull request${prUrls.length === 1 ? "" : "s"}:\n${prUrls.map((url) => `- ${url}`).join("\n")}`,
 			});
 			await this.reportGitHubWorkItemStatus(workItem.workItemId, {
 				status: "awaiting_review",
 				sessionId: workItem.sessionId,
 				runnerType: workItem.runnerType,
-				prUrl,
+				prUrl: prUrls[0],
+				prUrls,
 			});
 			this.setGitHubIssueWorkItemStatus(workItem, "awaiting_review");
 			this.emit("session:ended", workItem.issue.id, 0, workItem.repository.id);
@@ -1672,6 +1872,7 @@ export class EdgeWorker extends EventEmitter {
 			)
 				return;
 			const err = error instanceof Error ? error : new Error(String(error));
+			workItem.error = err.message;
 			this.logger.error(
 				`GitHub Issue session failed for ${workItem.repositoryFullName}#${workItem.issueNumber}`,
 				err,
@@ -1713,6 +1914,12 @@ export class EdgeWorker extends EventEmitter {
 			type: string;
 		};
 		labels?: Array<{ id?: number; name?: string; color?: string }>;
+		commentsData?: Array<{
+			id: number;
+			author: string;
+			body: string;
+			url: string;
+		}>;
 		pull_request?: unknown;
 		created_at?: string;
 		updated_at?: string;
@@ -1734,9 +1941,35 @@ export class EdgeWorker extends EventEmitter {
 				response.status === 404 ? 404 : 502,
 			);
 		}
-		return (await response.json()) as Awaited<
+		const issue = (await response.json()) as Awaited<
 			ReturnType<EdgeWorker["fetchGitHubIssue"]>
 		>;
+		const commentsResponse = await fetch(
+			`https://api.github.com/repos/${repositoryFullName}/issues/${issueNumber}/comments?per_page=100`,
+			{
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			},
+		);
+		if (commentsResponse.ok) {
+			const comments = (await commentsResponse.json()) as Array<{
+				id: number;
+				body?: string | null;
+				html_url?: string;
+				user?: { login?: string };
+			}>;
+			issue.commentsData = comments.map((comment) => ({
+				id: comment.id,
+				author: comment.user?.login ?? "unknown",
+				body: comment.body ?? "",
+				url: comment.html_url ?? "",
+			}));
+		}
+		return issue;
 	}
 
 	private buildSyntheticGitHubIssue(
@@ -1778,16 +2011,31 @@ export class EdgeWorker extends EventEmitter {
 	private buildGitHubIssueSystemPrompt(
 		workItem: GitHubIssueWorkItemSession,
 	): string {
-		return `You are implementing a GitHub Issue for ${workItem.repositoryFullName}.
+		const targets = workItem.repositories
+			.map((repository) => {
+				const fullName = this.configuredRepositoryFullName(repository);
+				return `- ${fullName}: branch \`${workItem.branchNames[repository.id]}\`, base \`${repository.baseBranch}\``;
+			})
+			.join("\n");
+		return `You are implementing GitHub Issue ${workItem.repositoryFullName}#${workItem.issueNumber} in an isolated multi-repository workspace.
 
-Work only in the checked-out branch \`${workItem.branchName}\`. Implement and verify the requested change, commit it, push the branch, and open a pull request against \`${workItem.repository.baseBranch}\`. The pull request body must contain \`Fixes #${workItem.issueNumber}\` so GitHub closes the issue when the PR is merged. Do not mark the source issue closed yourself.`;
+Participating repositories:
+${targets}
+
+Investigate across every participating repository. Modify only repositories that need changes. For every repository with commits, push its checked-out branch and open a pull request against its listed base branch. Each pull request body must contain \`Fixes ${workItem.repositoryFullName}#${workItem.issueNumber}\`. Do not create empty pull requests and do not close the source issue yourself.`;
 	}
 
 	private buildGitHubIssueTaskPrompt(
 		githubIssue: Awaited<ReturnType<EdgeWorker["fetchGitHubIssue"]>>,
 		repositoryFullName: string,
 	): string {
-		return `# GitHub Issue ${repositoryFullName}#${githubIssue.number}: ${githubIssue.title}\n\n${githubIssue.body ?? "No description provided."}`;
+		const comments = (githubIssue.commentsData ?? [])
+			.map(
+				(comment) =>
+					`<comment author="${comment.author}">\n${comment.body}\n</comment>`,
+			)
+			.join("\n\n");
+		return `# GitHub Issue ${repositoryFullName}#${githubIssue.number}: ${githubIssue.title}\n\n${githubIssue.body ?? "No description provided."}${comments ? `\n\n## Existing discussion\n\n${comments}` : ""}`;
 	}
 
 	private githubIssueSlug(title: string): string {
@@ -1814,31 +2062,70 @@ Work only in the checked-out branch \`${workItem.branchName}\`. Implement and ve
 		}
 	}
 
-	private async findGitHubIssuePullRequest(
+	private async findGitHubIssuePullRequests(
 		workItem: GitHubIssueWorkItemSession,
 		token: string,
-	): Promise<string | undefined> {
-		const [owner] = workItem.repositoryFullName.split("/");
-		const params = new URLSearchParams({
-			state: "open",
-			head: `${owner}:${workItem.branchName}`,
-			base: workItem.repository.baseBranch,
-			per_page: "1",
-		});
-		const response = await fetch(
-			`https://api.github.com/repos/${workItem.repositoryFullName}/pulls?${params}`,
-			{
-				headers: {
-					Accept: "application/vnd.github+json",
-					Authorization: `Bearer ${token}`,
-					"User-Agent": "cyrus-ai",
-					"X-GitHub-Api-Version": "2022-11-28",
+	): Promise<string[]> {
+		const session = this.agentSessionManager.getSession(workItem.sessionId);
+		const prUrls: string[] = [];
+		for (const repository of workItem.repositories) {
+			const worktreePath =
+				session?.workspace.repoPaths?.[repository.id] ??
+				session?.workspace.path;
+			if (!worktreePath) continue;
+			let commitCount = 0;
+			try {
+				commitCount = Number.parseInt(
+					execFileSync(
+						"git",
+						[
+							"-C",
+							worktreePath,
+							"rev-list",
+							"--count",
+							`origin/${repository.baseBranch}..HEAD`,
+						],
+						{ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+					).trim(),
+					10,
+				);
+			} catch {
+				continue;
+			}
+			if (!Number.isFinite(commitCount) || commitCount <= 0) continue;
+
+			const fullName = this.configuredRepositoryFullName(repository);
+			const [owner] = fullName.split("/");
+			const params = new URLSearchParams({
+				state: "open",
+				head: `${owner}:${workItem.branchNames[repository.id]}`,
+				base: repository.baseBranch,
+				per_page: "1",
+			});
+			const response = await fetch(
+				`https://api.github.com/repos/${fullName}/pulls?${params}`,
+				{
+					headers: {
+						Accept: "application/vnd.github+json",
+						Authorization: `Bearer ${token}`,
+						"User-Agent": "cyrus-ai",
+						"X-GitHub-Api-Version": "2022-11-28",
+					},
 				},
-			},
-		);
-		if (!response.ok) return undefined;
-		const pulls = (await response.json()) as Array<{ html_url?: string }>;
-		return pulls[0]?.html_url;
+			);
+			if (!response.ok) {
+				throw new Error(`Could not verify a pull request for ${fullName}`);
+			}
+			const pulls = (await response.json()) as Array<{ html_url?: string }>;
+			const prUrl = pulls[0]?.html_url;
+			if (!prUrl) {
+				throw new Error(
+					`Repository ${fullName} has commits but no open pull request`,
+				);
+			}
+			prUrls.push(prUrl);
+		}
+		return prUrls;
 	}
 
 	private async reportGitHubWorkItemStatus(
@@ -1853,6 +2140,7 @@ Work only in the checked-out branch \`${workItem.branchName}\`. Implement and ve
 			sessionId: string;
 			runnerType: RunnerType;
 			prUrl?: string;
+			prUrls?: string[];
 			error?: string;
 		},
 	): Promise<void> {
@@ -1909,18 +2197,35 @@ Work only in the checked-out branch \`${workItem.branchName}\`. Implement and ve
 		const metadata = persistedSession?.metadata?.githubWorkItem;
 		if (!persistedSession?.issue || !metadata) return undefined;
 		const repository = this.findRepositoryByGitHubUrl(
-			metadata.repositoryFullName,
+			metadata.targetRepositoryFullNames?.[0] ?? metadata.repositoryFullName,
 		);
 		if (!repository) return undefined;
+		const repositories = (
+			metadata.targetRepositoryFullNames ?? [metadata.repositoryFullName]
+		)
+			.map((name) => this.findRepositoryByGitHubUrl(name))
+			.filter((repo): repo is RepositoryConfig => Boolean(repo));
+		if (repositories.length === 0) return undefined;
 
 		const recovered: GitHubIssueWorkItemSession = {
 			workItemId,
 			sessionId: persistedSession.id,
 			repository,
+			repositories,
 			repositoryFullName: metadata.repositoryFullName,
+			targetRepositoryFullNames: metadata.targetRepositoryFullNames ?? [
+				metadata.repositoryFullName,
+			],
 			issueNumber: metadata.issueNumber,
 			issueIdentifier: metadata.issueIdentifier,
 			branchName: metadata.branchName,
+			branchNames:
+				metadata.branchNames ??
+				Object.fromEntries(
+					repositories.map((repo) => [repo.id, metadata.branchName]),
+				),
+			prUrls: metadata.prUrls ?? [],
+			error: metadata.error,
 			runnerType: metadata.runnerType,
 			issue: persistedSession.issue,
 			// Runners are process-local. A previously running session must resume
@@ -1940,6 +2245,8 @@ Work only in the checked-out branch \`${workItem.branchName}\`. Implement and ve
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (session?.metadata?.githubWorkItem) {
 			session.metadata.githubWorkItem.status = status;
+			session.metadata.githubWorkItem.prUrls = workItem.prUrls;
+			session.metadata.githubWorkItem.error = workItem.error;
 		}
 	}
 
@@ -2421,17 +2728,29 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 	private findRepositoryByGitHubUrl(
 		repoFullName: string,
 	): RepositoryConfig | null {
+		const normalized = repoFullName
+			.replace(/^https?:\/\/github\.com\//i, "")
+			.replace(/\.git$/i, "")
+			.replace(/^\/+|\/+$/g, "")
+			.toLowerCase();
 		for (const repo of this.repositories.values()) {
 			if (!repo.githubUrl) continue;
-			// Match against full name (owner/repo) or URL containing it
 			if (
-				repo.githubUrl.includes(repoFullName) ||
-				repo.githubUrl.endsWith(`/${repoFullName}`)
+				this.configuredRepositoryFullName(repo).toLowerCase() === normalized
 			) {
 				return repo;
 			}
 		}
 		return null;
+	}
+
+	private configuredRepositoryFullName(repository: RepositoryConfig): string {
+		const githubUrl = repository.githubUrl ?? "";
+		return githubUrl
+			.replace(/^git@github\.com:/i, "")
+			.replace(/^https?:\/\/github\.com\//i, "")
+			.replace(/\.git$/i, "")
+			.replace(/^\/+|\/+$/g, "");
 	}
 
 	/**
@@ -6628,6 +6947,77 @@ ${taskSection}`;
 		const failureModesClient = this.getFailureModesClient();
 		const options: CyrusToolsOptions = {
 			parentSessionId,
+			githubIssues: {
+				get: ({ reference }) => this.inspectGitHubIssue(reference),
+				start: async ({ reference, targetRepositories }) => {
+					const parsed = this.parseGitHubIssueReference(reference);
+					const targets = this.resolveGitHubTargetRepositories(
+						parsed.repositoryFullName,
+						targetRepositories,
+					);
+					const workItemId = this.githubIssueWorkItemId(
+						parsed.repositoryFullName,
+						parsed.issueNumber,
+						targets.fullNames,
+					);
+					const result = await this.startGitHubIssueWorkItem({
+						workItemId,
+						repositoryFullName: parsed.repositoryFullName,
+						issueNumber: parsed.issueNumber,
+						targetRepositoryFullNames: targets.fullNames,
+						runnerType: this.runnerSelectionService.getDefaultRunner(),
+						requestId: randomUUID(),
+					});
+					return {
+						workItemId,
+						...result,
+						targetRepositories: targets.fullNames,
+					};
+				},
+				status: async ({ reference }) => ({
+					workItems: this.githubWorkItemsForReference(reference).map((item) =>
+						this.githubWorkItemStatusResult(item),
+					),
+				}),
+				prompt: async ({ reference, message }) => {
+					const active = this.githubWorkItemsForReference(reference).filter(
+						(item) =>
+							item.status === "starting" || item.status === "in_progress",
+					);
+					if (active.length === 0) {
+						throw this.gitHubWorkItemError(
+							"No active Cyrus engineering session exists for this issue",
+							404,
+						);
+					}
+					await Promise.all(
+						active.map((item) =>
+							this.promptGitHubIssueWorkItem(item.workItemId, {
+								requestId: randomUUID(),
+								commentId: Date.now(),
+								author: "Slack user",
+								body: message,
+							}),
+						),
+					);
+					return { promptedWorkItemIds: active.map((item) => item.workItemId) };
+				},
+				stop: async ({ reference }) => {
+					const active = this.githubWorkItemsForReference(reference).filter(
+						(item) =>
+							item.status === "starting" || item.status === "in_progress",
+					);
+					await Promise.all(
+						active.map((item) =>
+							this.stopGitHubIssueWorkItem(item.workItemId, {
+								requestId: randomUUID(),
+								reason: "user_requested",
+							}),
+						),
+					);
+					return { stoppedWorkItemIds: active.map((item) => item.workItemId) };
+				},
+			},
 			onSessionCreated: (childSessionId: string, parentId: string) => {
 				this.handleChildSessionMapping(childSessionId, parentId);
 			},

@@ -80,6 +80,18 @@ function getMimeType(filename: string): string {
  * Options for creating Cyrus tools with session management capabilities
  */
 export interface CyrusToolsOptions {
+	/** GitHub Issue operations exposed to conversational parent agents. */
+	githubIssues?: {
+		get: (input: { reference: string }) => Promise<unknown>;
+		start: (input: {
+			reference: string;
+			targetRepositories?: string[];
+		}) => Promise<unknown>;
+		status: (input: { reference: string }) => Promise<unknown>;
+		prompt: (input: { reference: string; message: string }) => Promise<unknown>;
+		stop: (input: { reference: string }) => Promise<unknown>;
+	};
+
 	/**
 	 * Callback to register a child-to-parent session mapping
 	 * Called when a new agent session is created
@@ -114,13 +126,131 @@ export interface CyrusToolsOptions {
  * Create a standard MCP SDK server with Cyrus tools.
  */
 export function createCyrusToolsServer(
-	linearClient: LinearClient,
+	linearClient?: LinearClient,
 	options: CyrusToolsOptions = {},
 ): McpServer {
 	const server = new McpServer({
 		name: "cyrus-tools",
 		version: "1.0.0",
 	});
+
+	if (options.githubIssues) {
+		const result = async (operation: () => Promise<unknown>) => {
+			try {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify(
+								{ success: true, result: await operation() },
+								null,
+								2,
+							),
+						},
+					],
+				};
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({
+								success: false,
+								error: error instanceof Error ? error.message : String(error),
+							}),
+						},
+					],
+				};
+			}
+		};
+
+		server.registerTool(
+			"github_issue_get",
+			{
+				description:
+					"Read a GitHub Issue, including its existing discussion, and identify which locally configured repositories can be used to investigate or implement it. Use this instead of WebFetch for private GitHub issues. This tool only inspects; it never starts coding work.",
+				inputSchema: {
+					reference: z
+						.string()
+						.describe(
+							"A GitHub issue URL or owner/repository#number reference",
+						),
+				},
+			},
+			async ({ reference }) =>
+				result(() => options.githubIssues!.get({ reference })),
+		);
+
+		server.registerTool(
+			"github_issue_start",
+			{
+				description:
+					"Start an isolated engineering session for a GitHub Issue after investigating it. Use natural-language intent: start for a clear implementation request; for an ambiguous request, inspect the issue and code first and start only when the evidence supports making a change. The session edits code, runs checks, and opens pull requests. Multiple configured repositories may be included when the fix genuinely spans them.",
+				inputSchema: {
+					reference: z.string(),
+					targetRepositories: z
+						.array(z.string())
+						.optional()
+						.describe(
+							"Configured repository names or owner/repository names that must participate. Omit to use the issue repository.",
+						),
+				},
+			},
+			async ({ reference, targetRepositories }) =>
+				result(() =>
+					options.githubIssues!.start({ reference, targetRepositories }),
+				),
+		);
+
+		server.registerTool(
+			"github_issue_status",
+			{
+				description:
+					"Get the current state, participating repositories, and pull request links for a GitHub Issue engineering session.",
+				inputSchema: { reference: z.string() },
+			},
+			async ({ reference }) =>
+				result(() => options.githubIssues!.status({ reference })),
+		);
+
+		server.registerTool(
+			"github_issue_prompt",
+			{
+				description:
+					"Send the user's natural-language correction or additional requirement to the active GitHub Issue engineering session.",
+				inputSchema: {
+					reference: z.string(),
+					message: z.string().min(1),
+				},
+			},
+			async ({ reference, message }) =>
+				result(() => options.githubIssues!.prompt({ reference, message })),
+		);
+
+		server.registerTool(
+			"github_issue_stop",
+			{
+				description:
+					"Stop the active GitHub Issue engineering session and clean up its isolated worktrees when the user naturally asks Cyrus to stop or cancel.",
+				inputSchema: { reference: z.string() },
+			},
+			async ({ reference }) =>
+				result(() => options.githubIssues!.stop({ reference })),
+		);
+	}
+
+	// GitHub-only/self-hosted chat configurations do not have a Linear client.
+	// Keep the orchestration tools available without registering broken Linear tools.
+	if (!linearClient) {
+		if (options.failureModes) {
+			registerLogFailureModeTool(server, {
+				resolveSessionFromCwd: options.failureModes.resolveSessionFromCwd,
+				httpClient: options.failureModes.httpClient,
+				fallbackSessionId: options.parentSessionId,
+			});
+		}
+		return server;
+	}
 
 	server.registerTool(
 		"linear_upload_file",

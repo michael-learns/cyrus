@@ -231,14 +231,13 @@ export class RunnerConfigBuilder {
 
 		// Build fresh MCP config at session start (reads current token from config)
 		// This follows the same pattern as buildIssueConfig — never use a pre-baked config
-		const mcpConfig =
-			input.linearWorkspaceId && input.repository
-				? this.mcpConfigProvider.buildMcpConfig(
-						input.repository.id,
-						input.linearWorkspaceId,
-						input.sessionId,
-					)
-				: undefined;
+		const mcpConfig = input.repository
+			? this.mcpConfigProvider.buildMcpConfig(
+					input.repository.id,
+					input.linearWorkspaceId ?? "",
+					input.sessionId,
+				)
+			: undefined;
 
 		// Extract MCP tool entries from the repository's allowedTools config
 		const userMcpTools = (input.repository?.allowedTools ?? []).filter((tool) =>

@@ -103,6 +103,7 @@ describe("EdgeWorker GitHub Issue work items", () => {
 				branchName: "cyrus/gh-17-fix-webhook-retries",
 			}),
 			githubIssue,
+			"ghs_token",
 		);
 		expect(worker.runGitHubIssueWorkItem).toHaveBeenCalledWith(
 			expect.objectContaining({ workItemId: "work-item-17" }),
@@ -227,6 +228,7 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		expect(worker.createGitHubIssueRunner).toHaveBeenCalledWith(
 			failed,
 			githubIssue,
+			"ghs_token",
 			"codex-session-1",
 		);
 		expect(worker.gitService.createGitWorktree).not.toHaveBeenCalled();
