@@ -27,6 +27,14 @@ export { ChatSessionHandler } from "./ChatSessionHandler.js";
 export { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 export { EdgeWorker } from "./EdgeWorker.js";
 export { EgressProxy } from "./EgressProxy.js";
+export {
+	type GitHubIssuePromptRequest,
+	type GitHubIssueStartRequest,
+	type GitHubIssueStartResult,
+	type GitHubIssueStopRequest,
+	GitHubIssueWorkItemController,
+	type GitHubIssueWorkItemHandlers,
+} from "./GitHubIssueWorkItemController.js";
 export type { CreateGitWorktreeOptions } from "./GitService.js";
 export { GitService } from "./GitService.js";
 export type { SerializedGlobalRegistryState } from "./GlobalSessionRegistry.js";

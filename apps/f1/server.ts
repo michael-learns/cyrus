@@ -38,6 +38,9 @@ import { bold, cyan, dim, gray, green, success } from "./src/utils/colors.js";
 
 const CYRUS_PORT = Number.parseInt(process.env.CYRUS_PORT || "3600", 10);
 const CYRUS_REPO_PATH = process.env.CYRUS_REPO_PATH || process.cwd();
+const CYRUS_REPO_GITHUB_URL =
+	process.env.CYRUS_REPO_GITHUB_URL ||
+	"https://github.com/f1-test/primary-repo";
 const CYRUS_HOME = join(tmpdir(), `cyrus-f1-${Date.now()}`);
 const DEFAULT_REPOS_BASE_DIR = getDefaultReposDir(CYRUS_HOME);
 const DEFAULT_WORKTREES_BASE_DIR = getDefaultWorktreesDir(CYRUS_HOME);
@@ -96,7 +99,7 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 		name: "F1 Test Repository",
 		repositoryPath: CYRUS_REPO_PATH,
 		baseBranch: "main",
-		githubUrl: "https://github.com/f1-test/primary-repo",
+		githubUrl: CYRUS_REPO_GITHUB_URL,
 		linearWorkspaceId: "cli-workspace",
 		workspaceBaseDir: DEFAULT_WORKTREES_BASE_DIR,
 		isActive: true,
