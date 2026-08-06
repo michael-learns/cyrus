@@ -217,6 +217,13 @@ type GitHubIssueWorkItemSession = {
 	branchNames: Record<string, string>;
 	prUrls: string[];
 	error?: string;
+	slackSubscribers: Array<{
+		parentSessionId: string;
+		teamId: string;
+		channel: string;
+		threadTs: string;
+		user: string;
+	}>;
 	runnerType: RunnerType;
 	issue: IssueMinimal;
 	status: "starting" | "in_progress" | "awaiting_review" | "failed" | "stopped";
@@ -250,6 +257,11 @@ export class EdgeWorker extends EventEmitter {
 	private slackEventTransport: SlackEventTransport | null = null;
 	private chatSessionHandler: ChatSessionHandler<SlackWebhookEvent> | null =
 		null;
+	private slackChatAdapter: SlackChatAdapter | null = null;
+	private slackWorkItemEvents = new Map<
+		string,
+		Map<string, SlackWebhookEvent>
+	>();
 	private gitHubCommentService: GitHubCommentService; // Service for posting comments back to GitHub PRs
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
@@ -1138,13 +1150,15 @@ export class EdgeWorker extends EventEmitter {
 			this.logger,
 			{ repositoryRoutingContext: routingContext, cyrusAppBaseUrl },
 		);
+		this.slackChatAdapter = slackAdapter;
 
-		if (
-			!chatRepositoryProvider.getDefaultLinearWorkspaceId() ||
-			!chatRepositoryProvider.getDefaultRepository()
-		) {
+		if (!chatRepositoryProvider.getDefaultRepository()) {
 			this.logger.warn(
-				"No repositories or workspaces configured — Slack sessions will not have access to MCP tools",
+				"No repositories configured — Slack sessions will not have repository or GitHub orchestration tools",
+			);
+		} else if (!chatRepositoryProvider.getDefaultLinearWorkspaceId()) {
+			this.logger.info(
+				"No Linear workspace configured — Slack GitHub orchestration remains available",
 			);
 		}
 
@@ -1433,6 +1447,102 @@ export class EdgeWorker extends EventEmitter {
 		};
 	}
 
+	private async attachSlackSubscriber(
+		workItemId: string,
+		parentSessionId: string,
+	): Promise<void> {
+		const event =
+			this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
+		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
+		if (!event || !workItem) return;
+
+		let events = this.slackWorkItemEvents.get(workItemId);
+		if (!events) {
+			events = new Map();
+			this.slackWorkItemEvents.set(workItemId, events);
+		}
+		events.set(parentSessionId, event);
+		const subscriber = {
+			parentSessionId,
+			teamId: event.teamId,
+			channel: event.payload.channel,
+			threadTs: event.payload.thread_ts || event.payload.ts,
+			user: event.payload.user,
+		};
+		if (!workItem.slackSubscribers) workItem.slackSubscribers = [];
+		const subscribers = workItem.slackSubscribers;
+		const existingIndex = subscribers.findIndex(
+			(item) => item.parentSessionId === parentSessionId,
+		);
+		if (existingIndex >= 0) subscribers[existingIndex] = subscriber;
+		else subscribers.push(subscriber);
+		this.setGitHubIssueWorkItemStatus(workItem, workItem.status);
+		this.chatSessionHandler?.setDelegatedWorkActive(parentSessionId, true);
+		await this.slackChatAdapter?.setBackgroundActivityStatus(event);
+		await this.savePersistedState();
+	}
+
+	private async updateSlackWorkItemActivity(
+		workItem: GitHubIssueWorkItemSession,
+		message: SDKMessage,
+	): Promise<void> {
+		const events = this.slackWorkItemEvents?.get(workItem.workItemId);
+		if (!events || !this.slackChatAdapter) return;
+		await Promise.allSettled(
+			Array.from(events.values()).map((event) =>
+				this.slackChatAdapter!.updateActivityStatus(event, message),
+			),
+		);
+	}
+
+	private async finishSlackWorkItem(
+		workItem: GitHubIssueWorkItemSession,
+		status: "awaiting_review" | "failed" | "stopped",
+	): Promise<void> {
+		const events = this.slackWorkItemEvents?.get(workItem.workItemId);
+		if (!events || !this.slackChatAdapter) return;
+		const finalSummary = this.githubWorkItemFinalSummary(workItem);
+		const text =
+			status === "awaiting_review"
+				? `Finished *${workItem.issue.title}*.${finalSummary ? `\n\n${finalSummary}` : ""}\n\nPull request${workItem.prUrls.length === 1 ? "" : "s"}:\n${workItem.prUrls.map((url) => `- <${url}|${url}>`).join("\n")}`
+				: status === "stopped"
+					? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
+					: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
+		await Promise.allSettled(
+			Array.from(events.entries()).flatMap(([parentSessionId, event]) => [
+				this.slackChatAdapter!.postDelegatedWorkMessage(event, text),
+				this.slackChatAdapter!.clearActivityStatus(event),
+				Promise.resolve(
+					this.chatSessionHandler?.setDelegatedWorkActive(
+						parentSessionId,
+						false,
+					),
+				),
+			]),
+		);
+		this.slackWorkItemEvents.delete(workItem.workItemId);
+	}
+
+	private githubWorkItemFinalSummary(
+		workItem: GitHubIssueWorkItemSession,
+	): string | undefined {
+		const messages =
+			this.agentSessionManager
+				.getSession(workItem.sessionId)
+				?.agentRunner?.getMessages() ?? [];
+		for (const message of [...messages].reverse()) {
+			if (
+				message.type === "result" &&
+				"result" in message &&
+				typeof message.result === "string" &&
+				message.result.trim()
+			) {
+				return message.result.trim().slice(0, 2_500);
+			}
+		}
+		return undefined;
+	}
+
 	private async startGitHubIssueWorkItem(
 		request: GitHubIssueStartRequest,
 		installationToken?: string,
@@ -1487,6 +1597,54 @@ export class EdgeWorker extends EventEmitter {
 			return {
 				sessionId: existing.sessionId,
 				status: existing.status,
+			};
+		}
+
+		const existingForIssue = Array.from(
+			this.gitHubIssueWorkItemSessions.values(),
+		).find(
+			(item) =>
+				item.repositoryFullName.toLowerCase() ===
+					request.repositoryFullName.toLowerCase() &&
+				item.issueNumber === request.issueNumber &&
+				item.status !== "stopped",
+		);
+		if (existingForIssue) {
+			const requestedTargets = [
+				...(request.targetRepositoryFullNames ?? [request.repositoryFullName]),
+			]
+				.map((value) => value.toLowerCase())
+				.sort();
+			const existingTargets = [
+				...(existingForIssue.targetRepositoryFullNames ?? [
+					existingForIssue.repositoryFullName,
+				]),
+			]
+				.map((value) => value.toLowerCase())
+				.sort();
+			if (
+				JSON.stringify(requestedTargets) !== JSON.stringify(existingTargets)
+			) {
+				throw this.gitHubWorkItemError(
+					"This issue already has a Cyrus work item with a different repository set. Stop it before restarting with additional repositories.",
+					409,
+				);
+			}
+			if (existingForIssue.status === "failed") {
+				return this.startGitHubIssueWorkItem(
+					{ ...request, workItemId: existingForIssue.workItemId },
+					installationToken,
+				);
+			}
+			if (existingForIssue.status === "stopped") {
+				throw this.gitHubWorkItemError(
+					"The previous Cyrus work item is still stopping",
+					409,
+				);
+			}
+			return {
+				sessionId: existingForIssue.sessionId,
+				status: existingForIssue.status,
 			};
 		}
 
@@ -1594,6 +1752,7 @@ export class EdgeWorker extends EventEmitter {
 				repositories.map((target) => [target.id, branchName]),
 			),
 			prUrls: [],
+			slackSubscribers: [],
 			runnerType: request.runnerType,
 			issue: issueMinimal,
 			status: "starting",
@@ -1612,6 +1771,7 @@ export class EdgeWorker extends EventEmitter {
 					targetRepositoryFullNames,
 					branchNames: workItemSession.branchNames,
 					prUrls: [],
+					slackSubscribers: [],
 					runnerType: request.runnerType,
 					status: "starting",
 				},
@@ -1751,6 +1911,7 @@ export class EdgeWorker extends EventEmitter {
 			sessionId: workItem.sessionId,
 			runnerType: workItem.runnerType,
 		});
+		await this.finishSlackWorkItem(workItem, "stopped");
 	}
 
 	private async createGitHubIssueRunner(
@@ -1806,6 +1967,11 @@ export class EdgeWorker extends EventEmitter {
 		const runnerConfig = config as AgentRunnerConfig & {
 			additionalEnv?: Record<string, string>;
 		};
+		const baseOnMessage = runnerConfig.onMessage;
+		runnerConfig.onMessage = async (message) => {
+			await baseOnMessage?.(message);
+			await this.updateSlackWorkItemActivity(workItem, message);
+		};
 		runnerConfig.additionalEnv = {
 			...runnerConfig.additionalEnv,
 			GH_TOKEN: githubToken,
@@ -1859,6 +2025,7 @@ export class EdgeWorker extends EventEmitter {
 				prUrls,
 			});
 			this.setGitHubIssueWorkItemStatus(workItem, "awaiting_review");
+			await this.finishSlackWorkItem(workItem, "awaiting_review");
 			this.emit("session:ended", workItem.issue.id, 0, workItem.repository.id);
 			this.config.handlers?.onSessionEnd?.(
 				workItem.issue.id,
@@ -1884,6 +2051,7 @@ export class EdgeWorker extends EventEmitter {
 				error: err.message,
 			});
 			this.setGitHubIssueWorkItemStatus(workItem, "failed");
+			await this.finishSlackWorkItem(workItem, "failed");
 			this.emit("session:ended", workItem.issue.id, 1, workItem.repository.id);
 			this.config.handlers?.onSessionEnd?.(
 				workItem.issue.id,
@@ -2226,6 +2394,7 @@ Investigate across every participating repository. Modify only repositories that
 				),
 			prUrls: metadata.prUrls ?? [],
 			error: metadata.error,
+			slackSubscribers: metadata.slackSubscribers ?? [],
 			runnerType: metadata.runnerType,
 			issue: persistedSession.issue,
 			// Runners are process-local. A previously running session must resume
@@ -2247,6 +2416,8 @@ Investigate across every participating repository. Modify only repositories that
 			session.metadata.githubWorkItem.status = status;
 			session.metadata.githubWorkItem.prUrls = workItem.prUrls;
 			session.metadata.githubWorkItem.error = workItem.error;
+			session.metadata.githubWorkItem.slackSubscribers =
+				workItem.slackSubscribers;
 		}
 	}
 
@@ -6968,8 +7139,20 @@ ${taskSection}`;
 						runnerType: this.runnerSelectionService.getDefaultRunner(),
 						requestId: randomUUID(),
 					});
+					const actualWorkItemId =
+						Array.from(this.gitHubIssueWorkItemSessions.values()).find(
+							(item) => item.sessionId === result.sessionId,
+						)?.workItemId ?? workItemId;
+					if (parentSessionId) {
+						await this.attachSlackSubscriber(actualWorkItemId, parentSessionId);
+						const workItem =
+							this.getGitHubIssueWorkItemSession(actualWorkItemId);
+						if (workItem && result.status === "awaiting_review") {
+							await this.finishSlackWorkItem(workItem, "awaiting_review");
+						}
+					}
 					return {
-						workItemId,
+						workItemId: actualWorkItemId,
 						...result,
 						targetRepositories: targets.fullNames,
 					};

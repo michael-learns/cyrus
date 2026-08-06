@@ -55,6 +55,8 @@ pnpm run server:dev
 - `CYRUS_PORT` - Server port (default: 3600)
 - `CYRUS_REPO_PATH` - Path to repository to test (default: current directory)
 - `CYRUS_REPO_GITHUB_URL` - GitHub URL matched by GitHub Issue work-item requests (default: the synthetic F1 repository URL)
+- `CYRUS_REPO_PATH_2` / `CYRUS_REPO_GITHUB_URL_2` - optional second local clone and GitHub URL for coordinated multi-repository tests
+- `CYRUS_CLAUDE_MODEL` - optional Claude model override for real harness runs
 
 Once started, the server displays:
 ```

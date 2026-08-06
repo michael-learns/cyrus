@@ -177,6 +177,8 @@ export class ChatSessionHandler<TEvent> {
 	private pendingFollowups: Map<string, TEvent[]> = new Map();
 	/** Last scheduled-work status posted for each session, used to avoid duplicates. */
 	private pendingWorkNotificationKeys: Map<string, string> = new Map();
+	/** Child engineering jobs that temporarily own this chat thread's status. */
+	private delegatedWorkSessions = new Set<string>();
 
 	constructor(
 		adapter: ChatPlatformAdapter<TEvent>,
@@ -479,6 +481,20 @@ export class ChatSessionHandler<TEvent> {
 		return this.sessionManager.getAgentRunner(sessionId);
 	}
 
+	/** Resolve the latest platform event for a chat session without exposing it to the model. */
+	getLatestEventForSession(sessionId: string): TEvent | undefined {
+		return (
+			this.pendingReplyEvents.get(sessionId)?.at(-1) ??
+			this.lastReplyEvent.get(sessionId)
+		);
+	}
+
+	/** Keep the chat status alive while a delegated child session is running. */
+	setDelegatedWorkActive(sessionId: string, active: boolean): void {
+		if (active) this.delegatedWorkSessions.add(sessionId);
+		else this.delegatedWorkSessions.delete(sessionId);
+	}
+
 	/** Mark how far this session has thread context, for the next catch-up */
 	private recordThreadContextTs(
 		session: CyrusAgentSession,
@@ -696,7 +712,9 @@ export class ChatSessionHandler<TEvent> {
 						error instanceof Error ? error : new Error(String(error)),
 					);
 				} finally {
-					await this.clearActivityStatus(replyEvent);
+					if (!this.delegatedWorkSessions.has(sessionId)) {
+						await this.clearActivityStatus(replyEvent);
+					}
 				}
 				// Fire-and-forget processed acknowledgement for every drained
 				// event (e.g., swap the receipt reaction) — runs even when

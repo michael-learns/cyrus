@@ -117,6 +117,13 @@ export interface CyrusAgentSession {
 			branchNames?: Record<string, string>;
 			prUrls?: string[];
 			error?: string;
+			slackSubscribers?: Array<{
+				parentSessionId: string;
+				teamId: string;
+				channel: string;
+				threadTs: string;
+				user: string;
+			}>;
 			runnerType: "claude" | "gemini" | "codex" | "cursor";
 			status:
 				| "starting"
