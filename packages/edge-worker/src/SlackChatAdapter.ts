@@ -39,6 +39,27 @@ const THREAD_CONTEXT_MESSAGE_LIMIT = 50;
  */
 const THREAD_CATCHUP_SCAN_LIMIT = 2000;
 
+/** Slack removes an assistant status after two minutes without a reply. */
+const ACTIVITY_STATUS_REFRESH_MS = 90_000;
+
+/** Avoid turning a busy tool stream into a Slack API call per SDK message. */
+const ACTIVITY_STATUS_MIN_INTERVAL_MS = 2_000;
+
+/** Keep task-specific status text useful without taking over the composer. */
+const ACTIVITY_SUBJECT_MAX_LENGTH = 80;
+
+interface SlackActivityStatusState {
+	subject: string;
+	event: SlackWebhookEvent;
+	desiredStatus: string;
+	queuedStatus?: string;
+	lastSentStatus?: string;
+	lastRequestedAt: number;
+	delivery: Promise<void>;
+	throttleTimer?: ReturnType<typeof setTimeout>;
+	refreshTimer?: ReturnType<typeof setTimeout>;
+}
+
 /** Reaction added when a message is received and queued for processing (👀) */
 export const RECEIPT_REACTION = "eyes";
 
@@ -66,6 +87,7 @@ export class SlackChatAdapter
 	private selfIdentityPromise:
 		| Promise<{ botId: string | undefined; userId: string } | undefined>
 		| undefined;
+	private activityStatuses = new Map<string, SlackActivityStatusState>();
 
 	constructor(
 		repositoryProvider: ChatRepositoryProvider,
@@ -139,6 +161,85 @@ export class SlackChatAdapter
 
 	extractTaskInstructions(event: SlackWebhookEvent): string {
 		return buildPromptText(event.payload) || "Ask the user for more context";
+	}
+
+	async startActivityStatus(
+		event: SlackWebhookEvent,
+		taskInstructions: string,
+	): Promise<void> {
+		const threadKey = this.getThreadKey(event);
+		let state = this.activityStatuses.get(threadKey);
+		if (!state) {
+			state = {
+				subject: this.sanitizeActivitySubject(taskInstructions),
+				event,
+				desiredStatus: "",
+				lastRequestedAt: 0,
+				delivery: Promise.resolve(),
+			};
+			this.activityStatuses.set(threadKey, state);
+		} else {
+			state.subject = this.sanitizeActivitySubject(taskInstructions);
+			state.event = event;
+		}
+
+		return this.requestActivityStatus(
+			threadKey,
+			state,
+			this.formatActivityStatus("is getting started on", state.subject),
+			true,
+		);
+	}
+
+	async updateActivityStatus(
+		event: SlackWebhookEvent,
+		message: SDKMessage,
+	): Promise<void> {
+		const threadKey = this.getThreadKey(event);
+		const state = this.activityStatuses.get(threadKey);
+		if (!state || message.type === "result") return;
+
+		state.event = event;
+		const verb = this.activityVerbForMessage(message);
+		return this.requestActivityStatus(
+			threadKey,
+			state,
+			this.formatActivityStatus(verb, state.subject),
+		);
+	}
+
+	async setBackgroundActivityStatus(event: SlackWebhookEvent): Promise<void> {
+		const threadKey = this.getThreadKey(event);
+		const state = this.activityStatuses.get(threadKey);
+		if (!state) return;
+
+		state.event = event;
+		return this.requestActivityStatus(
+			threadKey,
+			state,
+			this.formatActivityStatus(
+				"is waiting for background work on",
+				state.subject,
+			),
+			true,
+		);
+	}
+
+	async clearActivityStatus(event: SlackWebhookEvent): Promise<void> {
+		const threadKey = this.getThreadKey(event);
+		const state = this.activityStatuses.get(threadKey);
+		if (!state) return;
+
+		if (state.throttleTimer) clearTimeout(state.throttleTimer);
+		if (state.refreshTimer) clearTimeout(state.refreshTimer);
+		state.throttleTimer = undefined;
+		state.refreshTimer = undefined;
+		state.desiredStatus = "";
+
+		await this.enqueueActivityStatus(state, "");
+		if (this.activityStatuses.get(threadKey) === state) {
+			this.activityStatuses.delete(threadKey);
+		}
 	}
 
 	/**
@@ -535,6 +636,162 @@ Supported mrkdwn syntax:
 			text: "I'm still working on the previous request in this thread. I'll pick up your new message once I'm done.",
 			thread_ts: threadTs,
 		});
+	}
+
+	private sanitizeActivitySubject(taskInstructions: string): string {
+		const sanitized = taskInstructions
+			.replace(/<@[A-Z0-9]+>/gi, "")
+			.replace(/<(?:https?:\/\/|mailto:)[^>|]+(?:\|([^>]+))?>/gi, "$1")
+			.replace(/https?:\/\/\S+/gi, "")
+			.replace(
+				/\b(xox[a-z]-[a-z0-9-]+|gh[pousr]_[a-z0-9]+|sk-[a-z0-9_-]+)\b/gi,
+				"[redacted]",
+			)
+			.replace(
+				/\b(api[_ -]?key|token|password|secret)\s*[:=]\s*\S+/gi,
+				"$1=[redacted]",
+			)
+			.replace(/[`*_~]/g, "")
+			.replace(/\s+/g, " ")
+			.trim();
+		if (!sanitized) return "your request";
+		if (sanitized.length <= ACTIVITY_SUBJECT_MAX_LENGTH) return sanitized;
+		return `${sanitized.slice(0, ACTIVITY_SUBJECT_MAX_LENGTH - 1).trimEnd()}…`;
+	}
+
+	private formatActivityStatus(verb: string, subject: string): string {
+		return subject === "your request"
+			? `${verb} your request…`
+			: `${verb} “${subject}”…`;
+	}
+
+	private activityVerbForMessage(message: SDKMessage): string {
+		if (message.type === "system") return "is preparing to work on";
+		if (message.type === "user") return "is reviewing results for";
+		if (message.type !== "assistant") return "is thinking about";
+
+		const assistantMessage = message as {
+			message?: {
+				content?: Array<{
+					type?: string;
+					name?: string;
+					input?: Record<string, unknown>;
+				}>;
+			};
+		};
+		const toolUse = assistantMessage.message?.content?.find(
+			(block) => block.type === "tool_use" && typeof block.name === "string",
+		);
+		if (!toolUse?.name) return "is thinking about";
+
+		const toolName = toolUse.name.toLowerCase();
+		if (toolName === "read") return "is inspecting code for";
+		if (toolName === "glob" || toolName === "grep") {
+			return "is searching code for";
+		}
+		if (["edit", "write", "notebookedit"].includes(toolName)) {
+			return "is editing code for";
+		}
+		if (
+			toolName === "websearch" ||
+			toolName === "webfetch" ||
+			toolName.includes("search")
+		) {
+			return "is researching";
+		}
+		if (toolName === "task" || toolName.includes("agent")) {
+			return "is coordinating background work for";
+		}
+		if (toolName === "bash") {
+			const command =
+				typeof toolUse.input?.command === "string"
+					? toolUse.input.command.toLowerCase()
+					: "";
+			if (/\b(test|vitest|jest|pytest|typecheck|lint|build)\b/.test(command)) {
+				return "is running checks for";
+			}
+			if (/\bgit\b/.test(command))
+				return "is inspecting repository history for";
+		}
+
+		return "is working on";
+	}
+
+	private async requestActivityStatus(
+		threadKey: string,
+		state: SlackActivityStatusState,
+		status: string,
+		immediate = false,
+	): Promise<void> {
+		state.desiredStatus = status;
+		if (
+			!immediate &&
+			(status === state.queuedStatus || status === state.lastSentStatus)
+		) {
+			return state.delivery;
+		}
+
+		if (state.throttleTimer) {
+			clearTimeout(state.throttleTimer);
+			state.throttleTimer = undefined;
+		}
+
+		const elapsed = Date.now() - state.lastRequestedAt;
+		if (!immediate && elapsed < ACTIVITY_STATUS_MIN_INTERVAL_MS) {
+			state.throttleTimer = setTimeout(() => {
+				state.throttleTimer = undefined;
+				if (this.activityStatuses.get(threadKey) !== state) return;
+				void this.enqueueActivityStatus(state, state.desiredStatus);
+			}, ACTIVITY_STATUS_MIN_INTERVAL_MS - elapsed);
+			state.throttleTimer.unref?.();
+			return state.delivery;
+		}
+
+		return this.enqueueActivityStatus(state, status);
+	}
+
+	private enqueueActivityStatus(
+		state: SlackActivityStatusState,
+		status: string,
+	): Promise<void> {
+		state.queuedStatus = status;
+		state.lastRequestedAt = Date.now();
+		state.delivery = state.delivery
+			.catch(() => undefined)
+			.then(async () => {
+				const token = this.getSlackBotToken(state.event);
+				if (!token) return;
+
+				const threadTs =
+					state.event.payload.thread_ts || state.event.payload.ts;
+				try {
+					await new SlackMessageService().setAssistantThreadStatus({
+						token,
+						channel_id: state.event.payload.channel,
+						thread_ts: threadTs,
+						status,
+					});
+					state.lastSentStatus = status;
+				} catch (error) {
+					this.logger.warn(
+						`Failed to set Slack activity status: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				} finally {
+					if (state.queuedStatus === status) state.queuedStatus = undefined;
+				}
+
+				if (state.refreshTimer) clearTimeout(state.refreshTimer);
+				state.refreshTimer = undefined;
+				if (!status || state.desiredStatus !== status) return;
+
+				state.refreshTimer = setTimeout(() => {
+					state.refreshTimer = undefined;
+					void this.enqueueActivityStatus(state, state.desiredStatus);
+				}, ACTIVITY_STATUS_REFRESH_MS);
+				state.refreshTimer.unref?.();
+			});
+
+		return state.delivery;
 	}
 
 	private isSelfMessage(msg: SlackThreadMessage, selfBotId?: string): boolean {
