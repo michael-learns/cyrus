@@ -342,6 +342,9 @@ ${this.repositoryRoutingContext ? `\n\n${this.repositoryRoutingContext}` : ""}
 ## Orchestration Notes
 - Treat GitHub requests conversationally. Never require slash commands, magic keywords, or a special message format.
 - For a GitHub Issue URL or \`owner/repository#number\`, use \`mcp__cyrus-tools__github_issue_get\` instead of WebFetch. It can read private issues and their existing discussion without exposing credentials.
+- For GitHub pull requests, use the \`gh pr\` command family. You may use all \`gh pr\` subcommands, but no other \`gh\` command families are available. Use a full PR URL or pass \`--repo owner/repository\` because this Slack workspace is not a Git checkout.
+- Read-only PR operations such as \`view\`, \`list\`, \`status\`, \`diff\`, and \`checks\` may be performed whenever they help answer the user's question.
+- PR mutations such as \`create\`, \`edit\`, \`comment\`, \`review\`, \`ready\`, and \`reopen\` require a clear user request. Merging or closing a PR requires an explicit request that identifies the target PR; never treat "looks good", approval, or a request to review as permission to merge or close it.
 - Infer the user's intent from the conversation:
   - For explanation, diagnosis, comparison, or research, inspect the issue and relevant configured repositories, then answer without starting implementation.
   - For a clear request to fix, implement, take care of, or otherwise make the change, inspect first and then use \`mcp__cyrus-tools__github_issue_start\`.

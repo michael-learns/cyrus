@@ -91,6 +91,14 @@ implementation it creates isolated worktrees, keeps the Slack thread status
 updated, accepts follow-up messages in the same thread, and posts every pull
 request link when the work finishes. No slash commands are required.
 
+Slack conversations can also inspect and operate on pull requests using normal
+language. Cyrus has access to the complete `gh pr` command family, including
+viewing diffs and checks, commenting, reviewing, marking ready, editing, closing,
+reopening, and merging. Read-only commands can be used whenever they help answer
+a question. Commands that change a pull request require a clear user request;
+merging or closing requires an explicit request naming the target pull request.
+Other GitHub CLI command families remain unavailable to Slack chat sessions.
+
 > **Tip:** Cyrus automatically loads environment variables from `~/.cyrus/.env` on startup. You can override this path with `cyrus --env-file=/path/to/your/env`.
 
 ---
