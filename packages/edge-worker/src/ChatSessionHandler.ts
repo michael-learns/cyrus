@@ -38,7 +38,7 @@ export interface ChatPlatformAdapter<TEvent> {
 	 * Optional — when omitted, every event is treated as session-initiating
 	 * (the behaviour for platforms where every event is an explicit invocation).
 	 */
-	isSessionInitiatingEvent?(event: TEvent): boolean;
+	isSessionInitiatingEvent?(event: TEvent): boolean | Promise<boolean>;
 
 	/** Derive a unique thread key for session tracking (e.g., "C123:1704110400.000100") */
 	getThreadKey(event: TEvent): string;
@@ -270,10 +270,11 @@ export class ChatSessionHandler<TEvent> {
 			// start a session may do so — e.g. a Slack @mention. A plain follow-up
 			// message in an unbound thread must be ignored, otherwise every message
 			// in any channel Cyrus can see would spin up a session.
-			if (
-				!existingSessionId &&
-				this.adapter.isSessionInitiatingEvent?.(event) === false
-			) {
+			const mayInitiateSession =
+				!existingSessionId && this.adapter.isSessionInitiatingEvent
+					? await this.adapter.isSessionInitiatingEvent(event)
+					: true;
+			if (!existingSessionId && !mayInitiateSession) {
 				this.logger.info(
 					`Ignoring non-initiating ${this.adapter.platformName} event for unbound thread ${threadKey}`,
 				);

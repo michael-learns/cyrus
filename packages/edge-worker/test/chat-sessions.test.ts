@@ -479,31 +479,93 @@ describe("ChatSessionHandler busy follow-up queueing", () => {
 });
 
 describe("SlackChatAdapter session initiation", () => {
-	it("treats app_mention as session-initiating", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		delete process.env.SLACK_BOT_TOKEN;
+	});
+
+	const directMessage = (text: string): SlackWebhookEvent => ({
+		eventType: "message",
+		eventId: "Ev-direct",
+		teamId: "T1",
+		slackBotToken: "xoxb-test",
+		upstreamGated: false,
+		payload: {
+			type: "message",
+			user: "U1",
+			channel: "C1",
+			text,
+			ts: "1700000000.000200",
+			thread_ts: "1700000000.000100",
+			event_ts: "1700000000.000200",
+		},
+	});
+
+	it("treats app_mention as session-initiating", async () => {
 		const adapter = new SlackChatAdapter(createStaticProvider([]));
-		expect(
+		await expect(
 			adapter.isSessionInitiatingEvent({ eventType: "app_mention" } as any),
-		).toBe(true);
+		).resolves.toBe(true);
 	});
 
-	it("ignores a non-upstream-gated message (direct mode, unbound thread)", () => {
+	it("treats a direct message event containing its own mention as session-initiating", async () => {
+		vi.spyOn(SlackMessageService.prototype, "getIdentity").mockResolvedValue({
+			bot_id: "B0BOT",
+			user_id: "U0BOT",
+		});
 		const adapter = new SlackChatAdapter(createStaticProvider([]));
-		expect(
-			adapter.isSessionInitiatingEvent({
-				eventType: "message",
-				upstreamGated: false,
-			} as any),
-		).toBe(false);
+
+		await expect(
+			adapter.isSessionInitiatingEvent(
+				directMessage("<@U0BOT> compare these repositories"),
+			),
+		).resolves.toBe(true);
 	});
 
-	it("treats an upstream-gated message as session-initiating (proxy mode survives restart)", () => {
+	it("ignores a direct message event that mentions somebody else", async () => {
+		vi.spyOn(SlackMessageService.prototype, "getIdentity").mockResolvedValue({
+			bot_id: "B0BOT",
+			user_id: "U0BOT",
+		});
 		const adapter = new SlackChatAdapter(createStaticProvider([]));
-		expect(
+
+		await expect(
+			adapter.isSessionInitiatingEvent(
+				directMessage("<@U_SOMEONE_ELSE> can you help?"),
+			),
+		).resolves.toBe(false);
+	});
+
+	it("ignores a non-upstream-gated message without a mention", async () => {
+		vi.spyOn(SlackMessageService.prototype, "getIdentity").mockResolvedValue({
+			bot_id: "B0BOT",
+			user_id: "U0BOT",
+		});
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		await expect(
+			adapter.isSessionInitiatingEvent(directMessage("hello channel")),
+		).resolves.toBe(false);
+	});
+
+	it("fails closed when its Slack identity cannot be resolved", async () => {
+		vi.spyOn(SlackMessageService.prototype, "getIdentity").mockRejectedValue(
+			new Error("invalid_auth"),
+		);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+
+		await expect(
+			adapter.isSessionInitiatingEvent(directMessage("<@U0BOT> help")),
+		).resolves.toBe(false);
+	});
+
+	it("treats an upstream-gated message as session-initiating (proxy mode survives restart)", async () => {
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		await expect(
 			adapter.isSessionInitiatingEvent({
 				eventType: "message",
 				upstreamGated: true,
 			} as any),
-		).toBe(true);
+		).resolves.toBe(true);
 	});
 });
 

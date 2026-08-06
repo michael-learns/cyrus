@@ -58,7 +58,12 @@ export class SlackChatAdapter
 	private repositoryRoutingContext: string;
 	private behavioursPageUrl: string;
 	private logger: ILogger;
-	private selfBotId: string | undefined;
+	private selfIdentity:
+		| { botId: string | undefined; userId: string }
+		| undefined;
+	private selfIdentityPromise:
+		| Promise<{ botId: string | undefined; userId: string } | undefined>
+		| undefined;
 
 	constructor(
 		repositoryProvider: ChatRepositoryProvider,
@@ -98,20 +103,36 @@ export class SlackChatAdapter
 		return event.slackBotToken ?? process.env.SLACK_BOT_TOKEN;
 	}
 
+	private async getSelfIdentity(
+		token: string,
+	): Promise<{ botId: string | undefined; userId: string } | undefined> {
+		if (this.selfIdentity) return this.selfIdentity;
+		if (this.selfIdentityPromise) return this.selfIdentityPromise;
+
+		this.selfIdentityPromise = new SlackMessageService()
+			.getIdentity(token)
+			.then((identity) => {
+				this.selfIdentity = {
+					botId: identity.bot_id,
+					userId: identity.user_id,
+				};
+				return this.selfIdentity;
+			})
+			.catch((error) => {
+				this.logger.warn(
+					`Failed to resolve bot identity: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return undefined;
+			})
+			.finally(() => {
+				this.selfIdentityPromise = undefined;
+			});
+
+		return this.selfIdentityPromise;
+	}
+
 	private async getSelfBotId(token: string): Promise<string | undefined> {
-		if (this.selfBotId) {
-			return this.selfBotId;
-		}
-		try {
-			const identity = await new SlackMessageService().getIdentity(token);
-			this.selfBotId = identity.bot_id;
-			return this.selfBotId;
-		} catch (error) {
-			this.logger.warn(
-				`Failed to resolve bot identity: ${error instanceof Error ? error.message : String(error)}`,
-			);
-			return undefined;
-		}
+		return (await this.getSelfIdentity(token))?.botId;
 	}
 
 	extractTaskInstructions(event: SlackWebhookEvent): string {
@@ -123,7 +144,10 @@ export class SlackChatAdapter
 	 * in-memory binding for its thread.
 	 *
 	 * - An explicit @mention always may.
-	 * - A plain `message` event may only when it was upstream-gated (proxy mode):
+	 * - A plain `message` event may when it contains an exact mention of this
+	 *   bot's Slack user ID. Slack can deliver the `message` copy before the
+	 *   equivalent `app_mention`, and transport de-duplication keeps the first.
+	 * - A plain `message` event also may when it was upstream-gated (proxy mode):
 	 *   CYHOST forwards `message` events solely for threads it has a persistent
 	 *   binding row for, so reaching us means the thread is genuinely bound. This
 	 *   is what lets Cyrus keep answering follow-ups after a process restart wipes
@@ -132,8 +156,16 @@ export class SlackChatAdapter
 	 *   such guarantee, so an unbound plain message is ignored to avoid starting a
 	 *   session for arbitrary channel chatter.
 	 */
-	isSessionInitiatingEvent(event: SlackWebhookEvent): boolean {
-		return event.eventType === "app_mention" || event.upstreamGated === true;
+	async isSessionInitiatingEvent(event: SlackWebhookEvent): Promise<boolean> {
+		if (event.eventType === "app_mention" || event.upstreamGated === true) {
+			return true;
+		}
+
+		const token = this.getSlackBotToken(event);
+		if (!token) return false;
+
+		const userId = (await this.getSelfIdentity(token))?.userId;
+		return Boolean(userId && event.payload.text.includes(`<@${userId}>`));
 	}
 
 	getThreadKey(event: SlackWebhookEvent): string {
