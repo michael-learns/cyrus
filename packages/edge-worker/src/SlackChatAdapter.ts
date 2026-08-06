@@ -1,4 +1,5 @@
-import type { IAgentRunner, ILogger } from "cyrus-core";
+import type { SDKMessage } from "cyrus-claude-runner";
+import type { AgentPendingWork, IAgentRunner, ILogger } from "cyrus-core";
 import { createLogger } from "cyrus-core";
 import {
 	buildPromptText,
@@ -9,6 +10,7 @@ import {
 } from "cyrus-slack-event-transport";
 import type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import type { ChatPlatformAdapter } from "./ChatSessionHandler.js";
+import { formatPendingWorkThought } from "./PendingWorkFormatter.js";
 
 /**
  * Sentinel the agent emits when it has decided a Slack message does not warrant
@@ -355,16 +357,32 @@ Supported mrkdwn syntax:
 	async postReply(
 		event: SlackWebhookEvent,
 		runner: IAgentRunner,
+		resultMessage?: Extract<SDKMessage, { type: "result" }>,
 	): Promise<void> {
 		try {
-			// Get the last assistant message from the runner as the summary
+			// Prefer the result for this exact turn. Runner history may have no
+			// assistant entry yet, or its last entry may belong to an earlier turn.
 			const messages = runner.getMessages();
 			const lastAssistantMessage = [...messages]
 				.reverse()
 				.find((m) => m.type === "assistant");
 
-			let summary = "Task completed.";
+			let summary = "";
 			if (
+				resultMessage &&
+				"result" in resultMessage &&
+				typeof resultMessage.result === "string"
+			) {
+				summary = resultMessage.result.trim();
+			} else if (
+				resultMessage &&
+				"errors" in resultMessage &&
+				Array.isArray(resultMessage.errors)
+			) {
+				summary = resultMessage.errors.join("\n").trim();
+			}
+			if (
+				!summary &&
 				lastAssistantMessage &&
 				lastAssistantMessage.type === "assistant" &&
 				"message" in lastAssistantMessage
@@ -378,8 +396,15 @@ Supported mrkdwn syntax:
 					(block) => block.type === "text" && block.text,
 				);
 				if (textBlock?.text) {
-					summary = textBlock.text;
+					summary = textBlock.text.trim();
 				}
+			}
+
+			if (!summary) {
+				this.logger.warn(
+					`Skipping empty Slack reply for channel ${event.payload.channel}`,
+				);
+				return;
 			}
 
 			// The agent emits the no-response sentinel when it judged this message
@@ -421,6 +446,33 @@ Supported mrkdwn syntax:
 				error instanceof Error ? error : new Error(String(error)),
 			);
 		}
+	}
+
+	async postPendingStatus(
+		event: SlackWebhookEvent,
+		pendingWork: AgentPendingWork,
+	): Promise<void> {
+		const status = formatPendingWorkThought(pendingWork);
+		if (!status) return;
+
+		const token = this.getSlackBotToken(event);
+		if (!token) {
+			this.logger.warn(
+				"Cannot post pending Slack status: no slackBotToken available",
+			);
+			return;
+		}
+
+		const threadTs = event.payload.thread_ts || event.payload.ts;
+		await new SlackMessageService().postMessage({
+			token,
+			channel: event.payload.channel,
+			text: status,
+			thread_ts: threadTs,
+		});
+		this.logger.info(
+			`Posted pending Slack status to channel ${event.payload.channel} (thread ${threadTs})`,
+		);
 	}
 
 	async acknowledgeReceipt(event: SlackWebhookEvent): Promise<void> {
