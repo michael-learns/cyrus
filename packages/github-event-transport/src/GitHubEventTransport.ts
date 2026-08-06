@@ -9,6 +9,7 @@ import type {
 	GitHubEventTransportEvents,
 	GitHubEventType,
 	GitHubIssueCommentPayload,
+	GitHubIssuesPayload,
 	GitHubPullRequestReviewCommentPayload,
 	GitHubPullRequestReviewPayload,
 	GitHubPushPayload,
@@ -39,6 +40,7 @@ export declare interface GitHubEventTransport {
  * 2. "signature" mode: Verifies GitHub's HMAC-SHA256 signature (cloud)
  *
  * Supported GitHub event types:
+ * - issues: Issue creation and lifecycle updates for the Cyrus work inbox
  * - issue_comment: Comments on PR issues (top-level PR comments)
  * - pull_request_review_comment: Inline review comments on PR diffs
  * - pull_request_review: PR review submissions (e.g., changes_requested)
@@ -240,6 +242,7 @@ export class GitHubEventTransport extends EventEmitter {
 		}
 
 		if (
+			eventType !== "issues" &&
 			eventType !== "issue_comment" &&
 			eventType !== "pull_request_review_comment" &&
 			eventType !== "pull_request_review" &&
@@ -251,6 +254,7 @@ export class GitHubEventTransport extends EventEmitter {
 		}
 
 		const payload = request.body as
+			| GitHubIssuesPayload
 			| GitHubIssueCommentPayload
 			| GitHubPullRequestReviewCommentPayload
 			| GitHubPullRequestReviewPayload
@@ -259,6 +263,29 @@ export class GitHubEventTransport extends EventEmitter {
 		// Push events don't have an action field — always emit them
 		if (eventType === "push") {
 			// No action filtering needed for push events
+		} else if (eventType === "issues") {
+			const issuePayload = payload as GitHubIssuesPayload;
+			const supportedActions: GitHubIssuesPayload["action"][] = [
+				"opened",
+				"edited",
+				"closed",
+				"reopened",
+				"labeled",
+				"unlabeled",
+			];
+			if (!supportedActions.includes(issuePayload.action)) {
+				this.logger.debug(
+					`Ignoring ${eventType} with action: ${issuePayload.action}`,
+				);
+				reply.code(200).send({ success: true, ignored: true });
+				return;
+			}
+
+			if (issuePayload.issue.pull_request) {
+				this.logger.debug("Ignoring issues event for a pull request");
+				reply.code(200).send({ success: true, ignored: true });
+				return;
+			}
 		} else if (eventType === "pull_request_review") {
 			// For pull_request_review, handle 'submitted' action (not 'created')
 			if ((payload as GitHubPullRequestReviewPayload).action !== "submitted") {
@@ -289,8 +316,11 @@ export class GitHubEventTransport extends EventEmitter {
 		// Emit "event" for legacy compatibility
 		this.emit("event", webhookEvent);
 
-		// Emit "message" with translated internal message
-		this.emitMessage(webhookEvent);
+		// Issue lifecycle events are consumed by the work-item control plane and do
+		// not yet have an InternalMessage equivalent.
+		if (webhookEvent.eventType !== "issues") {
+			this.emitMessage(webhookEvent);
+		}
 
 		reply.code(200).send({ success: true });
 	}

@@ -4,6 +4,7 @@ import { GitHubEventTransport } from "../src/GitHubEventTransport.js";
 import type { GitHubEventTransportConfig } from "../src/types.js";
 import {
 	issueCommentPayload,
+	issuesOpenedPayload,
 	prReviewCommentPayload,
 	prReviewPayload,
 } from "./fixtures.js";
@@ -323,6 +324,65 @@ describe("GitHubEventTransport", () => {
 				"x-github-event": "issue_comment",
 				"x-github-delivery": "delivery-789",
 			});
+			const reply = createMockReply();
+
+			const handler = mockFastify.routes["/github-webhook"]!;
+			await handler(request, reply);
+
+			expect(reply.code).toHaveBeenCalledWith(200);
+			expect(reply.send).toHaveBeenCalledWith({
+				success: true,
+				ignored: true,
+			});
+			expect(eventListener).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			"opened",
+			"edited",
+			"closed",
+			"reopened",
+			"labeled",
+			"unlabeled",
+		] as const)("processes issues.%s lifecycle events", async (action) => {
+			const eventListener = vi.fn();
+			const messageListener = vi.fn();
+			transport.on("event", eventListener);
+			transport.on("message", messageListener);
+
+			const payload = { ...issuesOpenedPayload, action };
+			const request = createMockRequest(payload, {
+				authorization: `Bearer ${testSecret}`,
+				"x-github-event": "issues",
+				"x-github-delivery": `delivery-issues-${action}`,
+			});
+			const reply = createMockReply();
+
+			const handler = mockFastify.routes["/github-webhook"]!;
+			await handler(request, reply);
+
+			expect(reply.code).toHaveBeenCalledWith(200);
+			expect(eventListener).toHaveBeenCalledWith({
+				eventType: "issues",
+				deliveryId: `delivery-issues-${action}`,
+				payload,
+				installationToken: undefined,
+			});
+			expect(messageListener).not.toHaveBeenCalled();
+		});
+
+		it("ignores unsupported issues actions", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const request = createMockRequest(
+				{ ...issuesOpenedPayload, action: "assigned" },
+				{
+					authorization: `Bearer ${testSecret}`,
+					"x-github-event": "issues",
+					"x-github-delivery": "delivery-issues-assigned",
+				},
+			);
 			const reply = createMockReply();
 
 			const handler = mockFastify.routes["/github-webhook"]!;

@@ -43,6 +43,8 @@ export type {
 	GitHubInstallation,
 	GitHubIssue,
 	GitHubIssueCommentPayload,
+	GitHubIssuesPayload,
+	GitHubLabel,
 	GitHubPullRequest,
 	GitHubPullRequestMinimal,
 	GitHubPullRequestRef,
