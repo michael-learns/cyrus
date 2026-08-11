@@ -446,7 +446,7 @@ When determining allowed tools, Cyrus follows this priority order:
 
 ## Core Repository Fields
 
-Each repository configuration includes these required fields:
+Each repository configuration can include these fields:
 
 - `id` - Unique identifier for the repository
 - `name` - Repository name
@@ -456,6 +456,32 @@ Each repository configuration includes these required fields:
 - `gitlabUrl` - GitLab repository URL (e.g., `"https://gitlab.com/group/project"`) — used for webhook matching and routing
 - `workspaceBaseDir` - Directory for git worktrees
 - `isActive` - Whether the repository is active
-- `linearWorkspaceId` - Linear workspace UUID (references a key in `linearWorkspaces`)
+- `linearWorkspaceId` - Optional Linear workspace UUID (references a key in `linearWorkspaces`); required only for Linear-routed repositories
 
-These fields are managed automatically during setup. For self-hosted instances, use the `cyrus self-auth-linear` and `cyrus self-add-repo` commands.
+For Linear-linked repositories, these fields are managed automatically by
+`cyrus self-auth-linear` and `cyrus self-add-repo`.
+
+### GitHub and Slack without Linear
+
+`linearWorkspaceId` is optional. A GitHub + Slack setup can configure a
+repository directly after cloning it locally:
+
+```json
+{
+  "repositories": [
+    {
+      "id": "github-repo-id",
+      "name": "api",
+      "repositoryPath": "/Users/you/.cyrus/repos/api",
+      "githubUrl": "https://github.com/your-org/api",
+      "baseBranch": "main",
+      "workspaceBaseDir": "/Users/you/.cyrus/worktrees",
+      "isActive": true
+    }
+  ]
+}
+```
+
+Use this approach when Cyrus is triggered from Slack or GitHub rather than
+Linear. Clone the repository before adding the configuration, then restart
+Cyrus or let its configuration watcher reload the change.

@@ -162,13 +162,16 @@ Construct the manifest, substituting `AGENT_NAME`, `HOMEPAGE_URL`, and `CYRUS_BA
   "default_events": [
     "issues",
     "issue_comment",
-    "organization",
     "pull_request_review",
     "pull_request_review_comment",
     "repository"
   ]
 }
 ```
+
+`organization` is intentionally not included: GitHub requires an organization
+permission for that event, and Cyrus does not need it for issue, pull request,
+or comment triggers.
 
 **Note:** `redirect_url` is required by GitHub's manifest flow. The actual redirect will include a `?code=` parameter appended to this URL — the code is what matters, not the destination page.
 
@@ -293,7 +296,8 @@ The GitHub App must be installed on the repositories Cyrus will monitor.
 
 > Go to: `https://github.com/apps/<GITHUB_APP_SLUG>/installations/new`
 >
-> Select which repositories (or "All repositories") and click **Install**.
+> Select the repositories Cyrus is configured to operate on, then click
+> **Install**. Do not select every organization repository by default.
 
 Or via browser automation (navigate to URL, select repos, click Install).
 
@@ -333,6 +337,18 @@ grep -c '^GITHUB_APP_INSTALLATION_ID=.' ~/.cyrus/.env
 ```
 
 Must return 1.
+
+## Step 12: Restart Cyrus
+
+Restart the Cyrus process after saving the GitHub App credentials. On startup,
+Cyrus detects `GITHUB_WEBHOOK_SECRET` together with `CYRUS_HOST_EXTERNAL=true`
+and enables direct GitHub signature verification for `/github-webhook`.
+
+For example, with pm2:
+
+```bash
+pm2 restart cyrus
+```
 
 ## Completion
 

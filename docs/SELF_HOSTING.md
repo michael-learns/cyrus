@@ -101,6 +101,42 @@ Other GitHub CLI command families remain unavailable to Slack chat sessions.
 
 > **Tip:** Cyrus automatically loads environment variables from `~/.cyrus/.env` on startup. You can override this path with `cyrus --env-file=/path/to/your/env`.
 
+### GitHub App webhooks without Linear
+
+To let GitHub comments and reviews trigger Cyrus directly, create a GitHub App
+and use these public webhook URLs:
+
+```text
+https://your-public-url.com/github-webhook
+https://your-public-url.com/slack-webhook
+```
+
+Install the GitHub App only on the repositories Cyrus should operate on. Its
+webhook configuration needs the `issues`, `issue_comment`,
+`pull_request_review`, `pull_request_review_comment`, and `repository` events,
+plus read/write access to repository contents, issues, and pull requests.
+
+For a direct self-hosted setup, the relevant part of `~/.cyrus/.env` looks like
+this:
+
+```dotenv
+CYRUS_BASE_URL=https://your-machine.your-tailnet.ts.net
+CYRUS_SERVER_PORT=3456
+CYRUS_HOST_EXTERNAL=true
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+GITHUB_WEBHOOK_SECRET=...
+GITHUB_APP_ID=...
+GITHUB_BOT_USERNAME=...
+```
+
+After adding GitHub App credentials, restart Cyrus so `/github-webhook` starts
+in direct GitHub signature-verification mode.
+
+Opening a GitHub Issue does not start a worker session by itself. Mention the
+configured GitHub App in an issue comment, pull request comment, or review to
+trigger work. You can also mention Cyrus in Slack with a GitHub Issue URL.
+
 ---
 
 ## Step 1: Set Up Public URL
@@ -305,6 +341,11 @@ pm2 start cyrus --name cyrus
 pm2 save
 pm2 startup
 ```
+
+`pm2 startup` prints a platform-specific command that you must run once. On
+macOS, it creates a launchd job for your user and normally requires `sudo`; it
+restores pm2's saved process list after reboot, but does not grant Cyrus any new
+Slack, GitHub, or network permissions.
 
 ### Using systemd (Linux)
 

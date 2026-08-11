@@ -9,6 +9,11 @@ description: Add one or more Git repositories to Cyrus configuration so it can p
 
 Adds Git repositories to Cyrus so it knows which codebases to work with.
 
+> **Linear requirement:** `cyrus self-add-repo` requires Linear credentials and
+> is only for Linear-linked repositories. For a GitHub + Slack setup without
+> Linear, configure repositories directly using the GitHub-only example in
+> [`docs/CONFIG_FILE.md`](../../docs/CONFIG_FILE.md#github-and-slack-without-linear).
+
 ## Step 1: Check Existing Repositories
 
 ```bash

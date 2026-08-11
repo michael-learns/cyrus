@@ -60,6 +60,16 @@ Subscriptions should use:
 https://your-machine.your-tailnet.ts.net/slack-webhook
 ```
 
+The GitHub App webhook URL is:
+
+```text
+https://your-machine.your-tailnet.ts.net/github-webhook
+```
+
+For direct GitHub delivery, set `CYRUS_HOST_EXTERNAL=true` and provide a
+non-empty `GITHUB_WEBHOOK_SECRET` in `~/.cyrus/.env` so Cyrus verifies GitHub's
+webhook signature.
+
 ## Slack Events Not Reaching Cyrus
 
 Use this section when all of the following are true:
