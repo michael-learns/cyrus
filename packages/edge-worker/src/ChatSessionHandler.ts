@@ -618,13 +618,33 @@ export class ChatSessionHandler<TEvent> {
 							prompt: cron.prompt,
 						})),
 					);
-					if (
-						this.pendingWorkNotificationKeys.get(sessionId) !== notificationKey
-					) {
+					const previousNotificationKey =
+						this.pendingWorkNotificationKeys.get(sessionId);
+					if (previousNotificationKey !== notificationKey) {
+						// Reserve the key BEFORE awaiting the platform call. `result`
+						// messages are emitted synchronously by the runner and handled on
+						// floating promises, so a second result (a recurring wakeup firing
+						// again, or a streamed turn completing) can reach this check while
+						// the first post is still in flight and duplicate the waiting notice.
+						this.pendingWorkNotificationKeys.set(sessionId, notificationKey);
 						try {
 							await this.adapter.postPendingStatus(replyEvent, pendingWork);
-							this.pendingWorkNotificationKeys.set(sessionId, notificationKey);
 						} catch (error) {
+							// Release the reservation so a later turn retries — unless a newer
+							// turn already claimed or cleared the key in the meantime.
+							if (
+								this.pendingWorkNotificationKeys.get(sessionId) ===
+								notificationKey
+							) {
+								if (previousNotificationKey === undefined) {
+									this.pendingWorkNotificationKeys.delete(sessionId);
+								} else {
+									this.pendingWorkNotificationKeys.set(
+										sessionId,
+										previousNotificationKey,
+									);
+								}
+							}
 							this.logger.error(
 								`Failed to post pending ${this.adapter.platformName} status for session ${sessionId}`,
 								error instanceof Error ? error : new Error(String(error)),

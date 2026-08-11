@@ -589,6 +589,89 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		expect(acknowledgeProcessed).toHaveBeenCalledTimes(1);
 	});
 
+	it("posts one waiting status when a second result lands while the first post is in flight", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"concurrent-scheduled-thread",
+		);
+		const postReply = vi
+			.spyOn(adapter, "postReply")
+			.mockResolvedValue(undefined);
+		const releasePendingStatus: Array<() => void> = [];
+		const postPendingStatus = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					releasePendingStatus.push(resolve);
+				}),
+		);
+		(adapter as any).postPendingStatus = postPendingStatus;
+		const pendingWork = {
+			sessionCrons: [
+				{
+					id: "cron-1",
+					schedule: "*/5 * * * *",
+					recurring: true,
+					prompt: "Check CI",
+				},
+			],
+			backgroundTasks: [],
+		};
+
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn().mockReturnValue(false),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+				getPendingWork: vi.fn(() => pendingWork),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		const event = {
+			eventId: "mention",
+			threadKey: "concurrent-scheduled-thread",
+		};
+		await handler.handleEvent(event);
+		const intermediateResult = {
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "",
+			session_id: "session-1",
+		};
+
+		// Hold the first platform post open so it is still in flight.
+		const firstResult = capturedConfig.onMessage(intermediateResult);
+		await vi.waitFor(() => expect(postPendingStatus).toHaveBeenCalledTimes(1));
+
+		// A second result for the same unchanged scheduled work arrives before
+		// the first post resolves — it must not duplicate the waiting notice.
+		const secondResult = capturedConfig.onMessage(intermediateResult);
+		for (let tick = 0; tick < 5; tick++) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+
+		for (const release of releasePendingStatus) release();
+		await Promise.all([firstResult, secondResult]);
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+		expect(postReply).not.toHaveBeenCalled();
+	});
+
 	it("finishes an error result even when the runner reports stale pending work", async () => {
 		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
 			"error-thread",
