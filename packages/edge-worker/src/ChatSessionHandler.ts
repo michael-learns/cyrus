@@ -88,7 +88,15 @@ export interface ChatPlatformAdapter<TEvent> {
 	setBackgroundActivityStatus?(event: TEvent): Promise<void>;
 
 	/** Clear the platform's transient activity indicator. */
-	clearActivityStatus?(event: TEvent): Promise<void>;
+	/**
+	 * Clear the platform's transient activity indicator. `retainState` hides the
+	 * displayed status but keeps the indicator's bookkeeping alive, for a session
+	 * that will wake itself again without a new inbound event.
+	 */
+	clearActivityStatus?(
+		event: TEvent,
+		options?: { retainState?: boolean },
+	): Promise<void>;
 
 	/** Acknowledge receipt of the event (e.g., emoji reaction). Fire-and-forget */
 	acknowledgeReceipt(event: TEvent): Promise<void>;
@@ -177,6 +185,13 @@ export class ChatSessionHandler<TEvent> {
 	private pendingFollowups: Map<string, TEvent[]> = new Map();
 	/** Last scheduled-work status posted for each session, used to avoid duplicates. */
 	private pendingWorkNotificationKeys: Map<string, string> = new Map();
+	// Serializes events for a thread that is not yet bound to a session. Binding
+	// spans several awaits (the adapter's session-initiation check, workspace
+	// creation), and until the binding lands `threadSessions` still reads as
+	// unbound — a follow-up that interleaved with those awaits would evaluate
+	// that stale snapshot, be judged non-initiating, and get discarded. Chaining
+	// makes each event for a thread observe the previous one's binding.
+	private threadEventQueues: Map<string, Promise<void>> = new Map();
 
 	constructor(
 		adapter: ChatPlatformAdapter<TEvent>,
@@ -198,8 +213,41 @@ export class ChatSessionHandler<TEvent> {
 	 * Main entry point — handles a single chat platform event.
 	 *
 	 * Replaces the per-platform handleXxxWebhook method in EdgeWorker.
+	 *
+	 * Events for the same thread run one at a time, so a message that arrives
+	 * while an earlier one is still establishing the thread → session binding
+	 * sees that binding instead of a stale "unbound" snapshot.
 	 */
 	async handleEvent(event: TEvent): Promise<void> {
+		const threadKey = this.adapter.getThreadKey(event);
+		// Once a thread is bound to a session, events may run concurrently — the
+		// catch-up cursor has its own monotonicity guard for that. Only the
+		// unbound window needs serializing, because binding spans several awaits
+		// and a follow-up landing inside it would read a stale "unbound" snapshot.
+		if (this.threadSessions.has(threadKey)) {
+			return this.processEvent(event);
+		}
+		const previous = this.threadEventQueues.get(threadKey) ?? Promise.resolve();
+		const next = previous.then(() => this.processEvent(event));
+		// Store an error-swallowing view of the chain so one failure never blocks
+		// later events for the thread (processEvent logs its own errors), and drop
+		// the entry once the thread goes idle again.
+		const chained: Promise<void> = next
+			.catch(() => undefined)
+			.then(() => {
+				if (this.threadEventQueues.get(threadKey) === chained) {
+					this.threadEventQueues.delete(threadKey);
+				}
+			});
+		this.threadEventQueues.set(threadKey, chained);
+		return next;
+	}
+
+	/**
+	 * Processes a single event. Invoked only through the per-thread queue in
+	 * handleEvent, so at most one event per thread is ever in flight.
+	 */
+	private async processEvent(event: TEvent): Promise<void> {
 		this.deps.onWebhookStart();
 
 		try {
@@ -648,13 +696,33 @@ export class ChatSessionHandler<TEvent> {
 							prompt: cron.prompt,
 						})),
 					);
-					if (
-						this.pendingWorkNotificationKeys.get(sessionId) !== notificationKey
-					) {
+					const previousNotificationKey =
+						this.pendingWorkNotificationKeys.get(sessionId);
+					if (previousNotificationKey !== notificationKey) {
+						// Reserve the key BEFORE awaiting the platform call. `result`
+						// messages are emitted synchronously by the runner and handled on
+						// floating promises, so a second result (a recurring wakeup firing
+						// again, or a streamed turn completing) can reach this check while
+						// the first post is still in flight and duplicate the waiting notice.
+						this.pendingWorkNotificationKeys.set(sessionId, notificationKey);
 						try {
 							await this.adapter.postPendingStatus(replyEvent, pendingWork);
-							this.pendingWorkNotificationKeys.set(sessionId, notificationKey);
 						} catch (error) {
+							// Release the reservation so a later turn retries — unless a newer
+							// turn already claimed or cleared the key in the meantime.
+							if (
+								this.pendingWorkNotificationKeys.get(sessionId) ===
+								notificationKey
+							) {
+								if (previousNotificationKey === undefined) {
+									this.pendingWorkNotificationKeys.delete(sessionId);
+								} else {
+									this.pendingWorkNotificationKeys.set(
+										sessionId,
+										previousNotificationKey,
+									);
+								}
+							}
 							this.logger.error(
 								`Failed to post pending ${this.adapter.platformName} status for session ${sessionId}`,
 								error instanceof Error ? error : new Error(String(error)),
@@ -669,7 +737,13 @@ export class ChatSessionHandler<TEvent> {
 					if (pendingWork.backgroundTasks.length > 0) {
 						void this.setBackgroundActivityStatus(replyEvent);
 					} else {
-						await this.clearActivityStatus(replyEvent);
+						// Only scheduled wakeups remain: the runner stays open and
+						// resumes without another inbound event, so hide the status
+						// while it waits but keep the indicator's state so the woken
+						// turn can show progress again.
+						await this.clearActivityStatus(replyEvent, {
+							retainState: true,
+						});
 					}
 				}
 
@@ -760,10 +834,17 @@ export class ChatSessionHandler<TEvent> {
 		}
 	}
 
-	private async clearActivityStatus(event: TEvent): Promise<void> {
+	private async clearActivityStatus(
+		event: TEvent,
+		options?: { retainState?: boolean },
+	): Promise<void> {
 		if (!this.adapter.clearActivityStatus) return;
 		try {
-			await this.adapter.clearActivityStatus(event);
+			// Forward the options object only when one was given, so the ordinary
+			// clear stays a single-argument call for adapters and callers alike.
+			await (options
+				? this.adapter.clearActivityStatus(event, options)
+				: this.adapter.clearActivityStatus(event));
 		} catch (error) {
 			this.logger.warn(
 				`Failed to clear ${this.adapter.platformName} activity status: ${error instanceof Error ? error.message : String(error)}`,
