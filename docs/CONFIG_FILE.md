@@ -138,7 +138,7 @@ Routes issues to different AI modes based on Linear labels and optionally config
 
 - **Custom array**: Specify exact tools needed, e.g., `["Read", "Edit", "Task"]`
 
-Note: Linear MCP tools (`mcp__linear`) are always included automatically. Slack MCP tools (`mcp__slack`) are included when the `SLACK_BOT_TOKEN` environment variable is set (Linear and Slack sessions only; excluded from GitHub sessions).
+Note: Linear MCP tools (`mcp__linear`) are included when a Linear workspace is connected. Cyrus orchestration tools (`mcp__cyrus-tools`) remain available to GitHub-only Slack setups, and Slack MCP tools (`mcp__slack`) are included when `SLACK_BOT_TOKEN` is set (Linear and Slack sessions only; excluded from GitHub engineering sessions).
 
 ---
 

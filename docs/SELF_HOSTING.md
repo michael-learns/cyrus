@@ -26,7 +26,7 @@ This guide walks you through setting up Cyrus completely self-hosted, including 
 
 ## Prerequisites
 
-- **Linear workspace** with admin access (required to create OAuth apps)
+- **Linear workspace** with admin access if you want the Linear integration
 - **Node.js** v18 or higher
 - **jq** (for Claude Code parsing)
 - **A public URL** for receiving Linear webhooks
@@ -59,9 +59,37 @@ You'll complete these steps:
 
 1. Set up a public URL for webhooks
 2. Configure Claude Code authentication
-3. Create a Linear OAuth application
+3. Create a Linear OAuth application (skip for GitHub-only Slack setups)
 4. Install Cyrus and complete your environment file
-5. Start Cyrus, authorize with Linear, and add repositories
+5. Start Cyrus, optionally authorize with Linear, and add repositories
+
+### Using Slack as the GitHub Issue control surface
+
+Linear is optional when you use Cyrus through Slack and GitHub Issues. After
+connecting a Slack app and adding your GitHub repositories, authenticate GitHub
+on the Cyrus machine with one of the supported methods:
+
+```bash
+gh auth login
+gh auth status
+```
+
+You can instead configure a GitHub App or set `GITHUB_TOKEN`. Cyrus prefers a
+forwarded installation token, then self-hosted GitHub App credentials, then
+`GITHUB_TOKEN`, and finally the local `gh` login.
+
+In Slack, mention Cyrus and use normal language with a GitHub Issue URL:
+
+```text
+@Cyrus Can you investigate https://github.com/acme/payroll/issues/42 and fix it
+if the code confirms the bug? Authentication may live in the acme/host repo.
+```
+
+Cyrus reads private issue discussion, investigates the configured repositories,
+and decides whether the request calls for an explanation or implementation. For
+implementation it creates isolated worktrees, keeps the Slack thread status
+updated, accepts follow-up messages in the same thread, and posts every pull
+request link when the work finishes. No slash commands are required.
 
 > **Tip:** Cyrus automatically loads environment variables from `~/.cyrus/.env` on startup. You can override this path with `cyrus --env-file=/path/to/your/env`.
 

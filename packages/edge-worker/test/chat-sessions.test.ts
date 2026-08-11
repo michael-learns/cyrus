@@ -340,6 +340,53 @@ describe("ChatSessionHandler session-initiation gate", () => {
 });
 
 describe("ChatSessionHandler activity status lifecycle", () => {
+	it("lets delegated engineering work retain ownership of the thread status", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"delegated-status-thread",
+		);
+		adapter.startActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		adapter.clearActivityStatus = clearActivityStatus;
+		let capturedConfig: any;
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner: (config: any) => {
+				capturedConfig = config;
+				return {
+					supportsStreamingInput: false,
+					start: vi.fn().mockResolvedValue({ sessionId: "runner-1" }),
+					stop: vi.fn(),
+					isRunning: vi.fn().mockReturnValue(false),
+					getMessages: vi.fn().mockReturnValue([]),
+				} as any;
+			},
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+		const event = {
+			eventId: "delegated-event",
+			threadKey: "delegated-status-thread",
+		};
+
+		await handler.handleEvent(event);
+		const sessionId = handler.listThreads()[0]!.sessionId;
+		expect(handler.getLatestEventForSession(sessionId)).toBe(event);
+		handler.setDelegatedWorkActive(sessionId, true);
+		await capturedConfig.onMessage({
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "Delegated the issue.",
+			session_id: "runner-1",
+		});
+
+		expect(clearActivityStatus).not.toHaveBeenCalled();
+	});
+
 	it("starts, updates, and clears activity status around a completed turn", async () => {
 		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
 			"status-thread",
@@ -1391,6 +1438,25 @@ describe("SlackChatAdapter responding policy", () => {
 		});
 	});
 
+	it("posts delegated engineering results to the originating thread", async () => {
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const postSpy = vi
+			.spyOn(SlackMessageService.prototype, "postMessage")
+			.mockResolvedValue({} as any);
+
+		await adapter.postDelegatedWorkMessage(
+			slackEvent("take care of this issue"),
+			"Finished the fix. Pull request: <https://github.com/acme/repo/pull/1|PR>",
+		);
+
+		expect(postSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				channel: "C1",
+				thread_ts: "1700000000.000100",
+			}),
+		);
+	});
+
 	it("uses the current result when the runner has no assistant message", async () => {
 		const adapter = new SlackChatAdapter(createStaticProvider([]));
 		const postSpy = vi
@@ -1502,7 +1568,7 @@ describe("SlackChatAdapter system prompt", () => {
 		expect(systemPrompt).toContain("Bash(git -C * pull)");
 	});
 
-	it("includes orchestrator routing context and self-assignment workflow", () => {
+	it("includes natural-language GitHub orchestration guidance", () => {
 		const repositoryPaths = ["/repo/chat-one", "/repo/chat-two"];
 		const repositoryRoutingContext =
 			"<repository_routing_context>\n  <description>Use repo routing tags.</description>\n</repository_routing_context>";
@@ -1523,9 +1589,11 @@ describe("SlackChatAdapter system prompt", () => {
 		} as any);
 
 		expect(systemPrompt).toContain(repositoryRoutingContext);
-		expect(systemPrompt).toContain("mcp__linear__get_user");
-		expect(systemPrompt).toContain('query: "me"');
-		expect(systemPrompt).toContain("linear_get_agent_sessions");
+		expect(systemPrompt).toContain("mcp__cyrus-tools__github_issue_get");
+		expect(systemPrompt).toContain("github_issue_start");
+		expect(systemPrompt).toContain("github_issue_prompt");
+		expect(systemPrompt).toContain("Never require slash commands");
+		expect(systemPrompt).not.toContain("First run `mcp__linear__get_user`");
 	});
 
 	const appMentionEvent = {

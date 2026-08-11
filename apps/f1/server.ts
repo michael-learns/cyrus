@@ -46,6 +46,9 @@ const DEFAULT_REPOS_BASE_DIR = getDefaultReposDir(CYRUS_HOME);
 const DEFAULT_WORKTREES_BASE_DIR = getDefaultWorktreesDir(CYRUS_HOME);
 // Optional second repository path for multi-repo orchestration testing
 const CYRUS_REPO_PATH_2 = process.env.CYRUS_REPO_PATH_2;
+const CYRUS_REPO_GITHUB_URL_2 =
+	process.env.CYRUS_REPO_GITHUB_URL_2 ||
+	"https://github.com/f1-test/secondary-repo";
 const MULTI_REPO_MODE = Boolean(CYRUS_REPO_PATH_2);
 
 // Validate port
@@ -139,7 +142,7 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 			name: "F1 Secondary Repository",
 			repositoryPath: CYRUS_REPO_PATH_2,
 			baseBranch: "main",
-			githubUrl: "https://github.com/f1-test/secondary-repo",
+			githubUrl: CYRUS_REPO_GITHUB_URL_2,
 			linearWorkspaceId: "cli-workspace", // Same workspace for routing test
 			workspaceBaseDir: join(DEFAULT_WORKTREES_BASE_DIR, "secondary"),
 			isActive: true,
@@ -165,7 +168,7 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 		cyrusHome: CYRUS_HOME,
 		serverPort: CYRUS_PORT,
 		serverHost: "localhost",
-		claudeDefaultModel: "sonnet",
+		claudeDefaultModel: process.env.CYRUS_CLAUDE_MODEL || "sonnet",
 		claudeDefaultFallbackModel: "haiku",
 		// Env-gated runner selection for harness validation (default unchanged).
 		// e.g. CYRUS_DEFAULT_RUNNER=codex to exercise the Codex (app-server) path.

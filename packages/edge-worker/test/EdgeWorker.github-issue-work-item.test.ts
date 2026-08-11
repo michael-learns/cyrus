@@ -11,6 +11,7 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		runner = {
 			isRunning: vi.fn().mockReturnValue(false),
 			stop: vi.fn(),
+			getMessages: vi.fn().mockReturnValue([]),
 		};
 		repository = {
 			id: "repo-1",
@@ -109,6 +110,53 @@ describe("EdgeWorker GitHub Issue work items", () => {
 			expect.objectContaining({ workItemId: "work-item-17" }),
 			runner,
 			"issue prompt",
+			"ghs_token",
+		);
+	});
+
+	it("creates one coordinated workspace for multiple configured repositories", async () => {
+		const hostRepository = {
+			...repository,
+			id: "repo-2",
+			name: "cyrus-host",
+			repositoryPath: "/repos/cyrus-host",
+			githubUrl: "https://github.com/cyrusagents/cyrus-host",
+		};
+		worker.findRepositoryByGitHubUrl.mockImplementation((name: string) =>
+			name === "cyrusagents/cyrus-host" ? hostRepository : repository,
+		);
+
+		await worker.startGitHubIssueWorkItem({
+			workItemId: "work-item-multi",
+			repositoryFullName: "cyrusagents/cyrus",
+			issueNumber: 17,
+			targetRepositoryFullNames: [
+				"cyrusagents/cyrus",
+				"cyrusagents/cyrus-host",
+			],
+			runnerType: "claude",
+			requestId: "request-multi",
+		});
+
+		expect(worker.gitService.createGitWorktree).toHaveBeenCalledWith(
+			expect.objectContaining({ identifier: "GH-cyrus-17" }),
+			[repository, hostRepository],
+		);
+		expect(
+			worker.agentSessionManager.createCyrusAgentSession.mock.calls[0]?.[5],
+		).toEqual([
+			expect.objectContaining({ repositoryId: "repo-1" }),
+			expect.objectContaining({ repositoryId: "repo-2" }),
+		]);
+		expect(worker.createGitHubIssueRunner).toHaveBeenCalledWith(
+			expect.objectContaining({
+				repositories: [repository, hostRepository],
+				targetRepositoryFullNames: [
+					"cyrusagents/cyrus",
+					"cyrusagents/cyrus-host",
+				],
+			}),
+			githubIssue,
 			"ghs_token",
 		);
 	});
@@ -229,6 +277,41 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		);
 	});
 
+	it("rejects an overlapping work item with a different repository set", async () => {
+		worker.gitHubIssueWorkItemSessions.set("existing-work-item", {
+			workItemId: "existing-work-item",
+			sessionId: "github-issue-existing",
+			repository,
+			repositories: [repository],
+			repositoryFullName: "cyrusagents/cyrus",
+			targetRepositoryFullNames: ["cyrusagents/cyrus"],
+			issueNumber: 17,
+			issueIdentifier: "GH-cyrus-17",
+			branchName: "cyrus/gh-17-fix-webhook-retries",
+			branchNames: { "repo-1": "cyrus/gh-17-fix-webhook-retries" },
+			prUrls: [],
+			slackSubscribers: [],
+			runnerType: "claude",
+			issue: { id: "42" },
+			status: "in_progress",
+		});
+
+		await expect(
+			worker.startGitHubIssueWorkItem({
+				workItemId: "new-work-item",
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 17,
+				targetRepositoryFullNames: [
+					"cyrusagents/cyrus",
+					"cyrusagents/cyrus-host",
+				],
+				runnerType: "claude",
+				requestId: "expand-request",
+			}),
+		).rejects.toMatchObject({ statusCode: 409 });
+		expect(worker.gitService.createGitWorktree).not.toHaveBeenCalled();
+	});
+
 	it("retries a failed work item in its existing session", async () => {
 		const failed = {
 			workItemId: "work-item-17",
@@ -301,5 +384,115 @@ describe("EdgeWorker GitHub Issue work items", () => {
 				repository,
 			}),
 		);
+	});
+
+	it("posts pull requests to Slack and releases delegated status ownership", async () => {
+		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
+		const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const setDelegatedWorkActive = vi.fn();
+		worker.slackChatAdapter = {
+			postDelegatedWorkMessage,
+			clearActivityStatus,
+		};
+		const hasDelegatedWork = vi.fn().mockReturnValue(false);
+		worker.chatSessionHandler = { setDelegatedWorkActive, hasDelegatedWork };
+		worker.slackWorkItemEvents = new Map([
+			["work-item-17", new Map([["slack-session-1", event]])],
+		]);
+		const workItem = {
+			workItemId: "work-item-17",
+			issue: { title: "Fix webhook retries" },
+			prUrls: [
+				"https://github.com/cyrusagents/cyrus/pull/1",
+				"https://github.com/cyrusagents/cyrus-host/pull/2",
+			],
+		};
+
+		await worker.finishSlackWorkItem(workItem, "awaiting_review");
+
+		expect(postDelegatedWorkMessage).toHaveBeenCalledWith(
+			event,
+			expect.stringContaining("cyrus-host/pull/2"),
+		);
+		expect(clearActivityStatus).toHaveBeenCalledWith(event);
+		expect(setDelegatedWorkActive).toHaveBeenCalledWith(
+			"slack-session-1",
+			false,
+			"work-item-17",
+		);
+		expect(worker.slackWorkItemEvents.has("work-item-17")).toBe(false);
+	});
+
+	it("keeps the thread status while a sibling delegated job is still running", async () => {
+		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
+		const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const setDelegatedWorkActive = vi.fn();
+		// A second job delegated by the same chat session is still in flight.
+		const hasDelegatedWork = vi.fn().mockReturnValue(true);
+		worker.slackChatAdapter = {
+			postDelegatedWorkMessage,
+			clearActivityStatus,
+		};
+		worker.chatSessionHandler = { setDelegatedWorkActive, hasDelegatedWork };
+		worker.slackWorkItemEvents = new Map([
+			["work-item-17", new Map([["slack-session-1", event]])],
+		]);
+
+		await worker.finishSlackWorkItem(
+			{
+				workItemId: "work-item-17",
+				issue: { title: "Fix webhook retries" },
+				prUrls: ["https://github.com/cyrusagents/cyrus/pull/1"],
+			},
+			"awaiting_review",
+		);
+
+		expect(postDelegatedWorkMessage).toHaveBeenCalled();
+		expect(clearActivityStatus).not.toHaveBeenCalled();
+	});
+
+	it("converts a delegated summary from Markdown to Slack mrkdwn", async () => {
+		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
+		const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+		worker.slackChatAdapter = {
+			postDelegatedWorkMessage,
+			clearActivityStatus: vi.fn().mockResolvedValue(undefined),
+		};
+		worker.chatSessionHandler = {
+			setDelegatedWorkActive: vi.fn(),
+			hasDelegatedWork: vi.fn().mockReturnValue(false),
+		};
+		worker.slackWorkItemEvents = new Map([
+			["work-item-17", new Map([["slack-session-1", event]])],
+		]);
+		worker.agentSessionManager.getSession = vi.fn().mockReturnValue({
+			agentRunner: {
+				getMessages: () => [
+					{
+						type: "result",
+						result:
+							"### Summary\nFixed **retries**. See [the PR](https://github.com/o/r/pull/1).",
+					},
+				],
+			},
+		});
+
+		await worker.finishSlackWorkItem(
+			{
+				workItemId: "work-item-17",
+				issue: { title: "Fix webhook retries" },
+				prUrls: ["https://github.com/cyrusagents/cyrus/pull/1"],
+			},
+			"awaiting_review",
+		);
+
+		const text = postDelegatedWorkMessage.mock.calls[0]?.[1] as string;
+		expect(text).toContain("*Summary*");
+		expect(text).toContain("Fixed *retries*");
+		expect(text).toContain("<https://github.com/o/r/pull/1|the PR>");
+		expect(text).not.toContain("###");
+		expect(text).not.toContain("**");
 	});
 });

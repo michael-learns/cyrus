@@ -81,6 +81,68 @@ export const RECEIPT_REACTION = "eyes";
 export const PROCESSED_REACTION = "white_check_mark";
 
 /**
+ * Convert ordinary Markdown into Slack mrkdwn.
+ *
+ * The Slack chat agent avoids Markdown because its system prompt forbids it
+ * (see the "Slack Message Formatting" rules below). Text that never passed
+ * through that prompt — a delegated GitHub work item's final summary, written
+ * by an engineering runner — arrives as plain Markdown, whose `###` headings,
+ * `**bold**`, `[text](url)` links and pipe tables all render as broken plain
+ * text in Slack. Normalize it before posting.
+ *
+ * Fenced code blocks pass through untouched: Slack renders ``` the same way,
+ * and rewriting their contents would corrupt the code.
+ */
+export function markdownToSlackMrkdwn(markdown: string): string {
+	const out: string[] = [];
+	let inFence = false;
+
+	for (const line of markdown.split("\n")) {
+		if (/^\s*```/.test(line)) {
+			inFence = !inFence;
+			out.push(line);
+			continue;
+		}
+		if (inFence) {
+			out.push(line);
+			continue;
+		}
+		// Table separator rows (| --- | :---: |) have no Slack equivalent.
+		if (line.includes("|") && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line)) {
+			continue;
+		}
+
+		let converted = line;
+		// `### Heading` -> `*Heading*` on its own line
+		converted = converted.replace(
+			/^\s*#{1,6}\s+(.*?)\s*#*\s*$/,
+			(_match, heading: string) => (heading ? `*${heading}*` : ""),
+		);
+		// `| a | b |` -> `a — b`
+		if (/^\s*\|.*\|\s*$/.test(converted)) {
+			converted = converted
+				.trim()
+				.replace(/^\||\|$/g, "")
+				.split("|")
+				.map((cell) => cell.trim())
+				.filter((cell) => cell.length > 0)
+				.join(" — ");
+		}
+		// `[text](url)` -> `<url|text>`
+		converted = converted.replace(
+			/\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g,
+			(_match, text: string, url: string) =>
+				text.trim() ? `<${url}|${text.trim()}>` : `<${url}>`,
+		);
+		// `**bold**` -> `*bold*`
+		converted = converted.replace(/\*\*([^*]+)\*\*/g, "*$1*");
+		out.push(converted);
+	}
+
+	return out.join("\n");
+}
+
+/**
  * Slack implementation of ChatPlatformAdapter.
  *
  * Contains all Slack-specific logic extracted from EdgeWorker:
@@ -357,7 +419,7 @@ ${repositoryPaths.map((path) => `- ${path}`).join("\n")}
 ## Instructions
 - You are running in a transient workspace, not associated with any code repository
 - Be concise in your responses as they will be posted back to Slack
-- If the user's request involves code changes, help them plan the work and suggest creating an issue in their project tracker (Linear, Jira, or GitHub Issues)
+- You can investigate private GitHub Issues and delegate implementation work without asking the user to run special commands
 - You can answer questions, provide analysis, help with planning, and assist with research
 - If files need to be created or examined, they will be in your working directory
 ${repositoryAccessSection}
@@ -368,14 +430,16 @@ ${this.repositoryRoutingContext ? `\n\n${this.repositoryRoutingContext}` : ""}
 - Always prefer searching the docs over guessing or relying on your training data for Cyrus-specific questions.
 
 ## Orchestration Notes
-- If the user asks you to make repo code changes immediately, use these steps:
-  - First run \`mcp__linear__get_user\` with \`query: "me"\` to get your Linear identity.
-  - Create an Issue in the user's tracker for the requested work (for example using \`mcp__linear__save_issue\`), including enough context and acceptance criteria to execute it. Default the issue status/state to "Backlog". **IMPORTANT: Never set the status to "Triage".**
-  - To route the issue to a specific repository, add \`[repo=repo-name]\` to the issue description. To target a specific branch, use \`[repo=repo-name#branch-name]\`. For multiple repos: \`repos=repo1,repo2\`.
-  - Assign that Issue to that same user (your own Linear user).
-  - That assignment is what immediately kicks off work in your own agent session.
-  - Track execution progress by searching \`mcp__cyrus-tools__linear_get_agent_sessions\` for the active session, then opening it with \`mcp__cyrus-tools__linear_get_agent_session\`.
-  - To send mid-flight feedback or corrections to a running child session, use \`mcp__cyrus-tools__linear_agent_give_feedback\` with the session ID returned by \`linear_get_agent_sessions\`. This is the ONLY way to directly prompt a running child agent. \`mcp__linear__save_comment\` does NOT trigger or notify the agent in any way — it just writes a comment on the issue, which the running session will not see. Always prefer \`linear_agent_give_feedback\` when the child agent is actively working.
+- Treat GitHub requests conversationally. Never require slash commands, magic keywords, or a special message format.
+- For a GitHub Issue URL or \`owner/repository#number\`, use \`mcp__cyrus-tools__github_issue_get\` instead of WebFetch. It can read private issues and their existing discussion without exposing credentials.
+- Infer the user's intent from the conversation:
+  - For explanation, diagnosis, comparison, or research, inspect the issue and relevant configured repositories, then answer without starting implementation.
+  - For a clear request to fix, implement, take care of, or otherwise make the change, inspect first and then use \`mcp__cyrus-tools__github_issue_start\`.
+  - When intent is ambiguous, investigate the issue and code first. Start implementation when the evidence and conversation clearly call for a fix; ask one concise question only when scope, safety, or expected behavior remains genuinely unclear.
+- Select every configured repository that genuinely participates in a cross-repository fix using \`targetRepositories\`. Do not include unrelated repositories. The delegated worker receives isolated worktrees, full coding tools, tests, Git, GitHub access, and web research tools, and it opens a pull request for each repository it changes.
+- Use \`mcp__cyrus-tools__github_issue_status\` for natural status questions, \`github_issue_prompt\` for mid-flight feedback or added requirements, and \`github_issue_stop\` when the user naturally asks to stop or cancel.
+- After starting work, briefly tell the user what you delegated and which repositories are included. Cyrus will keep the Slack thread status updated and will post the pull request links when the child session finishes.
+- Existing Linear orchestration tools remain available when the user explicitly wants to create or operate on a Linear issue.
 
 ## Slack Message Formatting (CRITICAL)
 Your response will be posted as a Slack message. Slack uses its own "mrkdwn" format, which is NOT standard Markdown. You MUST follow these rules exactly.
@@ -602,6 +666,26 @@ Supported mrkdwn syntax:
 		this.logger.info(
 			`Posted pending Slack status to channel ${event.payload.channel} (thread ${threadTs})`,
 		);
+	}
+
+	/** Post a lifecycle message owned by a delegated engineering session. */
+	async postDelegatedWorkMessage(
+		event: SlackWebhookEvent,
+		text: string,
+	): Promise<void> {
+		const token = this.getSlackBotToken(event);
+		if (!token) {
+			this.logger.warn(
+				"Cannot post delegated Slack update: no token available",
+			);
+			return;
+		}
+		await new SlackMessageService().postMessage({
+			token,
+			channel: event.payload.channel,
+			thread_ts: event.payload.thread_ts || event.payload.ts,
+			text,
+		});
 	}
 
 	async acknowledgeReceipt(event: SlackWebhookEvent): Promise<void> {

@@ -185,6 +185,13 @@ export class ChatSessionHandler<TEvent> {
 	private pendingFollowups: Map<string, TEvent[]> = new Map();
 	/** Last scheduled-work status posted for each session, used to avoid duplicates. */
 	private pendingWorkNotificationKeys: Map<string, string> = new Map();
+	/**
+	 * Child engineering jobs that temporarily own this chat thread's status,
+	 * keyed by chat session id. One chat session can delegate several jobs at
+	 * once, so ownership is tracked per work item: releasing one job must not
+	 * hand the status back while its siblings are still running.
+	 */
+	private delegatedWorkSessions: Map<string, Set<string>> = new Map();
 	// Serializes events for a thread that is not yet bound to a session. Binding
 	// spans several awaits (the adapter's session-initiation check, workspace
 	// creation), and until the binding lands `threadSessions` still reads as
@@ -527,6 +534,36 @@ export class ChatSessionHandler<TEvent> {
 		return this.sessionManager.getAgentRunner(sessionId);
 	}
 
+	/** Resolve the latest platform event for a chat session without exposing it to the model. */
+	getLatestEventForSession(sessionId: string): TEvent | undefined {
+		return (
+			this.pendingReplyEvents.get(sessionId)?.at(-1) ??
+			this.lastReplyEvent.get(sessionId)
+		);
+	}
+
+	/** Keep the chat status alive while a delegated child session is running. */
+	setDelegatedWorkActive(
+		sessionId: string,
+		active: boolean,
+		workItemId: string,
+	): void {
+		const workItemIds = this.delegatedWorkSessions.get(sessionId);
+		if (active) {
+			if (workItemIds) workItemIds.add(workItemId);
+			else this.delegatedWorkSessions.set(sessionId, new Set([workItemId]));
+			return;
+		}
+		if (!workItemIds) return;
+		workItemIds.delete(workItemId);
+		if (workItemIds.size === 0) this.delegatedWorkSessions.delete(sessionId);
+	}
+
+	/** True while at least one delegated job still owns this thread's status. */
+	hasDelegatedWork(sessionId: string): boolean {
+		return (this.delegatedWorkSessions.get(sessionId)?.size ?? 0) > 0;
+	}
+
 	/** Mark how far this session has thread context, for the next catch-up */
 	private recordThreadContextTs(
 		session: CyrusAgentSession,
@@ -770,7 +807,9 @@ export class ChatSessionHandler<TEvent> {
 						error instanceof Error ? error : new Error(String(error)),
 					);
 				} finally {
-					await this.clearActivityStatus(replyEvent);
+					if (!this.hasDelegatedWork(sessionId)) {
+						await this.clearActivityStatus(replyEvent);
+					}
 				}
 				// Fire-and-forget processed acknowledgement for every drained
 				// event (e.g., swap the receipt reaction) — runs even when
