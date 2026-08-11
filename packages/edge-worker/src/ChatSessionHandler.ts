@@ -151,6 +151,13 @@ export class ChatSessionHandler<TEvent> {
 	// re-dispatched as a fresh turn, so a follow-up is never silently dropped —
 	// honoring the "I'll pick up your new message once I'm done" promise.
 	private pendingFollowups: Map<string, TEvent[]> = new Map();
+	// Serializes events for a thread that is not yet bound to a session. Binding
+	// spans several awaits (the adapter's session-initiation check, workspace
+	// creation), and until the binding lands `threadSessions` still reads as
+	// unbound — a follow-up that interleaved with those awaits would evaluate
+	// that stale snapshot, be judged non-initiating, and get discarded. Chaining
+	// makes each event for a thread observe the previous one's binding.
+	private threadEventQueues: Map<string, Promise<void>> = new Map();
 
 	constructor(
 		adapter: ChatPlatformAdapter<TEvent>,
@@ -172,8 +179,41 @@ export class ChatSessionHandler<TEvent> {
 	 * Main entry point — handles a single chat platform event.
 	 *
 	 * Replaces the per-platform handleXxxWebhook method in EdgeWorker.
+	 *
+	 * Events for the same thread run one at a time, so a message that arrives
+	 * while an earlier one is still establishing the thread → session binding
+	 * sees that binding instead of a stale "unbound" snapshot.
 	 */
 	async handleEvent(event: TEvent): Promise<void> {
+		const threadKey = this.adapter.getThreadKey(event);
+		// Once a thread is bound to a session, events may run concurrently — the
+		// catch-up cursor has its own monotonicity guard for that. Only the
+		// unbound window needs serializing, because binding spans several awaits
+		// and a follow-up landing inside it would read a stale "unbound" snapshot.
+		if (this.threadSessions.has(threadKey)) {
+			return this.processEvent(event);
+		}
+		const previous = this.threadEventQueues.get(threadKey) ?? Promise.resolve();
+		const next = previous.then(() => this.processEvent(event));
+		// Store an error-swallowing view of the chain so one failure never blocks
+		// later events for the thread (processEvent logs its own errors), and drop
+		// the entry once the thread goes idle again.
+		const chained: Promise<void> = next
+			.catch(() => undefined)
+			.then(() => {
+				if (this.threadEventQueues.get(threadKey) === chained) {
+					this.threadEventQueues.delete(threadKey);
+				}
+			});
+		this.threadEventQueues.set(threadKey, chained);
+		return next;
+	}
+
+	/**
+	 * Processes a single event. Invoked only through the per-thread queue in
+	 * handleEvent, so at most one event per thread is ever in flight.
+	 */
+	private async processEvent(event: TEvent): Promise<void> {
 		this.deps.onWebhookStart();
 
 		try {

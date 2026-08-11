@@ -287,6 +287,40 @@ describe("ChatSessionHandler session-initiation gate", () => {
 		expect(createRunner).toHaveBeenCalledTimes(1);
 		expect(handler.listThreads()).toHaveLength(1);
 	});
+
+	it("does not drop a follow-up that arrives while the mention is still binding the thread", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"race-thread",
+		);
+		// Stands in for SlackChatAdapter's network-backed identity lookup: the
+		// gate keeps the first event suspended mid-initiation, exactly the window
+		// in which a follow-up used to read the thread as still unbound.
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		adapter.isSessionInitiatingEvent = async (event: TestEvent) => {
+			await gate;
+			return event.eventId === "mention";
+		};
+
+		const { handler, createRunner } = buildHandler(adapter);
+		const first = handler.handleEvent({
+			eventId: "mention",
+			threadKey: "race-thread",
+		} as any);
+		const second = handler.handleEvent({
+			eventId: "follow-up",
+			threadKey: "race-thread",
+		} as any);
+		releaseGate();
+		await Promise.all([first, second]);
+
+		// The follow-up ran against the session the mention established rather
+		// than being discarded as "non-initiating for an unbound thread".
+		expect(handler.listThreads()).toHaveLength(1);
+		expect(createRunner).toHaveBeenCalledTimes(2);
+	});
 });
 
 describe("ChatSessionHandler processed acknowledgement", () => {
