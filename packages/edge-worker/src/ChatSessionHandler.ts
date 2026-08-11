@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { SDKMessage, SdkPluginConfig } from "cyrus-claude-runner";
 import type {
+	AgentPendingWork,
 	AgentRunnerConfig,
 	AgentSessionInfo,
 	CyrusAgentSession,
@@ -22,6 +23,7 @@ import type { RunnerConfigBuilder } from "./RunnerConfigBuilder.js";
  */
 /** Platform identifiers supported by the session manager */
 export type ChatPlatformName = "slack" | "linear" | "github";
+type SDKResultMessage = Extract<SDKMessage, { type: "result" }>;
 
 export interface ChatPlatformAdapter<TEvent> {
 	readonly platformName: ChatPlatformName;
@@ -64,7 +66,17 @@ export interface ChatPlatformAdapter<TEvent> {
 	getThreadContextTs?(event: TEvent): string | undefined;
 
 	/** Post the agent's final response back to the platform */
-	postReply(event: TEvent, runner: IAgentRunner): Promise<void>;
+	postReply(
+		event: TEvent,
+		runner: IAgentRunner,
+		resultMessage?: SDKResultMessage,
+	): Promise<void>;
+
+	/** Post a non-final status when the session has scheduled future work. */
+	postPendingStatus?(
+		event: TEvent,
+		pendingWork: AgentPendingWork,
+	): Promise<void>;
 
 	/** Acknowledge receipt of the event (e.g., emoji reaction). Fire-and-forget */
 	acknowledgeReceipt(event: TEvent): Promise<void>;
@@ -151,6 +163,8 @@ export class ChatSessionHandler<TEvent> {
 	// re-dispatched as a fresh turn, so a follow-up is never silently dropped —
 	// honoring the "I'll pick up your new message once I'm done" promise.
 	private pendingFollowups: Map<string, TEvent[]> = new Map();
+	/** Last scheduled-work status posted for each session, used to avoid duplicates. */
+	private pendingWorkNotificationKeys: Map<string, string> = new Map();
 	// Serializes events for a thread that is not yet bound to a session. Binding
 	// spans several awaits (the adapter's session-initiation check, workspace
 	// creation), and until the binding lands `threadSessions` still reads as
@@ -616,17 +630,88 @@ export class ChatSessionHandler<TEvent> {
 		await this.sessionManager.handleClaudeMessage(sessionId, message);
 
 		if (message.type === "result") {
+			const runner = this.sessionManager.getAgentRunner(sessionId);
+			const pendingWork =
+				message.subtype === "success" && !message.is_error
+					? runner?.getPendingWork?.()
+					: undefined;
+			const hasPendingWork = Boolean(
+				pendingWork &&
+					(pendingWork.sessionCrons.length > 0 ||
+						pendingWork.backgroundTasks.length > 0),
+			);
+
+			if (hasPendingWork && pendingWork) {
+				const replyEvent =
+					this.pendingReplyEvents.get(sessionId)?.[0] ??
+					this.lastReplyEvent.get(sessionId);
+				if (
+					replyEvent &&
+					pendingWork.sessionCrons.length > 0 &&
+					this.adapter.postPendingStatus
+				) {
+					const notificationKey = JSON.stringify(
+						pendingWork.sessionCrons.map((cron) => ({
+							id: cron.id,
+							schedule: cron.schedule,
+							recurring: cron.recurring,
+							prompt: cron.prompt,
+						})),
+					);
+					const previousNotificationKey =
+						this.pendingWorkNotificationKeys.get(sessionId);
+					if (previousNotificationKey !== notificationKey) {
+						// Reserve the key BEFORE awaiting the platform call. `result`
+						// messages are emitted synchronously by the runner and handled on
+						// floating promises, so a second result (a recurring wakeup firing
+						// again, or a streamed turn completing) can reach this check while
+						// the first post is still in flight and duplicate the waiting notice.
+						this.pendingWorkNotificationKeys.set(sessionId, notificationKey);
+						try {
+							await this.adapter.postPendingStatus(replyEvent, pendingWork);
+						} catch (error) {
+							// Release the reservation so a later turn retries — unless a newer
+							// turn already claimed or cleared the key in the meantime.
+							if (
+								this.pendingWorkNotificationKeys.get(sessionId) ===
+								notificationKey
+							) {
+								if (previousNotificationKey === undefined) {
+									this.pendingWorkNotificationKeys.delete(sessionId);
+								} else {
+									this.pendingWorkNotificationKeys.set(
+										sessionId,
+										previousNotificationKey,
+									);
+								}
+							}
+							this.logger.error(
+								`Failed to post pending ${this.adapter.platformName} status for session ${sessionId}`,
+								error instanceof Error ? error : new Error(String(error)),
+							);
+						}
+					}
+				} else if (pendingWork.sessionCrons.length === 0) {
+					this.pendingWorkNotificationKeys.delete(sessionId);
+				}
+
+				this.logger.info(
+					`Deferring ${this.adapter.platformName} reply for session ${sessionId}: ${pendingWork.sessionCrons.length} scheduled wakeup(s), ${pendingWork.backgroundTasks.length} background task(s) remain`,
+				);
+				return;
+			}
+
+			this.pendingWorkNotificationKeys.delete(sessionId);
 			// A `result` ends the turn, and the turn has seen every prompt
 			// injected so far — drain the whole queue, not just one entry
 			// (quick-succession messages get merged into a single turn).
 			const events = this.drainReplies(sessionId);
-			const runner = this.sessionManager.getAgentRunner(sessionId);
 			// Queue already drained by an earlier merged turn? The reply still
 			// belongs to this session's thread — post it via the last event.
 			const replyEvent = events[0] ?? this.lastReplyEvent.get(sessionId);
 			if (replyEvent && runner) {
 				try {
-					await this.adapter.postReply(replyEvent, runner);
+					await this.adapter.postReply(replyEvent, runner, message);
 				} catch (error) {
 					this.logger.error(
 						`Failed to post ${this.adapter.platformName} reply for session ${sessionId}`,
@@ -721,6 +806,7 @@ export class ChatSessionHandler<TEvent> {
 	 */
 	private clearPendingReplies(sessionId: string): void {
 		this.lastReplyEvent.delete(sessionId);
+		this.pendingWorkNotificationKeys.delete(sessionId);
 		const queue = this.pendingReplyEvents.get(sessionId);
 		if (!queue || queue.length === 0) return;
 		this.logger.warn(

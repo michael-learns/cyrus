@@ -272,6 +272,22 @@ describe("ChatSessionHandler session-initiation gate", () => {
 		expect(handler.listThreads()).toHaveLength(0);
 	});
 
+	it("awaits an asynchronous session-initiation decision", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"async-unbound-thread",
+		);
+		adapter.isSessionInitiatingEvent = async () => false;
+
+		const { handler, createRunner } = buildHandler(adapter);
+		await handler.handleEvent({
+			eventId: "async-follow-up",
+			threadKey: "async-unbound-thread",
+		});
+
+		expect(createRunner).not.toHaveBeenCalled();
+		expect(handler.listThreads()).toHaveLength(0);
+	});
+
 	it("starts a session for an initiating event", async () => {
 		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
 			"bound-thread",
@@ -440,6 +456,318 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		expect(postReply).toHaveBeenCalledTimes(2);
 		expect(postReply.mock.calls[0]?.[0]).toBe(eventA);
 		expect(postReply.mock.calls[1]?.[0]).toBe(eventC);
+	});
+
+	it("keeps the reply and receipt acknowledgement pending while background work remains", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"background-thread",
+		);
+		const acknowledgeProcessed = vi.fn().mockResolvedValue(undefined);
+		adapter.acknowledgeProcessed = acknowledgeProcessed;
+		const postReply = vi
+			.spyOn(adapter, "postReply")
+			.mockResolvedValue(undefined);
+		const notifyBusy = vi
+			.spyOn(adapter, "notifyBusy")
+			.mockResolvedValue(undefined);
+		let running = true;
+		let pendingWork = {
+			sessionCrons: [],
+			backgroundTasks: [
+				{
+					id: "task-1",
+					type: "agent",
+					status: "running",
+					description: "Compare both repositories",
+				},
+			],
+		};
+
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn(() => running),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+				getPendingWork: vi.fn(() => pendingWork),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		const event = { eventId: "mention", threadKey: "background-thread" };
+		await handler.handleEvent(event);
+		const intermediateResult = {
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "",
+			session_id: "session-1",
+		};
+		await capturedConfig.onMessage(intermediateResult);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(postReply).not.toHaveBeenCalled();
+		expect(acknowledgeProcessed).not.toHaveBeenCalled();
+		const followup = {
+			eventId: "follow-up",
+			threadKey: "background-thread",
+		};
+		await handler.handleEvent(followup);
+		expect(notifyBusy).toHaveBeenCalledWith(followup, "background-thread");
+		expect(createRunner).toHaveBeenCalledTimes(1);
+
+		pendingWork = { sessionCrons: [], backgroundTasks: [] };
+		running = false;
+		const finalResult = { ...intermediateResult, result: "Comparison ready" };
+		await capturedConfig.onMessage(finalResult);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		expect(postReply).toHaveBeenCalledTimes(1);
+		expect(postReply).toHaveBeenCalledWith(
+			event,
+			expect.anything(),
+			finalResult,
+		);
+		expect(acknowledgeProcessed).toHaveBeenCalledTimes(1);
+		expect(acknowledgeProcessed).toHaveBeenCalledWith(event);
+		expect(createRunner).toHaveBeenCalledTimes(2);
+	});
+
+	it("posts one waiting status for unchanged scheduled work and finishes later", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"scheduled-thread",
+		);
+		const acknowledgeProcessed = vi.fn().mockResolvedValue(undefined);
+		adapter.acknowledgeProcessed = acknowledgeProcessed;
+		const postReply = vi
+			.spyOn(adapter, "postReply")
+			.mockResolvedValue(undefined);
+		const postPendingStatus = vi.fn().mockResolvedValue(undefined);
+		(adapter as any).postPendingStatus = postPendingStatus;
+		let pendingWork = {
+			sessionCrons: [
+				{
+					id: "cron-1",
+					schedule: "27 12 * * *",
+					recurring: false,
+					prompt: "Check CI",
+				},
+			],
+			backgroundTasks: [],
+		};
+
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn().mockReturnValue(false),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+				getPendingWork: vi.fn(() => pendingWork),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		const event = { eventId: "mention", threadKey: "scheduled-thread" };
+		await handler.handleEvent(event);
+		const intermediateResult = {
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "",
+			session_id: "session-1",
+		};
+		await capturedConfig.onMessage(intermediateResult);
+		await capturedConfig.onMessage(intermediateResult);
+
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+		expect(postPendingStatus).toHaveBeenCalledWith(event, pendingWork);
+		expect(postReply).not.toHaveBeenCalled();
+		expect(acknowledgeProcessed).not.toHaveBeenCalled();
+
+		pendingWork = { sessionCrons: [], backgroundTasks: [] };
+		await capturedConfig.onMessage({
+			...intermediateResult,
+			result: "CI passed",
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(postReply).toHaveBeenCalledTimes(1);
+		expect(acknowledgeProcessed).toHaveBeenCalledTimes(1);
+	});
+
+	it("posts one waiting status when a second result lands while the first post is in flight", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"concurrent-scheduled-thread",
+		);
+		const postReply = vi
+			.spyOn(adapter, "postReply")
+			.mockResolvedValue(undefined);
+		const releasePendingStatus: Array<() => void> = [];
+		const postPendingStatus = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					releasePendingStatus.push(resolve);
+				}),
+		);
+		(adapter as any).postPendingStatus = postPendingStatus;
+		const pendingWork = {
+			sessionCrons: [
+				{
+					id: "cron-1",
+					schedule: "*/5 * * * *",
+					recurring: true,
+					prompt: "Check CI",
+				},
+			],
+			backgroundTasks: [],
+		};
+
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn().mockReturnValue(false),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+				getPendingWork: vi.fn(() => pendingWork),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		const event = {
+			eventId: "mention",
+			threadKey: "concurrent-scheduled-thread",
+		};
+		await handler.handleEvent(event);
+		const intermediateResult = {
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "",
+			session_id: "session-1",
+		};
+
+		// Hold the first platform post open so it is still in flight.
+		const firstResult = capturedConfig.onMessage(intermediateResult);
+		await vi.waitFor(() => expect(postPendingStatus).toHaveBeenCalledTimes(1));
+
+		// A second result for the same unchanged scheduled work arrives before
+		// the first post resolves — it must not duplicate the waiting notice.
+		const secondResult = capturedConfig.onMessage(intermediateResult);
+		for (let tick = 0; tick < 5; tick++) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+
+		for (const release of releasePendingStatus) release();
+		await Promise.all([firstResult, secondResult]);
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+		expect(postReply).not.toHaveBeenCalled();
+	});
+
+	it("finishes an error result even when the runner reports stale pending work", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"error-thread",
+		);
+		const acknowledgeProcessed = vi.fn().mockResolvedValue(undefined);
+		adapter.acknowledgeProcessed = acknowledgeProcessed;
+		const postReply = vi
+			.spyOn(adapter, "postReply")
+			.mockResolvedValue(undefined);
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn().mockReturnValue(false),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+				getPendingWork: vi.fn(() => ({
+					sessionCrons: [],
+					backgroundTasks: [
+						{
+							id: "stale-task",
+							type: "agent",
+							status: "running",
+							description: "Stale snapshot",
+						},
+					],
+				})),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		const event = { eventId: "mention", threadKey: "error-thread" };
+		await handler.handleEvent(event);
+		const errorResult = {
+			type: "result",
+			subtype: "error_during_execution",
+			is_error: true,
+			errors: ["Agent failed"],
+			session_id: "session-1",
+		};
+		await capturedConfig.onMessage(errorResult);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(postReply).toHaveBeenCalledWith(
+			event,
+			expect.anything(),
+			errorResult,
+		);
+		expect(acknowledgeProcessed).toHaveBeenCalledWith(event);
 	});
 });
 
@@ -689,6 +1017,14 @@ describe("SlackChatAdapter responding policy", () => {
 				{ type: "assistant", message: { content: [{ type: "text", text }] } },
 			],
 		}) as any;
+	const resultMessage = (result: string) =>
+		({
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result,
+			session_id: "session-1",
+		}) as any;
 
 	it("documents the when-to-respond policy and the silence sentinel in the system prompt", () => {
 		const adapter = new SlackChatAdapter(createStaticProvider([]));
@@ -745,6 +1081,66 @@ describe("SlackChatAdapter responding policy", () => {
 			text: "It memoizes the result.",
 			thread_ts: "1700000000.000100",
 		});
+	});
+
+	it("uses the current result when the runner has no assistant message", async () => {
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const postSpy = vi
+			.spyOn(SlackMessageService.prototype, "postMessage")
+			.mockResolvedValue({} as any);
+
+		await adapter.postReply(
+			slackEvent("compare the repositories"),
+			{ getMessages: () => [] } as any,
+			resultMessage("Authentication lives in the host repository."),
+		);
+
+		expect(postSpy).toHaveBeenCalledTimes(1);
+		expect(postSpy.mock.calls[0]?.[0]).toMatchObject({
+			text: "Authentication lives in the host repository.",
+		});
+	});
+
+	it("does not invent a completion message for an empty successful result", async () => {
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const postSpy = vi
+			.spyOn(SlackMessageService.prototype, "postMessage")
+			.mockResolvedValue({} as any);
+
+		await adapter.postReply(
+			slackEvent("compare the repositories"),
+			{ getMessages: () => [] } as any,
+			resultMessage(""),
+		);
+
+		expect(postSpy).not.toHaveBeenCalled();
+	});
+
+	it("posts a readable waiting status for scheduled work", async () => {
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const postSpy = vi
+			.spyOn(SlackMessageService.prototype, "postMessage")
+			.mockResolvedValue({} as any);
+
+		await adapter.postPendingStatus(slackEvent("check CI"), {
+			sessionCrons: [
+				{
+					id: "cron-1",
+					schedule: "27 12 * * *",
+					recurring: false,
+					prompt: "Check CI",
+				},
+			],
+			backgroundTasks: [],
+		});
+
+		expect(postSpy).toHaveBeenCalledTimes(1);
+		expect(postSpy.mock.calls[0]?.[0]).toMatchObject({
+			channel: "C1",
+			thread_ts: "1700000000.000100",
+		});
+		expect(postSpy.mock.calls[0]?.[0].text).toContain("Standing by");
+		expect(postSpy.mock.calls[0]?.[0].text).toContain("12:27");
 	});
 
 	it("swaps the receipt reaction for the processed one after the turn completes", async () => {
