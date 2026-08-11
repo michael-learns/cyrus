@@ -1168,14 +1168,7 @@ export class EdgeWorker extends EventEmitter {
 				cyrusHome: this.cyrusHome,
 				chatRepositoryProvider,
 				runnerConfigBuilder: this.runnerConfigBuilder,
-				createRunner: (config) => {
-					const runnerType = this.runnerSelectionService.getDefaultRunner();
-					return this.createRunnerForType(runnerType, {
-						...config,
-						model: this.getDefaultModelForRunner(runnerType),
-						fallbackModel: this.getDefaultFallbackModelForRunner(runnerType),
-					});
-				},
+				createRunner: (config) => this.createChatRunner(config),
 				// Live read so hot-reloaded config (`setConfig`) picks up new
 				// per-platform MCP paths without rebuilding the handler.
 				getPlatformMcpConfigOverrides: () => this.config.slackMcpConfigs,
@@ -1484,6 +1477,36 @@ export class EdgeWorker extends EventEmitter {
 		);
 		await this.slackChatAdapter?.setBackgroundActivityStatus(event);
 		await this.savePersistedState();
+	}
+
+	/**
+	 * Build the runner for a chat session.
+	 *
+	 * Chat sessions run `gh pr ...`, but their workspace is not a git checkout
+	 * and they only inherit the parent environment. A self-hosted deployment
+	 * authenticated by GitHub App credentials has neither `GITHUB_TOKEN` nor a
+	 * local `gh` login, so resolve the supported token chain and hand `gh` a
+	 * token it actually understands. Reaches the Claude and Gemini runners;
+	 * Codex and Cursor still ignore `additionalEnv` (see AgentRunnerConfig).
+	 */
+	private async createChatRunner(
+		config: AgentRunnerConfig,
+	): Promise<IAgentRunner> {
+		const runnerType = this.runnerSelectionService.getDefaultRunner();
+		const runnerConfig: AgentRunnerConfig = {
+			...config,
+			model: this.getDefaultModelForRunner(runnerType),
+			fallbackModel: this.getDefaultFallbackModelForRunner(runnerType),
+		};
+		const githubToken = await this.resolveGitHubTokenValue();
+		if (githubToken) {
+			runnerConfig.additionalEnv = {
+				...runnerConfig.additionalEnv,
+				GH_TOKEN: githubToken,
+				GITHUB_TOKEN: githubToken,
+			};
+		}
+		return this.createRunnerForType(runnerType, runnerConfig);
 	}
 
 	private async updateSlackWorkItemActivity(

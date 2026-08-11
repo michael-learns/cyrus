@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildCyrusPermissionsConfig } from "../src/permissions.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HELPER = join(HERE, "..", "src", "permission-check.mjs");
@@ -203,5 +204,77 @@ describe("permission-check helper", () => {
 		});
 		expect(decision.permission).toBe("allow");
 		expect(decision.permission).not.toBe("ask");
+	});
+
+	describe("translated multiword shell allowances", () => {
+		// Feed the real translator's output into the real helper, so the two
+		// halves of the permission system are checked against each other rather
+		// than against hand-written patterns.
+		const translated = () => {
+			const dir = mkdtempSync(join(tmpdir(), "perm-translate-"));
+			tempDirs.push(dir);
+			return buildCyrusPermissionsConfig({
+				workspace: dir,
+				allowedTools: ["Read", "Bash(git -C * pull)", "Bash(gh pr:*)"],
+			});
+		};
+
+		it("allows the gh pr commands the Slack defaults advertise", () => {
+			const cfg = translated();
+			for (const command of [
+				"gh pr view 123 --repo owner/name",
+				"gh pr list --repo owner/name",
+				"gh pr merge https://github.com/owner/name/pull/1",
+			]) {
+				const { decision } = runHelper({
+					allow: cfg.allow,
+					deny: cfg.deny,
+					payload: { hook_event_name: "beforeShellExecution", command },
+				});
+				expect(decision.permission, command).toBe("allow");
+			}
+		});
+
+		it("still denies gh subcommands outside the allowance", () => {
+			const cfg = translated();
+			const { decision } = runHelper({
+				allow: cfg.allow,
+				deny: cfg.deny,
+				payload: {
+					hook_event_name: "beforeShellExecution",
+					command: "gh issue list",
+				},
+			});
+			expect(decision.permission).toBe("deny");
+		});
+
+		it("allows the repository refresh command", () => {
+			const cfg = translated();
+			const { decision } = runHelper({
+				allow: cfg.allow,
+				deny: cfg.deny,
+				payload: {
+					hook_event_name: "beforeShellExecution",
+					command: "git -C /repos/cyrus pull",
+				},
+			});
+			expect(decision.permission).toBe("allow");
+		});
+
+		it("opens the preToolUse gate for Shell but not for Write", () => {
+			const cfg = translated();
+			const shell = runHelper({
+				allow: cfg.allow,
+				deny: cfg.deny,
+				payload: { hook_event_name: "preToolUse", tool_name: "Shell" },
+			});
+			expect(shell.decision.permission).toBe("allow");
+			const write = runHelper({
+				allow: cfg.allow,
+				deny: cfg.deny,
+				payload: { hook_event_name: "preToolUse", tool_name: "Write" },
+			});
+			expect(write.decision.permission).toBe("deny");
+		});
 	});
 });

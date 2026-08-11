@@ -73,6 +73,16 @@ function normalizeShellArgsGlob(argument: string | null): string | null {
 	return args || null;
 }
 
+/**
+ * Claude `Bash(...)` patterns use `*` as a free-form argument wildcard that
+ * routinely spans paths and URLs (`--repo owner/name`, a pull request URL).
+ * Cursor's matcher treats a lone `*` as "anything except /", so widen it to
+ * `**` when folding command words onto the argument side.
+ */
+function widenShellGlob(value: string): string {
+	return value.replace(/\*+/g, "**");
+}
+
 function mapMcpPattern(pattern: string): string | null {
 	const trimmed = pattern.trim();
 	if (!trimmed.toLowerCase().startsWith("mcp__")) return null;
@@ -130,8 +140,24 @@ function mapToolPatternToHookPatterns(pattern: string): string[] {
 		const argsGlob = normalizeShellArgsGlob(arg);
 		const out: string[] = [];
 		if (base) {
-			out.push(`Shell(${base})`);
-			if (argsGlob) out.push(`Shell(${base}:${argsGlob})`);
+			// Cursor derives its candidates from the leading word of the command
+			// and everything after it — `Shell(<exe>)` and `Shell(<exe>:<rest>)` —
+			// so a multiword prefix like `gh pr` can never match `Shell(gh pr)`.
+			// Fold the extra words onto the argument side, which grants that
+			// subcommand family rather than the whole executable.
+			const [executable, ...prefixWords] = base.split(/\s+/);
+			if (executable && prefixWords.length > 0) {
+				const prefix = widenShellGlob(prefixWords.join(" "));
+				out.push(`Shell(${executable}:${prefix})`);
+				if (argsGlob) {
+					out.push(
+						`Shell(${executable}:${prefix} ${widenShellGlob(argsGlob)})`,
+					);
+				}
+			} else {
+				out.push(`Shell(${base})`);
+				if (argsGlob) out.push(`Shell(${base}:${argsGlob})`);
+			}
 		}
 		return out;
 	}
@@ -307,6 +333,17 @@ export function buildCyrusPermissionsConfig(args: {
 		for (const mapped of mapToolPatternToHookPatterns(pattern)) {
 			allow.add(mapped);
 		}
+	}
+
+	// The preToolUse gate only sees the tool name ("Shell"), never the command,
+	// so an allow list built purely from parenthesized `Bash(...)` patterns is
+	// denied there before beforeShellExecution can evaluate the command. Add the
+	// name-level gate whenever a command-level shell allow exists — the command
+	// itself stays restricted by the `Shell(...)` patterns. Deliberately NOT done
+	// for `Tool(Write)`: there is no write-level hook event, so that gate is the
+	// only enforcement point for writes.
+	if ([...allow].some((pattern) => pattern.startsWith("Shell("))) {
+		allow.add("Tool(Shell)");
 	}
 
 	const deny = new Set<string>();
