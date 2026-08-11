@@ -517,6 +517,16 @@ export interface AgentRunnerConfig {
 	 * a single tool call will be rejected.
 	 */
 	onAskUserQuestion?: OnAskUserQuestion;
+	/**
+	 * Extra environment variables for the agent's child process, merged over
+	 * the inherited `process.env`.
+	 *
+	 * Honored today by the Claude and Gemini runners. Codex and Cursor still
+	 * ignore it: the Codex app-server is pooled by a launch key that includes
+	 * its env map (so per-session values would fragment the pool), and
+	 * `@cursor/sdk` exposes no env option at all.
+	 */
+	additionalEnv?: Record<string, string>;
 	/** Logger instance for the runner */
 	logger?: ILogger;
 	/** Callback for each message received */

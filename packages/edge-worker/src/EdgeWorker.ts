@@ -1490,6 +1490,29 @@ export class EdgeWorker extends EventEmitter {
 			};
 		}
 
+		// Distinct target sets hash to distinct work item IDs, but the worktree
+		// path (`issueIdentifier`) and the branch name are derived only from the
+		// source repository and the issue number. Two live sessions on one issue
+		// would therefore share worktrees and branches, and stopping either would
+		// delete the other's workspace. Allow a single live engineering session
+		// per GitHub Issue until those keys carry target-set identity.
+		const conflicting = Array.from(
+			this.gitHubIssueWorkItemSessions.values(),
+		).find(
+			(item) =>
+				item.workItemId !== request.workItemId &&
+				item.repositoryFullName.toLowerCase() ===
+					request.repositoryFullName.toLowerCase() &&
+				item.issueNumber === request.issueNumber &&
+				item.status !== "stopped",
+		);
+		if (conflicting) {
+			throw this.gitHubWorkItemError(
+				`A Cyrus session for ${request.repositoryFullName}#${request.issueNumber} is already running against ${conflicting.targetRepositoryFullNames.join(", ")}. Stop it before starting a different repository set.`,
+				409,
+			);
+		}
+
 		const token = await this.resolveGitHubTokenValue(installationToken);
 		if (!token) {
 			throw this.gitHubWorkItemError(
@@ -1803,11 +1826,12 @@ export class EdgeWorker extends EventEmitter {
 				`Runner selection mismatch: requested ${workItem.runnerType}, resolved ${runnerType}`,
 			);
 		}
-		const runnerConfig = config as AgentRunnerConfig & {
-			additionalEnv?: Record<string, string>;
-		};
-		runnerConfig.additionalEnv = {
-			...runnerConfig.additionalEnv,
+		// Claude and Gemini forward `additionalEnv` to the child process. Codex
+		// and Cursor do not yet (see AgentRunnerConfig.additionalEnv), so those
+		// runners still rely on ambient `gh` / `GITHUB_TOKEN` auth and cannot use
+		// a proxy-forwarded or self-minted GitHub App installation token.
+		config.additionalEnv = {
+			...config.additionalEnv,
 			GH_TOKEN: githubToken,
 			GITHUB_TOKEN: githubToken,
 		};
