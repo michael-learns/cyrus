@@ -182,7 +182,7 @@ import {
 	type SkillSessionContext,
 	SkillsPluginResolver,
 } from "./SkillsPluginResolver.js";
-import { SlackChatAdapter } from "./SlackChatAdapter.js";
+import { markdownToSlackMrkdwn, SlackChatAdapter } from "./SlackChatAdapter.js";
 import type { IActivitySink } from "./sinks/IActivitySink.js";
 import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
@@ -1477,7 +1477,11 @@ export class EdgeWorker extends EventEmitter {
 		if (existingIndex >= 0) subscribers[existingIndex] = subscriber;
 		else subscribers.push(subscriber);
 		this.setGitHubIssueWorkItemStatus(workItem, workItem.status);
-		this.chatSessionHandler?.setDelegatedWorkActive(parentSessionId, true);
+		this.chatSessionHandler?.setDelegatedWorkActive(
+			parentSessionId,
+			true,
+			workItemId,
+		);
 		await this.slackChatAdapter?.setBackgroundActivityStatus(event);
 		await this.savePersistedState();
 	}
@@ -1509,16 +1513,24 @@ export class EdgeWorker extends EventEmitter {
 					? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
 					: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
 		await Promise.allSettled(
-			Array.from(events.entries()).flatMap(([parentSessionId, event]) => [
-				this.slackChatAdapter!.postDelegatedWorkMessage(event, text),
-				this.slackChatAdapter!.clearActivityStatus(event),
-				Promise.resolve(
-					this.chatSessionHandler?.setDelegatedWorkActive(
-						parentSessionId,
-						false,
-					),
-				),
-			]),
+			Array.from(events.entries()).flatMap(([parentSessionId, event]) => {
+				// Release this job's claim first, then hand the thread status back
+				// only once no sibling job of the same chat session is left —
+				// otherwise one child clears another child's status mid-run.
+				this.chatSessionHandler?.setDelegatedWorkActive(
+					parentSessionId,
+					false,
+					workItem.workItemId,
+				);
+				const siblingStillRunning =
+					this.chatSessionHandler?.hasDelegatedWork(parentSessionId) ?? false;
+				return [
+					this.slackChatAdapter!.postDelegatedWorkMessage(event, text),
+					...(siblingStillRunning
+						? []
+						: [this.slackChatAdapter!.clearActivityStatus(event)]),
+				];
+			}),
 		);
 		this.slackWorkItemEvents.delete(workItem.workItemId);
 	}
@@ -1537,7 +1549,9 @@ export class EdgeWorker extends EventEmitter {
 				typeof message.result === "string" &&
 				message.result.trim()
 			) {
-				return message.result.trim().slice(0, 2_500);
+				// The engineering runner writes ordinary Markdown; Slack needs
+				// mrkdwn. Convert before truncating so a cut can't split a token.
+				return markdownToSlackMrkdwn(message.result.trim()).slice(0, 2_500);
 			}
 		}
 		return undefined;
@@ -1600,6 +1614,10 @@ export class EdgeWorker extends EventEmitter {
 			};
 		}
 
+		// One live engineering session per GitHub Issue: the worktree path and
+		// branch name derive only from the source repository and issue number,
+		// so two sessions on one issue would share worktrees and branches and
+		// stopping either would delete the other's workspace.
 		const existingForIssue = Array.from(
 			this.gitHubIssueWorkItemSessions.values(),
 		).find(
@@ -1964,16 +1982,17 @@ export class EdgeWorker extends EventEmitter {
 				`Runner selection mismatch: requested ${workItem.runnerType}, resolved ${runnerType}`,
 			);
 		}
-		const runnerConfig = config as AgentRunnerConfig & {
-			additionalEnv?: Record<string, string>;
-		};
-		const baseOnMessage = runnerConfig.onMessage;
-		runnerConfig.onMessage = async (message) => {
+		const baseOnMessage = config.onMessage;
+		config.onMessage = async (message) => {
 			await baseOnMessage?.(message);
 			await this.updateSlackWorkItemActivity(workItem, message);
 		};
-		runnerConfig.additionalEnv = {
-			...runnerConfig.additionalEnv,
+		// Claude and Gemini forward `additionalEnv` to the child process. Codex
+		// and Cursor do not yet (see AgentRunnerConfig.additionalEnv), so those
+		// runners still rely on ambient `gh` / `GITHUB_TOKEN` auth and cannot use
+		// a proxy-forwarded or self-minted GitHub App installation token.
+		config.additionalEnv = {
+			...config.additionalEnv,
 			GH_TOKEN: githubToken,
 			GITHUB_TOKEN: githubToken,
 		};

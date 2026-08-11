@@ -48,6 +48,14 @@ const ACTIVITY_STATUS_MIN_INTERVAL_MS = 2_000;
 /** Keep task-specific status text useful without taking over the composer. */
 const ACTIVITY_SUBJECT_MAX_LENGTH = 80;
 
+/**
+ * Capping the subject alone is not enough — the verb, the quotes and the
+ * ellipsis around it all count toward what Slack renders, and the longest
+ * verbs push an 80-character subject to roughly 120. Bound the fully
+ * formatted status instead.
+ */
+const ACTIVITY_STATUS_MAX_LENGTH = 100;
+
 interface SlackActivityStatusState {
 	subject: string;
 	event: SlackWebhookEvent;
@@ -58,6 +66,12 @@ interface SlackActivityStatusState {
 	delivery: Promise<void>;
 	throttleTimer?: ReturnType<typeof setTimeout>;
 	refreshTimer?: ReturnType<typeof setTimeout>;
+	/**
+	 * Bumped whenever a new turn takes over this thread. A clear captures the
+	 * generation before awaiting its delivery, so an in-flight clear can never
+	 * tear down state a newer turn has already adopted.
+	 */
+	generation: number;
 }
 
 /** Reaction added when a message is received and queued for processing (👀) */
@@ -65,6 +79,68 @@ export const RECEIPT_REACTION = "eyes";
 
 /** Reaction that replaces the receipt one once the agent finished its turn (✅) */
 export const PROCESSED_REACTION = "white_check_mark";
+
+/**
+ * Convert ordinary Markdown into Slack mrkdwn.
+ *
+ * The Slack chat agent avoids Markdown because its system prompt forbids it
+ * (see the "Slack Message Formatting" rules below). Text that never passed
+ * through that prompt — a delegated GitHub work item's final summary, written
+ * by an engineering runner — arrives as plain Markdown, whose `###` headings,
+ * `**bold**`, `[text](url)` links and pipe tables all render as broken plain
+ * text in Slack. Normalize it before posting.
+ *
+ * Fenced code blocks pass through untouched: Slack renders ``` the same way,
+ * and rewriting their contents would corrupt the code.
+ */
+export function markdownToSlackMrkdwn(markdown: string): string {
+	const out: string[] = [];
+	let inFence = false;
+
+	for (const line of markdown.split("\n")) {
+		if (/^\s*```/.test(line)) {
+			inFence = !inFence;
+			out.push(line);
+			continue;
+		}
+		if (inFence) {
+			out.push(line);
+			continue;
+		}
+		// Table separator rows (| --- | :---: |) have no Slack equivalent.
+		if (line.includes("|") && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line)) {
+			continue;
+		}
+
+		let converted = line;
+		// `### Heading` -> `*Heading*` on its own line
+		converted = converted.replace(
+			/^\s*#{1,6}\s+(.*?)\s*#*\s*$/,
+			(_match, heading: string) => (heading ? `*${heading}*` : ""),
+		);
+		// `| a | b |` -> `a — b`
+		if (/^\s*\|.*\|\s*$/.test(converted)) {
+			converted = converted
+				.trim()
+				.replace(/^\||\|$/g, "")
+				.split("|")
+				.map((cell) => cell.trim())
+				.filter((cell) => cell.length > 0)
+				.join(" — ");
+		}
+		// `[text](url)` -> `<url|text>`
+		converted = converted.replace(
+			/\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g,
+			(_match, text: string, url: string) =>
+				text.trim() ? `<${url}|${text.trim()}>` : `<${url}>`,
+		);
+		// `**bold**` -> `*bold*`
+		converted = converted.replace(/\*\*([^*]+)\*\*/g, "*$1*");
+		out.push(converted);
+	}
+
+	return out.join("\n");
+}
 
 /**
  * Slack implementation of ChatPlatformAdapter.
@@ -176,11 +252,13 @@ export class SlackChatAdapter
 				desiredStatus: "",
 				lastRequestedAt: 0,
 				delivery: Promise.resolve(),
+				generation: 0,
 			};
 			this.activityStatuses.set(threadKey, state);
 		} else {
 			state.subject = this.sanitizeActivitySubject(taskInstructions);
 			state.event = event;
+			state.generation += 1;
 		}
 
 		return this.requestActivityStatus(
@@ -225,19 +303,31 @@ export class SlackChatAdapter
 		);
 	}
 
-	async clearActivityStatus(event: SlackWebhookEvent): Promise<void> {
+	async clearActivityStatus(
+		event: SlackWebhookEvent,
+		options?: { retainState?: boolean },
+	): Promise<void> {
 		const threadKey = this.getThreadKey(event);
 		const state = this.activityStatuses.get(threadKey);
 		if (!state) return;
 
+		const generation = state.generation;
 		if (state.throttleTimer) clearTimeout(state.throttleTimer);
 		if (state.refreshTimer) clearTimeout(state.refreshTimer);
 		state.throttleTimer = undefined;
 		state.refreshTimer = undefined;
 		state.desiredStatus = "";
 
-		await this.enqueueActivityStatus(state, "");
-		if (this.activityStatuses.get(threadKey) === state) {
+		await this.enqueueActivityStatus(threadKey, state, "");
+		// Delivery is async, so a newer turn may have adopted this same state
+		// object while the clear was in flight. Only the turn that owns the
+		// state may retire it — and `retainState` keeps it alive for a session
+		// that is merely waiting on a scheduled wakeup.
+		if (
+			!options?.retainState &&
+			this.activityStatuses.get(threadKey) === state &&
+			state.generation === generation
+		) {
 			this.activityStatuses.delete(threadKey);
 		}
 	}
@@ -682,9 +772,25 @@ Supported mrkdwn syntax:
 	}
 
 	private formatActivityStatus(verb: string, subject: string): string {
-		return subject === "your request"
-			? `${verb} your request…`
-			: `${verb} “${subject}”…`;
+		const status =
+			subject === "your request"
+				? `${verb} your request…`
+				: `${verb} “${this.fitActivitySubject(verb, subject)}”…`;
+		return status.length <= ACTIVITY_STATUS_MAX_LENGTH
+			? status
+			: `${status.slice(0, ACTIVITY_STATUS_MAX_LENGTH - 1).trimEnd()}…`;
+	}
+
+	/**
+	 * Shrink the subject so the verb, quotes and ellipsis around it still fit
+	 * inside the status limit — a long verb must not push an already-capped
+	 * subject over the edge.
+	 */
+	private fitActivitySubject(verb: string, subject: string): string {
+		const room = ACTIVITY_STATUS_MAX_LENGTH - `${verb} “”…`.length;
+		if (room <= 0) return "";
+		if (subject.length <= room) return subject;
+		return `${subject.slice(0, room - 1).trimEnd()}…`;
 	}
 
 	private activityVerbForMessage(message: SDKMessage): string {
@@ -763,16 +869,17 @@ Supported mrkdwn syntax:
 			state.throttleTimer = setTimeout(() => {
 				state.throttleTimer = undefined;
 				if (this.activityStatuses.get(threadKey) !== state) return;
-				void this.enqueueActivityStatus(state, state.desiredStatus);
+				void this.enqueueActivityStatus(threadKey, state, state.desiredStatus);
 			}, ACTIVITY_STATUS_MIN_INTERVAL_MS - elapsed);
 			state.throttleTimer.unref?.();
 			return state.delivery;
 		}
 
-		return this.enqueueActivityStatus(state, status);
+		return this.enqueueActivityStatus(threadKey, state, status);
 	}
 
 	private enqueueActivityStatus(
+		threadKey: string,
 		state: SlackActivityStatusState,
 		status: string,
 	): Promise<void> {
@@ -808,7 +915,14 @@ Supported mrkdwn syntax:
 
 				state.refreshTimer = setTimeout(() => {
 					state.refreshTimer = undefined;
-					void this.enqueueActivityStatus(state, state.desiredStatus);
+					// Mirror the throttle timer's guard: a state that is no longer
+					// registered must not keep refreshing forever.
+					if (this.activityStatuses.get(threadKey) !== state) return;
+					void this.enqueueActivityStatus(
+						threadKey,
+						state,
+						state.desiredStatus,
+					);
 				}, ACTIVITY_STATUS_REFRESH_MS);
 				state.refreshTimer.unref?.();
 			});
