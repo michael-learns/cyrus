@@ -135,6 +135,94 @@ describe("SlackMessageService", () => {
 		});
 	});
 
+	describe("setAssistantThreadStatus", () => {
+		it("sets a task status on a Slack thread", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: true }),
+			});
+
+			await service.setAssistantThreadStatus({
+				token: "xoxb-test-token",
+				channel_id: "C9876543210",
+				thread_ts: "1704110400.000100",
+				status: "is inspecting code…",
+			});
+
+			expect(mockFetch).toHaveBeenCalledWith(
+				"https://slack.com/api/assistant.threads.setStatus",
+				{
+					method: "POST",
+					headers: {
+						Authorization: "Bearer xoxb-test-token",
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						channel_id: "C9876543210",
+						thread_ts: "1704110400.000100",
+						status: "is inspecting code…",
+					}),
+				},
+			);
+		});
+
+		it("clears a task status with an empty status", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: true }),
+			});
+
+			await service.setAssistantThreadStatus({
+				token: "xoxb-test-token",
+				channel_id: "C9876543210",
+				thread_ts: "1704110400.000100",
+				status: "",
+			});
+
+			expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toEqual({
+				channel_id: "C9876543210",
+				thread_ts: "1704110400.000100",
+				status: "",
+			});
+		});
+
+		it("throws on a non-OK HTTP response", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: false,
+				status: 429,
+				statusText: "Too Many Requests",
+				text: async () => "ratelimited",
+			});
+
+			await expect(
+				service.setAssistantThreadStatus({
+					token: "xoxb-test-token",
+					channel_id: "C9876543210",
+					thread_ts: "1704110400.000100",
+					status: "is thinking…",
+				}),
+			).rejects.toThrow(
+				"[SlackMessageService] Failed to set assistant thread status: 429 Too Many Requests",
+			);
+		});
+
+		it("throws when Slack rejects the status", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: false, error: "missing_scope" }),
+			});
+
+			await expect(
+				service.setAssistantThreadStatus({
+					token: "xoxb-test-token",
+					channel_id: "C9876543210",
+					thread_ts: "1704110400.000100",
+					status: "is thinking…",
+				}),
+			).rejects.toThrow("[SlackMessageService] Slack API error: missing_scope");
+		});
+	});
+
 	describe("fetchThreadMessages", () => {
 		it("fetches thread messages with correct GET params and Bearer auth", async () => {
 			mockFetch.mockResolvedValueOnce({

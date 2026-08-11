@@ -2,6 +2,7 @@ export { SlackEventTransport } from "./SlackEventTransport.js";
 export type {
 	SlackFetchThreadParams,
 	SlackPostMessageParams,
+	SlackSetAssistantThreadStatusParams,
 	SlackThreadMessage,
 } from "./SlackMessageService.js";
 export { SlackMessageService } from "./SlackMessageService.js";

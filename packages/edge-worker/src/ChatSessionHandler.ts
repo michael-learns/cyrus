@@ -78,6 +78,26 @@ export interface ChatPlatformAdapter<TEvent> {
 		pendingWork: AgentPendingWork,
 	): Promise<void>;
 
+	/** Start the platform's transient activity indicator for an accepted request. */
+	startActivityStatus?(event: TEvent, taskInstructions: string): Promise<void>;
+
+	/** Update the activity indicator from a runner lifecycle message. */
+	updateActivityStatus?(event: TEvent, message: SDKMessage): Promise<void>;
+
+	/** Show that active background work still needs to finish. */
+	setBackgroundActivityStatus?(event: TEvent): Promise<void>;
+
+	/** Clear the platform's transient activity indicator. */
+	/**
+	 * Clear the platform's transient activity indicator. `retainState` hides the
+	 * displayed status but keeps the indicator's bookkeeping alive, for a session
+	 * that will wake itself again without a new inbound event.
+	 */
+	clearActivityStatus?(
+		event: TEvent,
+		options?: { retainState?: boolean },
+	): Promise<void>;
+
 	/** Acknowledge receipt of the event (e.g., emoji reaction). Fire-and-forget */
 	acknowledgeReceipt(event: TEvent): Promise<void>;
 
@@ -259,6 +279,7 @@ export class ChatSessionHandler<TEvent> {
 						existingRunner.addStreamMessage &&
 						existingRunner.isStreaming?.()
 					) {
+						await this.startActivityStatus(event, taskInstructions);
 						this.logger.info(
 							`Injecting follow-up prompt into running session ${existingSessionId} (thread ${threadKey})`,
 						);
@@ -279,6 +300,7 @@ export class ChatSessionHandler<TEvent> {
 						);
 						this.queuePendingFollowup(threadKey, event);
 						await this.adapter.notifyBusy(event, threadKey);
+						void this.setBackgroundActivityStatus(event);
 					}
 					return;
 				}
@@ -296,6 +318,7 @@ export class ChatSessionHandler<TEvent> {
 						existingSession.cursorSessionId;
 
 					if (resumeSessionId) {
+						await this.startActivityStatus(event, taskInstructions);
 						try {
 							await this.resumeSession(
 								event,
@@ -305,6 +328,7 @@ export class ChatSessionHandler<TEvent> {
 								taskInstructions,
 							);
 						} catch (error) {
+							await this.clearActivityStatus(event);
 							this.logger.error(
 								`Failed to resume ${this.adapter.platformName} session ${existingSessionId}`,
 								error instanceof Error ? error : new Error(String(error)),
@@ -335,9 +359,12 @@ export class ChatSessionHandler<TEvent> {
 				return;
 			}
 
+			await this.startActivityStatus(event, taskInstructions);
+
 			// Create an empty workspace directory for this thread
 			const workspace = await this.createWorkspace(threadKey);
 			if (!workspace) {
+				await this.clearActivityStatus(event);
 				this.logger.error(
 					`Failed to create workspace for ${this.adapter.platformName} thread ${threadKey}`,
 				);
@@ -359,6 +386,7 @@ export class ChatSessionHandler<TEvent> {
 
 			const session = this.sessionManager.getSession(sessionId);
 			if (!session) {
+				await this.clearActivityStatus(event);
 				this.logger.error(
 					`Failed to create session for ${this.adapter.platformName} webhook ${eventId}`,
 				);
@@ -430,6 +458,7 @@ export class ChatSessionHandler<TEvent> {
 					// Runner died before emitting a final `result`. Drop any
 					// still-queued reply events for this session so a later
 					// resumeSession() doesn't pair them with a future turn.
+					void this.clearActivityStatus(event);
 					this.clearPendingReplies(sessionId);
 				})
 				.finally(() => {
@@ -441,6 +470,7 @@ export class ChatSessionHandler<TEvent> {
 					});
 				});
 		} catch (error) {
+			await this.clearActivityStatus(event);
 			this.logger.error(
 				`Failed to process ${this.adapter.platformName} webhook`,
 				error instanceof Error ? error : new Error(String(error)),
@@ -614,6 +644,7 @@ export class ChatSessionHandler<TEvent> {
 					`${this.adapter.platformName} resume session error for ${sessionId}`,
 					error instanceof Error ? error : new Error(String(error)),
 				);
+				void this.clearActivityStatus(event);
 				this.clearPendingReplies(sessionId);
 			});
 	}
@@ -628,6 +659,13 @@ export class ChatSessionHandler<TEvent> {
 		message: SDKMessage,
 	): Promise<void> {
 		await this.sessionManager.handleClaudeMessage(sessionId, message);
+
+		const statusEvent =
+			this.pendingReplyEvents.get(sessionId)?.[0] ??
+			this.lastReplyEvent.get(sessionId);
+		if (statusEvent && message.type !== "result") {
+			void this.updateActivityStatus(statusEvent, message);
+		}
 
 		if (message.type === "result") {
 			const runner = this.sessionManager.getAgentRunner(sessionId);
@@ -695,6 +733,20 @@ export class ChatSessionHandler<TEvent> {
 					this.pendingWorkNotificationKeys.delete(sessionId);
 				}
 
+				if (replyEvent) {
+					if (pendingWork.backgroundTasks.length > 0) {
+						void this.setBackgroundActivityStatus(replyEvent);
+					} else {
+						// Only scheduled wakeups remain: the runner stays open and
+						// resumes without another inbound event, so hide the status
+						// while it waits but keep the indicator's state so the woken
+						// turn can show progress again.
+						await this.clearActivityStatus(replyEvent, {
+							retainState: true,
+						});
+					}
+				}
+
 				this.logger.info(
 					`Deferring ${this.adapter.platformName} reply for session ${sessionId}: ${pendingWork.sessionCrons.length} scheduled wakeup(s), ${pendingWork.backgroundTasks.length} background task(s) remain`,
 				);
@@ -717,6 +769,8 @@ export class ChatSessionHandler<TEvent> {
 						`Failed to post ${this.adapter.platformName} reply for session ${sessionId}`,
 						error instanceof Error ? error : new Error(String(error)),
 					);
+				} finally {
+					await this.clearActivityStatus(replyEvent);
 				}
 				// Fire-and-forget processed acknowledgement for every drained
 				// event (e.g., swap the receipt reaction) — runs even when
@@ -732,10 +786,69 @@ export class ChatSessionHandler<TEvent> {
 				this.logger.warn(
 					`Received result for session ${sessionId} with no pending reply event — nothing to post`,
 				);
+			} else {
+				await this.clearActivityStatus(replyEvent);
 			}
 
 			// The turn is done — deliver any follow-ups that arrived while busy.
 			this.drainPendingFollowups(sessionId);
+		}
+	}
+
+	private async startActivityStatus(
+		event: TEvent,
+		taskInstructions: string,
+	): Promise<void> {
+		if (!this.adapter.startActivityStatus) return;
+		try {
+			await this.adapter.startActivityStatus(event, taskInstructions);
+		} catch (error) {
+			this.logger.warn(
+				`Failed to start ${this.adapter.platformName} activity status: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private async updateActivityStatus(
+		event: TEvent,
+		message: SDKMessage,
+	): Promise<void> {
+		if (!this.adapter.updateActivityStatus) return;
+		try {
+			await this.adapter.updateActivityStatus(event, message);
+		} catch (error) {
+			this.logger.warn(
+				`Failed to update ${this.adapter.platformName} activity status: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private async setBackgroundActivityStatus(event: TEvent): Promise<void> {
+		if (!this.adapter.setBackgroundActivityStatus) return;
+		try {
+			await this.adapter.setBackgroundActivityStatus(event);
+		} catch (error) {
+			this.logger.warn(
+				`Failed to update ${this.adapter.platformName} background activity status: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private async clearActivityStatus(
+		event: TEvent,
+		options?: { retainState?: boolean },
+	): Promise<void> {
+		if (!this.adapter.clearActivityStatus) return;
+		try {
+			// Forward the options object only when one was given, so the ordinary
+			// clear stays a single-argument call for adapters and callers alike.
+			await (options
+				? this.adapter.clearActivityStatus(event, options)
+				: this.adapter.clearActivityStatus(event));
+		} catch (error) {
+			this.logger.warn(
+				`Failed to clear ${this.adapter.platformName} activity status: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 

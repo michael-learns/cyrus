@@ -55,6 +55,20 @@ export interface SlackPostMessageParams {
 	thread_ts?: string;
 }
 
+/**
+ * Parameters for setting the transient loading status shown in a Slack thread.
+ */
+export interface SlackSetAssistantThreadStatusParams {
+	/** Slack Bot OAuth token */
+	token: string;
+	/** Channel ID containing the thread */
+	channel_id: string;
+	/** Timestamp of the thread parent message */
+	thread_ts: string;
+	/** Status text. An empty string clears the current status. */
+	status: string;
+}
+
 export class SlackMessageService {
 	private apiBaseUrl: string;
 
@@ -94,6 +108,44 @@ export class SlackMessageService {
 		}
 
 		// Slack API returns HTTP 200 even for errors — check the response body
+		const responseBody = (await response.json()) as {
+			ok: boolean;
+			error?: string;
+		};
+		if (!responseBody.ok) {
+			throw new Error(
+				`[SlackMessageService] Slack API error: ${responseBody.error ?? "unknown"}`,
+			);
+		}
+	}
+
+	/**
+	 * Set or clear the loading status displayed in a Slack thread.
+	 *
+	 * @see https://docs.slack.dev/reference/methods/assistant.threads.setStatus/
+	 */
+	async setAssistantThreadStatus(
+		params: SlackSetAssistantThreadStatusParams,
+	): Promise<void> {
+		const { token, channel_id, thread_ts, status } = params;
+		const url = `${this.apiBaseUrl}/assistant.threads.setStatus`;
+
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ channel_id, thread_ts, status }),
+		});
+
+		if (!response.ok) {
+			const errorBody = await response.text();
+			throw new Error(
+				`[SlackMessageService] Failed to set assistant thread status: ${response.status} ${response.statusText} - ${errorBody}`,
+			);
+		}
+
 		const responseBody = (await response.json()) as {
 			ok: boolean;
 			error?: string;

@@ -339,6 +339,104 @@ describe("ChatSessionHandler session-initiation gate", () => {
 	});
 });
 
+describe("ChatSessionHandler activity status lifecycle", () => {
+	it("starts, updates, and clears activity status around a completed turn", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"status-thread",
+		);
+		const startActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const updateActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		adapter.startActivityStatus = startActivityStatus;
+		adapter.updateActivityStatus = updateActivityStatus;
+		adapter.clearActivityStatus = clearActivityStatus;
+
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn().mockReturnValue(false),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+		const event = { eventId: "status-event", threadKey: "status-thread" };
+
+		await handler.handleEvent(event);
+		expect(startActivityStatus).toHaveBeenCalledWith(
+			event,
+			"Inspect repository configuration",
+		);
+
+		const assistantMessage = {
+			type: "assistant",
+			message: { content: [{ type: "tool_use", name: "Read", input: {} }] },
+		};
+		await capturedConfig.onMessage(assistantMessage);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(updateActivityStatus).toHaveBeenCalledWith(event, assistantMessage);
+
+		await capturedConfig.onMessage({
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "done",
+			session_id: "session-1",
+		});
+		expect(clearActivityStatus).toHaveBeenCalledWith(event);
+	});
+
+	it("clears activity status when the runner rejects before a result", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"failed-status-thread",
+		);
+		adapter.startActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		adapter.clearActivityStatus = clearActivityStatus;
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner: () =>
+				({
+					supportsStreamingInput: false,
+					start: vi.fn().mockRejectedValue(new Error("runner failed")),
+					stop: vi.fn(),
+					isRunning: vi.fn().mockReturnValue(false),
+					isStreaming: vi.fn().mockReturnValue(false),
+					addStreamMessage: vi.fn(),
+					getMessages: vi.fn().mockReturnValue([]),
+				}) as any,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+		const event = {
+			eventId: "failed-status-event",
+			threadKey: "failed-status-thread",
+		};
+
+		await handler.handleEvent(event);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(clearActivityStatus).toHaveBeenCalledWith(event);
+	});
+});
+
 describe("ChatSessionHandler processed acknowledgement", () => {
 	it("calls acknowledgeProcessed when the runner emits a result", async () => {
 		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
@@ -470,6 +568,11 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		const notifyBusy = vi
 			.spyOn(adapter, "notifyBusy")
 			.mockResolvedValue(undefined);
+		adapter.startActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const setBackgroundActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		adapter.setBackgroundActivityStatus = setBackgroundActivityStatus;
+		adapter.clearActivityStatus = clearActivityStatus;
 		let running = true;
 		let pendingWork = {
 			sessionCrons: [],
@@ -522,6 +625,8 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 
 		expect(postReply).not.toHaveBeenCalled();
 		expect(acknowledgeProcessed).not.toHaveBeenCalled();
+		expect(setBackgroundActivityStatus).toHaveBeenCalledWith(event);
+		expect(clearActivityStatus).not.toHaveBeenCalled();
 		const followup = {
 			eventId: "follow-up",
 			threadKey: "background-thread",
@@ -544,6 +649,7 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		);
 		expect(acknowledgeProcessed).toHaveBeenCalledTimes(1);
 		expect(acknowledgeProcessed).toHaveBeenCalledWith(event);
+		expect(clearActivityStatus).toHaveBeenCalledWith(event);
 		expect(createRunner).toHaveBeenCalledTimes(2);
 	});
 
@@ -558,6 +664,9 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 			.mockResolvedValue(undefined);
 		const postPendingStatus = vi.fn().mockResolvedValue(undefined);
 		(adapter as any).postPendingStatus = postPendingStatus;
+		adapter.startActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		adapter.clearActivityStatus = clearActivityStatus;
 		let pendingWork = {
 			sessionCrons: [
 				{
@@ -611,6 +720,11 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		expect(postPendingStatus).toHaveBeenCalledWith(event, pendingWork);
 		expect(postReply).not.toHaveBeenCalled();
 		expect(acknowledgeProcessed).not.toHaveBeenCalled();
+		// Only a scheduled wakeup remains: hide the status but keep the
+		// indicator's state so the woken turn can drive it again.
+		expect(clearActivityStatus).toHaveBeenCalledWith(event, {
+			retainState: true,
+		});
 
 		pendingWork = { sessionCrons: [], backgroundTasks: [] };
 		await capturedConfig.onMessage({
@@ -985,6 +1099,200 @@ describe("SlackChatAdapter task instructions", () => {
 		expect(adapter.extractTaskInstructions(mentionEvent("<@U0BOT>"))).toBe(
 			"Ask the user for more context",
 		);
+	});
+});
+
+describe("SlackChatAdapter activity statuses", () => {
+	const slackEvent = (text: string) =>
+		({
+			eventType: "app_mention",
+			eventId: "Ev-status",
+			teamId: "T1",
+			slackBotToken: "xoxb-test",
+			payload: {
+				type: "app_mention",
+				user: "U1",
+				channel: "C1",
+				text,
+				ts: "1700000000.000200",
+				thread_ts: "1700000000.000100",
+				event_ts: "1700000000.000200",
+			},
+		}) as SlackWebhookEvent;
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it("keeps the fully formatted status within Slack's length limit", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const longRequest =
+			"Investigate the intermittent billing reconciliation failure that affects enterprise customers during renewal";
+		const event = slackEvent(longRequest);
+
+		await adapter.startActivityStatus(event, longRequest);
+		await vi.advanceTimersByTimeAsync(2_000);
+		// The longest verb in the table, applied to the same long subject.
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						name: "Bash",
+						input: { command: "git log --oneline" },
+					},
+				],
+			},
+		} as any);
+
+		expect(setStatus.mock.calls.length).toBeGreaterThan(1);
+		for (const call of setStatus.mock.calls) {
+			expect(call[0].status.length).toBeLessThanOrEqual(100);
+		}
+	});
+
+	it("does not discard status state a newer turn has taken over", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const event = slackEvent("<@U0BOT> First request");
+
+		await adapter.startActivityStatus(event, "First request");
+		// A newer turn adopts the same state while the clear is still in flight.
+		const clearing = adapter.clearActivityStatus(event);
+		await adapter.startActivityStatus(event, "Second request");
+		await clearing;
+
+		const callsBeforeUpdate = setStatus.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(2_000);
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [{ type: "tool_use", name: "Grep", input: { pattern: "x" } }],
+			},
+		} as any);
+
+		// The newer turn still owns a live indicator: had the in-flight clear
+		// retired its state, this update would have been a silent no-op.
+		expect(setStatus.mock.calls.length).toBeGreaterThan(callsBeforeUpdate);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toContain("Second request");
+	});
+
+	it("shows sanitized task-specific stages and clears the status", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const event = slackEvent(
+			"<@U0BOT> Compare *authentication* and billing https://secret.example/path?token=abc",
+		);
+
+		await adapter.startActivityStatus(
+			event,
+			"<@U0BOT> Compare *authentication* and billing https://secret.example/path?token=abc",
+		);
+		expect(setStatus.mock.calls[0]?.[0]).toMatchObject({
+			channel_id: "C1",
+			thread_ts: "1700000000.000100",
+			status: "is getting started on “Compare authentication and billing”…",
+		});
+
+		await vi.advanceTimersByTimeAsync(2_000);
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [
+					{ type: "tool_use", name: "Grep", input: { pattern: "auth" } },
+				],
+			},
+		} as any);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toBe(
+			"is searching code for “Compare authentication and billing”…",
+		);
+
+		await adapter.clearActivityStatus(event);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toBe("");
+		for (const call of setStatus.mock.calls) {
+			expect(call[0].status).not.toContain("secret.example");
+			expect(call[0].status).not.toContain("token=abc");
+		}
+	});
+
+	it("throttles stage changes and refreshes an active status before Slack expires it", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const event = slackEvent("Compare the two repositories");
+
+		await adapter.startActivityStatus(event, "Compare the two repositories");
+		void adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						name: "Read",
+						input: { file_path: "/private/repo" },
+					},
+				],
+			},
+		} as any);
+		void adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						name: "Edit",
+						input: { file_path: "/private/repo" },
+					},
+				],
+			},
+		} as any);
+
+		expect(setStatus).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(2_000);
+		expect(setStatus).toHaveBeenCalledTimes(2);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toContain(
+			"is editing code for",
+		);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).not.toContain(
+			"/private/repo",
+		);
+
+		await vi.advanceTimersByTimeAsync(90_000);
+		expect(setStatus).toHaveBeenCalledTimes(3);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toBe(
+			setStatus.mock.calls.at(-2)?.[0].status,
+		);
+
+		await adapter.clearActivityStatus(event);
+	});
+
+	it("keeps Slack status failures non-fatal", async () => {
+		vi.spyOn(
+			SlackMessageService.prototype,
+			"setAssistantThreadStatus",
+		).mockRejectedValue(new Error("missing_scope"));
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+
+		await expect(
+			adapter.startActivityStatus(
+				slackEvent("Inspect the repository"),
+				"Inspect the repository",
+			),
+		).resolves.toBeUndefined();
 	});
 });
 
