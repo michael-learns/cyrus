@@ -720,7 +720,11 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		expect(postPendingStatus).toHaveBeenCalledWith(event, pendingWork);
 		expect(postReply).not.toHaveBeenCalled();
 		expect(acknowledgeProcessed).not.toHaveBeenCalled();
-		expect(clearActivityStatus).toHaveBeenCalledWith(event);
+		// Only a scheduled wakeup remains: hide the status but keep the
+		// indicator's state so the woken turn can drive it again.
+		expect(clearActivityStatus).toHaveBeenCalledWith(event, {
+			retainState: true,
+		});
 
 		pendingWork = { sessionCrons: [], backgroundTasks: [] };
 		await capturedConfig.onMessage({
@@ -1119,6 +1123,67 @@ describe("SlackChatAdapter activity statuses", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+	});
+
+	it("keeps the fully formatted status within Slack's length limit", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const longRequest =
+			"Investigate the intermittent billing reconciliation failure that affects enterprise customers during renewal";
+		const event = slackEvent(longRequest);
+
+		await adapter.startActivityStatus(event, longRequest);
+		await vi.advanceTimersByTimeAsync(2_000);
+		// The longest verb in the table, applied to the same long subject.
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						name: "Bash",
+						input: { command: "git log --oneline" },
+					},
+				],
+			},
+		} as any);
+
+		expect(setStatus.mock.calls.length).toBeGreaterThan(1);
+		for (const call of setStatus.mock.calls) {
+			expect(call[0].status.length).toBeLessThanOrEqual(100);
+		}
+	});
+
+	it("does not discard status state a newer turn has taken over", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const event = slackEvent("<@U0BOT> First request");
+
+		await adapter.startActivityStatus(event, "First request");
+		// A newer turn adopts the same state while the clear is still in flight.
+		const clearing = adapter.clearActivityStatus(event);
+		await adapter.startActivityStatus(event, "Second request");
+		await clearing;
+
+		const callsBeforeUpdate = setStatus.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(2_000);
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [{ type: "tool_use", name: "Grep", input: { pattern: "x" } }],
+			},
+		} as any);
+
+		// The newer turn still owns a live indicator: had the in-flight clear
+		// retired its state, this update would have been a silent no-op.
+		expect(setStatus.mock.calls.length).toBeGreaterThan(callsBeforeUpdate);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toContain("Second request");
 	});
 
 	it("shows sanitized task-specific stages and clears the status", async () => {

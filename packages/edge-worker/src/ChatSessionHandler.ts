@@ -88,7 +88,15 @@ export interface ChatPlatformAdapter<TEvent> {
 	setBackgroundActivityStatus?(event: TEvent): Promise<void>;
 
 	/** Clear the platform's transient activity indicator. */
-	clearActivityStatus?(event: TEvent): Promise<void>;
+	/**
+	 * Clear the platform's transient activity indicator. `retainState` hides the
+	 * displayed status but keeps the indicator's bookkeeping alive, for a session
+	 * that will wake itself again without a new inbound event.
+	 */
+	clearActivityStatus?(
+		event: TEvent,
+		options?: { retainState?: boolean },
+	): Promise<void>;
 
 	/** Acknowledge receipt of the event (e.g., emoji reaction). Fire-and-forget */
 	acknowledgeReceipt(event: TEvent): Promise<void>;
@@ -729,7 +737,13 @@ export class ChatSessionHandler<TEvent> {
 					if (pendingWork.backgroundTasks.length > 0) {
 						void this.setBackgroundActivityStatus(replyEvent);
 					} else {
-						await this.clearActivityStatus(replyEvent);
+						// Only scheduled wakeups remain: the runner stays open and
+						// resumes without another inbound event, so hide the status
+						// while it waits but keep the indicator's state so the woken
+						// turn can show progress again.
+						await this.clearActivityStatus(replyEvent, {
+							retainState: true,
+						});
 					}
 				}
 
@@ -820,10 +834,17 @@ export class ChatSessionHandler<TEvent> {
 		}
 	}
 
-	private async clearActivityStatus(event: TEvent): Promise<void> {
+	private async clearActivityStatus(
+		event: TEvent,
+		options?: { retainState?: boolean },
+	): Promise<void> {
 		if (!this.adapter.clearActivityStatus) return;
 		try {
-			await this.adapter.clearActivityStatus(event);
+			// Forward the options object only when one was given, so the ordinary
+			// clear stays a single-argument call for adapters and callers alike.
+			await (options
+				? this.adapter.clearActivityStatus(event, options)
+				: this.adapter.clearActivityStatus(event));
 		} catch (error) {
 			this.logger.warn(
 				`Failed to clear ${this.adapter.platformName} activity status: ${error instanceof Error ? error.message : String(error)}`,
