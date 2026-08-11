@@ -39,10 +39,11 @@ export declare interface SlackEventTransport {
  * - message: A plain message in a channel/thread the bot can see. Emitted only
  *   for threaded replies that aren't the bot's own message and aren't a
  *   subtype event (edits, joins, etc.). Whether it actually does anything is
- *   decided downstream (ChatSessionHandler only continues already-bound
- *   threads). Slack delivers both an `app_mention` AND a `message` event for a
- *   message that mentions the bot, so identical `(channel, ts)` pairs are
- *   de-duplicated here to avoid double-prompting.
+ *   decided downstream (ChatSessionHandler continues already-bound threads or
+ *   accepts an exact mention of the bot's own Slack user ID). Slack delivers
+ *   both an `app_mention` AND a `message` event for a message that mentions the
+ *   bot, so identical `(channel, ts)` pairs are de-duplicated here to avoid
+ *   double-prompting.
  */
 export class SlackEventTransport extends EventEmitter {
 	private config: SlackEventTransportConfig;
@@ -324,8 +325,8 @@ export class SlackEventTransport extends EventEmitter {
 
 		// `message` events fire for every message in every channel the bot can
 		// see, so apply cheap structural filters before doing any work. Anything
-		// that gets through here is a candidate follow-up prompt; the binding
-		// check (is this thread actually bound to Cyrus?) happens downstream.
+		// that gets through here is a candidate follow-up prompt or explicit
+		// mention; the binding/mention check happens downstream.
 		if (event.type === "message" && !this.shouldEmitMessageEvent(event)) {
 			reply.code(200).send({ success: true, ignored: true });
 			return;

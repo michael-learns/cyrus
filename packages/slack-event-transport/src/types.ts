@@ -75,9 +75,9 @@ export interface SlackWebhookEvent {
  *
  * - `app_mention`: an explicit @mention of the bot — always starts (or resumes)
  *   a session for the thread.
- * - `message`: a plain message in a channel/thread the bot can see. Only acted
- *   on as a follow-up prompt for a thread the bot is already bound to; never
- *   starts a new session (see ChatSessionHandler.isSessionInitiatingEvent).
+ * - `message`: a plain message in a channel/thread the bot can see. Usually a
+ *   follow-up for an already-bound thread; downstream may also start a session
+ *   when its text contains an exact mention of the bot's own Slack user ID.
  */
 export type SlackEventType = "app_mention" | "message";
 

@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 
 - Connected GitHub Issues can now be started manually from the Cyrus work inbox with a selected agent. Cyrus creates an isolated branch and worktree, accepts follow-up comments, reports progress and pull-request status, supports safe retries, and stops and cleans up when requested by the control plane. ([#2](https://github.com/michael-learns/cyrus/pull/2))
 
+### Fixed
+
+- Direct Slack mentions now start Cyrus reliably even when Slack delivers the ordinary message event before the app-mention event. ([#3](https://github.com/michael-learns/cyrus/pull/3))
+
 ## [0.2.68] - 2026-08-05
 
 ### Added
