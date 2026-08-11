@@ -358,6 +358,15 @@ or, if not yet trusted:
 
 In addition to repository-specific settings, you can configure global defaults:
 
+### `slackAllowedTools` (array of strings)
+
+Controls the tools available to conversational Slack sessions. The built-in
+default is read-only for files, permits configured-repository refreshes with
+`Bash(git -C * pull)`, and permits all pull-request operations with
+`Bash(gh pr:*)`. It does not grant general shell access or other GitHub CLI
+command families. Supplying this field replaces the built-in list, so include
+every tool the Slack session should retain.
+
 ### `promptDefaults` (object)
 
 Sets default allowed tools for each prompt type across all repositories. Repository-specific configurations override these defaults.

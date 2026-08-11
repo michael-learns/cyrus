@@ -95,14 +95,15 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
  * Slack sessions are transient — no PRs opened, no worktree checkouts.
  * The default list grants read-only access to repository sources (so Cyrus
  * can answer "look at the code in repo X" questions) plus the standard
- * planning/task tools, but no Edit/Write/general Bash. The single Bash
- * pattern allowed is `git -C * pull` so a chat session can refresh a
- * repo before grepping it.
+ * planning/task tools, but no Edit/Write/general Bash. Narrow Bash patterns
+ * allow refreshing configured repositories and using the GitHub CLI's pull
+ * request command family. Other `gh` namespaces remain unavailable.
  */
 export const SLACK_DEFAULT_ALLOWED_TOOLS = [
 	// Read access to configured repository paths
 	"Read",
 	"Bash(git -C * pull)",
+	"Bash(gh pr:*)",
 
 	// Web
 	"WebFetch",

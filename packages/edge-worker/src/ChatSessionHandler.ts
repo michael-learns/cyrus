@@ -87,7 +87,6 @@ export interface ChatPlatformAdapter<TEvent> {
 	/** Show that active background work still needs to finish. */
 	setBackgroundActivityStatus?(event: TEvent): Promise<void>;
 
-	/** Clear the platform's transient activity indicator. */
 	/**
 	 * Clear the platform's transient activity indicator. `retainState` hides the
 	 * displayed status but keeps the indicator's bookkeeping alive, for a session
@@ -124,8 +123,14 @@ export interface ChatSessionHandlerDeps {
 	chatRepositoryProvider: ChatRepositoryProvider;
 	/** Shared RunnerConfigBuilder for constructing runner configs */
 	runnerConfigBuilder: RunnerConfigBuilder;
-	/** Factory function that creates the appropriate runner based on config.defaultRunner */
-	createRunner: (config: AgentRunnerConfig) => IAgentRunner;
+	/**
+	 * Factory that creates the appropriate runner based on config.defaultRunner.
+	 * May be async so the factory can resolve credentials (e.g. a GitHub App
+	 * installation token) before constructing the runner.
+	 */
+	createRunner: (
+		config: AgentRunnerConfig,
+	) => IAgentRunner | Promise<IAgentRunner>;
 	/**
 	 * Live read of the workspace-level custom-integration MCP config paths
 	 * for the chat platform this handler is bound to (e.g.
@@ -419,7 +424,7 @@ export class ChatSessionHandler<TEvent> {
 				sessionId,
 			);
 
-			const runner = this.deps.createRunner(runnerConfig);
+			const runner = await this.deps.createRunner(runnerConfig);
 
 			// Store the runner in the session manager
 			this.sessionManager.addAgentRunner(sessionId, runner);
@@ -652,7 +657,7 @@ export class ChatSessionHandler<TEvent> {
 			resumeSessionId,
 		);
 
-		const runner = this.deps.createRunner(runnerConfig);
+		const runner = await this.deps.createRunner(runnerConfig);
 		this.sessionManager.addAgentRunner(sessionId, runner);
 
 		const resumePrompt = await this.withThreadCatchup(

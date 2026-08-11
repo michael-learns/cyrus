@@ -31,7 +31,11 @@ function createMockRunnerConfigBuilder(): RunnerConfigBuilder {
 			return {
 				workingDirectory: input.workspacePath,
 				allowedTools: [
-					...new Set([...getReadOnlyTools(), "Bash(git -C * pull)"]),
+					...new Set([
+						...getReadOnlyTools(),
+						"Bash(git -C * pull)",
+						"Bash(gh pr:*)",
+					]),
 				],
 				disallowedTools: [],
 				allowedDirectories: [input.workspacePath, ...repositoryPaths],
@@ -155,6 +159,9 @@ describe("ChatSessionHandler chat session permissions", () => {
 		expect(capturedConfig).toBeDefined();
 		expect(capturedConfig.allowedTools).toContain("Read(**)");
 		expect(capturedConfig.allowedTools).toContain("Bash(git -C * pull)");
+		expect(capturedConfig.allowedTools).toContain("Bash(gh pr:*)");
+		expect(capturedConfig.allowedTools).not.toContain("Bash");
+		expect(capturedConfig.allowedTools).not.toContain("Bash(gh:*)");
 		expect(capturedConfig.allowedTools).not.toContain("Edit(**)");
 
 		const expectedWorkspace = join(cyrusHome, "slack-workspaces", "thread-key");
@@ -1593,6 +1600,11 @@ describe("SlackChatAdapter system prompt", () => {
 		expect(systemPrompt).toContain("github_issue_start");
 		expect(systemPrompt).toContain("github_issue_prompt");
 		expect(systemPrompt).toContain("Never require slash commands");
+		expect(systemPrompt).toContain("use the `gh pr` command family");
+		expect(systemPrompt).toContain(
+			"Merging or closing a PR requires an explicit request",
+		);
+		expect(systemPrompt).toContain("--repo owner/repository");
 		expect(systemPrompt).not.toContain("First run `mcp__linear__get_user`");
 	});
 

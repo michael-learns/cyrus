@@ -29,7 +29,7 @@ This guide walks you through setting up Cyrus completely self-hosted, including 
 - **Linear workspace** with admin access if you want the Linear integration
 - **Node.js** v18 or higher
 - **jq** (for Claude Code parsing)
-- **A public URL** for receiving Linear webhooks
+- **A public URL** for receiving integration webhooks
 
 ### Install Dependencies
 
@@ -91,17 +91,27 @@ implementation it creates isolated worktrees, keeps the Slack thread status
 updated, accepts follow-up messages in the same thread, and posts every pull
 request link when the work finishes. No slash commands are required.
 
+Slack conversations can also inspect and operate on pull requests using normal
+language. Cyrus has access to the complete `gh pr` command family, including
+viewing diffs and checks, commenting, reviewing, marking ready, editing, closing,
+reopening, and merging. Read-only commands can be used whenever they help answer
+a question. Commands that change a pull request require a clear user request;
+merging or closing requires an explicit request naming the target pull request.
+Other GitHub CLI command families remain unavailable to Slack chat sessions.
+
 > **Tip:** Cyrus automatically loads environment variables from `~/.cyrus/.env` on startup. You can override this path with `cyrus --env-file=/path/to/your/env`.
 
 ---
 
 ## Step 1: Set Up Public URL
 
-Linear needs to send webhooks to your Cyrus instance. Choose one option:
+Slack, Linear, and other integrations need to send webhooks to your Cyrus
+instance. Choose one option:
 
 | Option | Best For | Persistence |
 |--------|----------|-------------|
 | [Cloudflare Tunnel](./CLOUDFLARE_TUNNEL.md) | Production | Permanent URL |
+| [Tailscale Funnel](./TAILSCALE_FUNNEL.md) | Development/testing on a Tailscale device | Stable device URL |
 | ngrok | Development/testing | Free static domain included |
 | Public server/domain | VPS or cloud hosting | Permanent URL |
 | Reverse proxy (nginx/caddy) | Existing infrastructure | Permanent URL |
@@ -344,8 +354,10 @@ For detailed options, see the [Configuration File Reference](./CONFIG_FILE.md).
 ### Webhooks Not Received
 
 - Verify Linear webhook URL matches `CYRUS_BASE_URL/linear-webhook` (the legacy `/webhook` path still works but is deprecated)
+- For Slack, verify the Event Subscriptions URL matches `CYRUS_BASE_URL/slack-webhook` and includes the `app_mention` bot event
 - Check Cyrus logs for incoming webhook attempts
 - Ensure your public URL is accessible
+- When using Tailscale, verify the public Funnel path rather than relying on a local MagicDNS check. See [Tailscale Funnel troubleshooting](./TAILSCALE_FUNNEL.md#slack-events-not-reaching-cyrus).
 
 ### Repository Not Processing
 
