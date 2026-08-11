@@ -161,6 +161,38 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		);
 	});
 
+	it("rejects a second target set while a session for the same issue is live", async () => {
+		await worker.startGitHubIssueWorkItem(
+			{
+				workItemId: "work-item-17",
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 17,
+				runnerType: "codex",
+				requestId: "request-17",
+			},
+			"forwarded-token",
+		);
+		worker.gitService.createGitWorktree.mockClear();
+
+		// A different target set hashes to a different work item id, but the
+		// worktree path and branch name are still derived from the source repo
+		// and issue number alone — so the two sessions would collide.
+		await expect(
+			worker.startGitHubIssueWorkItem(
+				{
+					workItemId: "work-item-17-multi",
+					repositoryFullName: "cyrusagents/cyrus",
+					issueNumber: 17,
+					targetRepositoryFullNames: ["cyrusagents/cyrus", "cyrusagents/other"],
+					runnerType: "codex",
+					requestId: "request-17-multi",
+				},
+				"forwarded-token",
+			),
+		).rejects.toMatchObject({ statusCode: 409 });
+		expect(worker.gitService.createGitWorktree).not.toHaveBeenCalled();
+	});
+
 	it("rejects closed GitHub Issues before creating a worktree", async () => {
 		githubIssue.state = "closed";
 
@@ -363,7 +395,8 @@ describe("EdgeWorker GitHub Issue work items", () => {
 			postDelegatedWorkMessage,
 			clearActivityStatus,
 		};
-		worker.chatSessionHandler = { setDelegatedWorkActive };
+		const hasDelegatedWork = vi.fn().mockReturnValue(false);
+		worker.chatSessionHandler = { setDelegatedWorkActive, hasDelegatedWork };
 		worker.slackWorkItemEvents = new Map([
 			["work-item-17", new Map([["slack-session-1", event]])],
 		]);
@@ -386,7 +419,80 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		expect(setDelegatedWorkActive).toHaveBeenCalledWith(
 			"slack-session-1",
 			false,
+			"work-item-17",
 		);
 		expect(worker.slackWorkItemEvents.has("work-item-17")).toBe(false);
+	});
+
+	it("keeps the thread status while a sibling delegated job is still running", async () => {
+		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
+		const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+		const clearActivityStatus = vi.fn().mockResolvedValue(undefined);
+		const setDelegatedWorkActive = vi.fn();
+		// A second job delegated by the same chat session is still in flight.
+		const hasDelegatedWork = vi.fn().mockReturnValue(true);
+		worker.slackChatAdapter = {
+			postDelegatedWorkMessage,
+			clearActivityStatus,
+		};
+		worker.chatSessionHandler = { setDelegatedWorkActive, hasDelegatedWork };
+		worker.slackWorkItemEvents = new Map([
+			["work-item-17", new Map([["slack-session-1", event]])],
+		]);
+
+		await worker.finishSlackWorkItem(
+			{
+				workItemId: "work-item-17",
+				issue: { title: "Fix webhook retries" },
+				prUrls: ["https://github.com/cyrusagents/cyrus/pull/1"],
+			},
+			"awaiting_review",
+		);
+
+		expect(postDelegatedWorkMessage).toHaveBeenCalled();
+		expect(clearActivityStatus).not.toHaveBeenCalled();
+	});
+
+	it("converts a delegated summary from Markdown to Slack mrkdwn", async () => {
+		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
+		const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+		worker.slackChatAdapter = {
+			postDelegatedWorkMessage,
+			clearActivityStatus: vi.fn().mockResolvedValue(undefined),
+		};
+		worker.chatSessionHandler = {
+			setDelegatedWorkActive: vi.fn(),
+			hasDelegatedWork: vi.fn().mockReturnValue(false),
+		};
+		worker.slackWorkItemEvents = new Map([
+			["work-item-17", new Map([["slack-session-1", event]])],
+		]);
+		worker.agentSessionManager.getSession = vi.fn().mockReturnValue({
+			agentRunner: {
+				getMessages: () => [
+					{
+						type: "result",
+						result:
+							"### Summary\nFixed **retries**. See [the PR](https://github.com/o/r/pull/1).",
+					},
+				],
+			},
+		});
+
+		await worker.finishSlackWorkItem(
+			{
+				workItemId: "work-item-17",
+				issue: { title: "Fix webhook retries" },
+				prUrls: ["https://github.com/cyrusagents/cyrus/pull/1"],
+			},
+			"awaiting_review",
+		);
+
+		const text = postDelegatedWorkMessage.mock.calls[0]?.[1] as string;
+		expect(text).toContain("*Summary*");
+		expect(text).toContain("Fixed *retries*");
+		expect(text).toContain("<https://github.com/o/r/pull/1|the PR>");
+		expect(text).not.toContain("###");
+		expect(text).not.toContain("**");
 	});
 });

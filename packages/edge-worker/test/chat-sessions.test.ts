@@ -310,6 +310,40 @@ describe("ChatSessionHandler session-initiation gate", () => {
 		expect(createRunner).toHaveBeenCalledTimes(1);
 		expect(handler.listThreads()).toHaveLength(1);
 	});
+
+	it("does not drop a follow-up that arrives while the mention is still binding the thread", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"race-thread",
+		);
+		// Stands in for SlackChatAdapter's network-backed identity lookup: the
+		// gate keeps the first event suspended mid-initiation, exactly the window
+		// in which a follow-up used to read the thread as still unbound.
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		adapter.isSessionInitiatingEvent = async (event: TestEvent) => {
+			await gate;
+			return event.eventId === "mention";
+		};
+
+		const { handler, createRunner } = buildHandler(adapter);
+		const first = handler.handleEvent({
+			eventId: "mention",
+			threadKey: "race-thread",
+		} as any);
+		const second = handler.handleEvent({
+			eventId: "follow-up",
+			threadKey: "race-thread",
+		} as any);
+		releaseGate();
+		await Promise.all([first, second]);
+
+		// The follow-up ran against the session the mention established rather
+		// than being discarded as "non-initiating for an unbound thread".
+		expect(handler.listThreads()).toHaveLength(1);
+		expect(createRunner).toHaveBeenCalledTimes(2);
+	});
 });
 
 describe("ChatSessionHandler activity status lifecycle", () => {
@@ -740,7 +774,11 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 		expect(postPendingStatus).toHaveBeenCalledWith(event, pendingWork);
 		expect(postReply).not.toHaveBeenCalled();
 		expect(acknowledgeProcessed).not.toHaveBeenCalled();
-		expect(clearActivityStatus).toHaveBeenCalledWith(event);
+		// Only a scheduled wakeup remains: hide the status but keep the
+		// indicator's state so the woken turn can drive it again.
+		expect(clearActivityStatus).toHaveBeenCalledWith(event, {
+			retainState: true,
+		});
 
 		pendingWork = { sessionCrons: [], backgroundTasks: [] };
 		await capturedConfig.onMessage({
@@ -751,6 +789,89 @@ describe("ChatSessionHandler processed acknowledgement", () => {
 
 		expect(postReply).toHaveBeenCalledTimes(1);
 		expect(acknowledgeProcessed).toHaveBeenCalledTimes(1);
+	});
+
+	it("posts one waiting status when a second result lands while the first post is in flight", async () => {
+		const adapter: ChatPlatformAdapter<TestEvent> = new TestChatAdapter(
+			"concurrent-scheduled-thread",
+		);
+		const postReply = vi
+			.spyOn(adapter, "postReply")
+			.mockResolvedValue(undefined);
+		const releasePendingStatus: Array<() => void> = [];
+		const postPendingStatus = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					releasePendingStatus.push(resolve);
+				}),
+		);
+		(adapter as any).postPendingStatus = postPendingStatus;
+		const pendingWork = {
+			sessionCrons: [
+				{
+					id: "cron-1",
+					schedule: "*/5 * * * *",
+					recurring: true,
+					prompt: "Check CI",
+				},
+			],
+			backgroundTasks: [],
+		};
+
+		let capturedConfig: any;
+		const createRunner = vi.fn((config: any) => {
+			capturedConfig = config;
+			return {
+				supportsStreamingInput: false,
+				start: vi.fn().mockResolvedValue({ sessionId: "session-1" }),
+				stop: vi.fn(),
+				isRunning: vi.fn().mockReturnValue(false),
+				isStreaming: vi.fn().mockReturnValue(false),
+				addStreamMessage: vi.fn(),
+				getMessages: vi.fn().mockReturnValue([]),
+				getPendingWork: vi.fn(() => pendingWork),
+			} as any;
+		});
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner,
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		const event = {
+			eventId: "mention",
+			threadKey: "concurrent-scheduled-thread",
+		};
+		await handler.handleEvent(event);
+		const intermediateResult = {
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			result: "",
+			session_id: "session-1",
+		};
+
+		// Hold the first platform post open so it is still in flight.
+		const firstResult = capturedConfig.onMessage(intermediateResult);
+		await vi.waitFor(() => expect(postPendingStatus).toHaveBeenCalledTimes(1));
+
+		// A second result for the same unchanged scheduled work arrives before
+		// the first post resolves — it must not duplicate the waiting notice.
+		const secondResult = capturedConfig.onMessage(intermediateResult);
+		for (let tick = 0; tick < 5; tick++) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+
+		for (const release of releasePendingStatus) release();
+		await Promise.all([firstResult, secondResult]);
+		expect(postPendingStatus).toHaveBeenCalledTimes(1);
+		expect(postReply).not.toHaveBeenCalled();
 	});
 
 	it("finishes an error result even when the runner reports stale pending work", async () => {
@@ -1056,6 +1177,67 @@ describe("SlackChatAdapter activity statuses", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+	});
+
+	it("keeps the fully formatted status within Slack's length limit", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const longRequest =
+			"Investigate the intermittent billing reconciliation failure that affects enterprise customers during renewal";
+		const event = slackEvent(longRequest);
+
+		await adapter.startActivityStatus(event, longRequest);
+		await vi.advanceTimersByTimeAsync(2_000);
+		// The longest verb in the table, applied to the same long subject.
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						name: "Bash",
+						input: { command: "git log --oneline" },
+					},
+				],
+			},
+		} as any);
+
+		expect(setStatus.mock.calls.length).toBeGreaterThan(1);
+		for (const call of setStatus.mock.calls) {
+			expect(call[0].status.length).toBeLessThanOrEqual(100);
+		}
+	});
+
+	it("does not discard status state a newer turn has taken over", async () => {
+		vi.useFakeTimers();
+		const setStatus = vi
+			.spyOn(SlackMessageService.prototype, "setAssistantThreadStatus")
+			.mockResolvedValue(undefined);
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		const event = slackEvent("<@U0BOT> First request");
+
+		await adapter.startActivityStatus(event, "First request");
+		// A newer turn adopts the same state while the clear is still in flight.
+		const clearing = adapter.clearActivityStatus(event);
+		await adapter.startActivityStatus(event, "Second request");
+		await clearing;
+
+		const callsBeforeUpdate = setStatus.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(2_000);
+		await adapter.updateActivityStatus(event, {
+			type: "assistant",
+			message: {
+				content: [{ type: "tool_use", name: "Grep", input: { pattern: "x" } }],
+			},
+		} as any);
+
+		// The newer turn still owns a live indicator: had the in-flight clear
+		// retired its state, this update would have been a silent no-op.
+		expect(setStatus.mock.calls.length).toBeGreaterThan(callsBeforeUpdate);
+		expect(setStatus.mock.calls.at(-1)?.[0].status).toContain("Second request");
 	});
 
 	it("shows sanitized task-specific stages and clears the status", async () => {
