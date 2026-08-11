@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Connected GitHub Issues can now be started manually from the Cyrus work inbox with a selected agent. Cyrus creates an isolated branch and worktree, accepts follow-up comments, reports progress and pull-request status, supports safe retries, and stops and cleans up when requested by the control plane. ([#2](https://github.com/michael-learns/cyrus/pull/2))
+
 ## [0.2.68] - 2026-08-05
 
 ### Added

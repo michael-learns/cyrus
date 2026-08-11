@@ -105,6 +105,21 @@ export interface CyrusAgentSession {
 		commentId?: string;
 		/** Chat sessions: thread position up to which this session has context */
 		lastContextTs?: string;
+		/** Persisted control-plane identity for resumable GitHub Issue work items. */
+		githubWorkItem?: {
+			workItemId: string;
+			repositoryFullName: string;
+			issueNumber: number;
+			issueIdentifier: string;
+			branchName: string;
+			runnerType: "claude" | "gemini" | "codex" | "cursor";
+			status:
+				| "starting"
+				| "in_progress"
+				| "awaiting_review"
+				| "failed"
+				| "stopped";
+		};
 	};
 }
 

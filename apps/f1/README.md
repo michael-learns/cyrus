@@ -36,6 +36,9 @@ pnpm run server
 # Or with custom configuration
 CYRUS_PORT=3600 CYRUS_REPO_PATH=/path/to/your/repo pnpm run server
 
+# Use a real disposable GitHub repository for GitHub Issue work-item tests
+CYRUS_REPO_GITHUB_URL=https://github.com/owner/repo pnpm run server
+
 # Development mode with auto-reload
 pnpm run server:dev
 ```
@@ -51,6 +54,7 @@ pnpm run server:dev
 **Environment Variables:**
 - `CYRUS_PORT` - Server port (default: 3600)
 - `CYRUS_REPO_PATH` - Path to repository to test (default: current directory)
+- `CYRUS_REPO_GITHUB_URL` - GitHub URL matched by GitHub Issue work-item requests (default: the synthetic F1 repository URL)
 
 Once started, the server displays:
 ```

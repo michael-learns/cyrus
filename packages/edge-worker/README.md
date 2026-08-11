@@ -127,6 +127,16 @@ const edgeWorker = new EdgeWorker({
 await edgeWorker.start()
 ```
 
+## GitHub Issue Work Items
+
+When the worker is paired with the Cyrus control plane through `CYRUS_API_KEY`, it exposes authenticated routes for manually controlling GitHub Issue sessions:
+
+- `POST /api/work-items/start` — starts the selected `claude`, `gemini`, `codex`, or `cursor` runner for an open issue.
+- `POST /api/work-items/:workItemId/prompt` — sends one deduplicated human issue comment into the active or resumable session.
+- `POST /api/work-items/:workItemId/stop` — stops the runner and removes its worktree when the source issue closes or a user stops it.
+
+Every request uses `Authorization: Bearer <CYRUS_API_KEY>`. Start and prompt requests may carry a short-lived GitHub App token in `X-GitHub-Installation-Token`; otherwise the worker uses its configured GitHub App or `GITHUB_TOKEN`. The worker reports idempotent lifecycle events to `/api/work-items/:workItemId/events` on the configured Cyrus app URL.
+
 ## Configuration
 
 ### Required Config

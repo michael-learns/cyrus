@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
@@ -149,6 +150,13 @@ import { ChatSessionHandler } from "./ChatSessionHandler.js";
 import { ConfigManager, type RepositoryChanges } from "./ConfigManager.js";
 import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
+import {
+	type GitHubIssuePromptRequest,
+	type GitHubIssueStartRequest,
+	type GitHubIssueStartResult,
+	type GitHubIssueStopRequest,
+	GitHubIssueWorkItemController,
+} from "./GitHubIssueWorkItemController.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 import { McpConfigService } from "./McpConfigService.js";
@@ -196,6 +204,19 @@ type CyrusToolsMcpContext = {
 	contextId?: string;
 };
 
+type GitHubIssueWorkItemSession = {
+	workItemId: string;
+	sessionId: string;
+	repository: RepositoryConfig;
+	repositoryFullName: string;
+	issueNumber: number;
+	issueIdentifier: string;
+	branchName: string;
+	runnerType: RunnerType;
+	issue: IssueMinimal;
+	status: "starting" | "in_progress" | "awaiting_review" | "failed" | "stopped";
+};
+
 /**
  * Unified edge worker that **orchestrates**
  *   capturing Linear webhooks,
@@ -213,6 +234,11 @@ export class EdgeWorker extends EventEmitter {
 	private issueTrackers: Map<string, IIssueTrackerService> = new Map(); // one issue tracker per Linear workspace (keyed by linearWorkspaceId)
 	private linearEventTransport: LinearEventTransport | null = null; // Single event transport for webhook delivery
 	private gitHubEventTransport: GitHubEventTransport | null = null; // GitHub event transport for forwarded GitHub webhooks
+	private gitHubIssueWorkItemSessions = new Map<
+		string,
+		GitHubIssueWorkItemSession
+	>();
+	private processedGitHubIssueCommentIds = new Set<string>();
 	private gitHubAppTokenProvider: GitHubAppTokenProvider | null = null; // Self-hosted GitHub App token minting
 	private gitLabEventTransport: GitLabEventTransport | null = null; // GitLab event transport for forwarded GitLab webhooks
 	private slackEventTransport: SlackEventTransport | null = null;
@@ -938,6 +964,14 @@ export class EdgeWorker extends EventEmitter {
 				);
 				return;
 			}
+			// Issue lifecycle intake is persisted by the hosted control plane. It
+			// must never auto-start a worker session merely because an issue opened.
+			if (event.eventType === "issues") {
+				this.logger.debug(
+					`Received GitHub issue lifecycle event ${event.deliveryId}; awaiting explicit Start request`,
+				);
+				return;
+			}
 			this.handleGitHubWebhook(event as GitHubCommentWebhookEvent).catch(
 				(error) => {
 					this.logger.error(
@@ -961,6 +995,24 @@ export class EdgeWorker extends EventEmitter {
 		// Register the /github-webhook endpoint
 		this.gitHubEventTransport.register();
 
+		new GitHubIssueWorkItemController({
+			fastifyServer: this.sharedApplicationServer.getFastifyInstance(),
+			apiKey: () => process.env.CYRUS_API_KEY,
+			logger: this.logger,
+			handlers: {
+				start: (request, installationToken) =>
+					this.startGitHubIssueWorkItem(request, installationToken),
+				prompt: (workItemId, request, installationToken) =>
+					this.promptGitHubIssueWorkItem(
+						workItemId,
+						request,
+						installationToken,
+					),
+				stop: (workItemId, request) =>
+					this.stopGitHubIssueWorkItem(workItemId, request),
+			},
+		}).register();
+
 		// Initialize GitHub App token provider for self-hosted users
 		const appId = process.env.GITHUB_APP_ID;
 		const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
@@ -980,6 +1032,9 @@ export class EdgeWorker extends EventEmitter {
 			`GitHub event transport registered (${verificationMode} mode)`,
 		);
 		this.logger.info("Webhook endpoint: POST /github-webhook");
+		this.logger.info(
+			"GitHub Issue controls: POST /api/work-items/start, /api/work-items/:id/prompt, /api/work-items/:id/stop",
+		);
 	}
 
 	/**
@@ -1187,10 +1242,10 @@ export class EdgeWorker extends EventEmitter {
 	 * 2. Self-minted installation token from GitHub App credentials (self-hosted)
 	 * 3. Personal access token from GITHUB_TOKEN env var (fallback)
 	 */
-	private async resolveGitHubToken(
-		event: GitHubWebhookEvent,
+	private async resolveGitHubTokenValue(
+		installationToken?: string,
 	): Promise<string | undefined> {
-		if (event.installationToken) return event.installationToken;
+		if (installationToken) return installationToken;
 		if (this.gitHubAppTokenProvider) {
 			try {
 				return await this.gitHubAppTokenProvider.getToken();
@@ -1202,6 +1257,690 @@ export class EdgeWorker extends EventEmitter {
 			}
 		}
 		return process.env.GITHUB_TOKEN;
+	}
+
+	private async resolveGitHubToken(
+		event: GitHubWebhookEvent,
+	): Promise<string | undefined> {
+		return this.resolveGitHubTokenValue(event.installationToken);
+	}
+
+	private async startGitHubIssueWorkItem(
+		request: GitHubIssueStartRequest,
+		installationToken?: string,
+	): Promise<GitHubIssueStartResult> {
+		const existing = this.getGitHubIssueWorkItemSession(request.workItemId);
+		if (existing) {
+			if (existing.status === "stopped") {
+				throw this.gitHubWorkItemError(
+					"This GitHub Issue session is stopping",
+					409,
+				);
+			}
+			if (existing.status === "failed") {
+				const token = await this.resolveGitHubTokenValue(installationToken);
+				if (!token) {
+					throw this.gitHubWorkItemError("No GitHub token is available", 401);
+				}
+				const githubIssue = await this.fetchGitHubIssue(
+					existing.repositoryFullName,
+					existing.issueNumber,
+					token,
+				);
+				if (githubIssue.state !== "open") {
+					throw this.gitHubWorkItemError("GitHub Issue is not open", 409);
+				}
+				const session = this.agentSessionManager.getSession(existing.sessionId);
+				if (!session) {
+					throw this.gitHubWorkItemError(
+						"The previous Cyrus session is no longer available",
+						410,
+					);
+				}
+				const runner = await this.createGitHubIssueRunner(
+					existing,
+					githubIssue,
+					this.runnerResumeSessionId(session, existing.runnerType),
+				);
+				this.agentSessionManager.addAgentRunner(existing.sessionId, runner);
+				this.setGitHubIssueWorkItemStatus(existing, "starting");
+				void this.runGitHubIssueWorkItem(
+					existing,
+					runner,
+					this.buildGitHubIssueTaskPrompt(
+						githubIssue,
+						existing.repositoryFullName,
+					),
+					token,
+				);
+				return { sessionId: existing.sessionId, status: "starting" };
+			}
+			return {
+				sessionId: existing.sessionId,
+				status: existing.status,
+			};
+		}
+
+		const token = await this.resolveGitHubTokenValue(installationToken);
+		if (!token) {
+			throw this.gitHubWorkItemError(
+				"No GitHub installation token or GITHUB_TOKEN is available",
+				401,
+			);
+		}
+
+		const repository = this.findRepositoryByGitHubUrl(
+			request.repositoryFullName,
+		);
+		if (!repository) {
+			throw this.gitHubWorkItemError(
+				`No repository configured for ${request.repositoryFullName}`,
+				404,
+			);
+		}
+
+		const githubIssue = await this.fetchGitHubIssue(
+			request.repositoryFullName,
+			request.issueNumber,
+			token,
+		);
+		if (githubIssue.state !== "open") {
+			throw this.gitHubWorkItemError("GitHub Issue is not open", 409);
+		}
+		if (githubIssue.pull_request) {
+			throw this.gitHubWorkItemError(
+				"Pull requests cannot be started through the GitHub Issues inbox",
+				400,
+			);
+		}
+
+		const repositoryIdentifier = repository.name
+			.replace(/[^a-zA-Z0-9]+/g, "-")
+			.replace(/^-|-$/g, "");
+		const issueIdentifier = `GH-${repositoryIdentifier}-${request.issueNumber}`;
+		const branchName = this.gitService.sanitizeBranchName(
+			`cyrus/gh-${request.issueNumber}-${this.githubIssueSlug(githubIssue.title)}`,
+		);
+		const issueMinimal: IssueMinimal = {
+			id: String(githubIssue.id),
+			identifier: issueIdentifier,
+			title: githubIssue.title,
+			description: githubIssue.body ?? undefined,
+			branchName,
+		};
+		const syntheticIssue = this.buildSyntheticGitHubIssue(
+			issueMinimal,
+			githubIssue,
+		);
+		const workspace = await this.gitService.createGitWorktree(syntheticIssue, [
+			repository,
+		]);
+		if (!workspace.isGitWorktree) {
+			throw this.gitHubWorkItemError(
+				`Could not create a Git worktree for ${request.repositoryFullName}#${request.issueNumber}`,
+				500,
+			);
+		}
+
+		const sessionId = `github-issue-${request.workItemId}`;
+		this.agentSessionManager.createCyrusAgentSession(
+			sessionId,
+			String(githubIssue.id),
+			issueMinimal,
+			workspace,
+			"github",
+			[
+				{
+					repositoryId: repository.id,
+					branchName,
+					baseBranchName: repository.baseBranch,
+				},
+			],
+		);
+		this.sessionRepositories.set(sessionId, repository.id);
+		const activitySink = this.getActivitySinkForRepo(repository.id);
+		if (activitySink) {
+			this.agentSessionManager.setActivitySink(sessionId, activitySink);
+		}
+
+		const workItemSession: GitHubIssueWorkItemSession = {
+			workItemId: request.workItemId,
+			sessionId,
+			repository,
+			repositoryFullName: request.repositoryFullName,
+			issueNumber: request.issueNumber,
+			issueIdentifier,
+			branchName,
+			runnerType: request.runnerType,
+			issue: issueMinimal,
+			status: "starting",
+		};
+		this.gitHubIssueWorkItemSessions.set(request.workItemId, workItemSession);
+		const agentSession = this.agentSessionManager.getSession(sessionId);
+		if (agentSession) {
+			agentSession.metadata = {
+				...agentSession.metadata,
+				githubWorkItem: {
+					workItemId: request.workItemId,
+					repositoryFullName: request.repositoryFullName,
+					issueNumber: request.issueNumber,
+					issueIdentifier,
+					branchName,
+					runnerType: request.runnerType,
+					status: "starting",
+				},
+			};
+		}
+
+		try {
+			const runner = await this.createGitHubIssueRunner(
+				workItemSession,
+				githubIssue,
+			);
+			this.agentSessionManager.addAgentRunner(sessionId, runner);
+			await this.savePersistedState();
+
+			this.emit(
+				"session:started",
+				String(githubIssue.id),
+				syntheticIssue,
+				repository.id,
+			);
+			this.config.handlers?.onSessionStart?.(
+				String(githubIssue.id),
+				syntheticIssue,
+				repository.id,
+			);
+			await this.reportGitHubWorkItemStatus(request.workItemId, {
+				status: "starting",
+				sessionId,
+				runnerType: request.runnerType,
+			});
+
+			void this.runGitHubIssueWorkItem(
+				workItemSession,
+				runner,
+				this.buildGitHubIssueTaskPrompt(
+					githubIssue,
+					request.repositoryFullName,
+				),
+				token,
+			);
+			return { sessionId, status: "starting" };
+		} catch (error) {
+			this.gitHubIssueWorkItemSessions.delete(request.workItemId);
+			this.agentSessionManager.removeSession(sessionId);
+			await this.gitService.deleteWorktree(issueIdentifier, {
+				repositories: [repository],
+			});
+			throw error;
+		}
+	}
+
+	private async promptGitHubIssueWorkItem(
+		workItemId: string,
+		request: GitHubIssuePromptRequest,
+		installationToken?: string,
+	): Promise<void> {
+		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
+		if (!workItem) {
+			throw this.gitHubWorkItemError(
+				"No Cyrus session exists for this issue",
+				404,
+			);
+		}
+
+		const botUsername = process.env.GITHUB_BOT_USERNAME;
+		if (botUsername && request.author === botUsername) return;
+		const commentKey = `${workItemId}:${request.commentId}`;
+		if (this.processedGitHubIssueCommentIds.has(commentKey)) return;
+
+		const session = this.agentSessionManager.getSession(workItem.sessionId);
+		if (!session) {
+			throw this.gitHubWorkItemError(
+				"The Cyrus session is no longer available",
+				410,
+			);
+		}
+		const prompt = `<github_issue_comment>\n<author>${request.author}</author>\n${request.url ? `<url>${request.url}</url>\n` : ""}<content>\n${request.body}\n</content>\n</github_issue_comment>`;
+		const existingRunner = session.agentRunner;
+		if (
+			existingRunner?.isRunning() &&
+			existingRunner.supportsStreamingInput &&
+			existingRunner.addStreamMessage
+		) {
+			try {
+				existingRunner.addStreamMessage(prompt);
+				this.processedGitHubIssueCommentIds.add(commentKey);
+				return;
+			} catch (error) {
+				this.logger.warn(
+					`Streaming GitHub Issue comment was rejected; resuming ${workItem.sessionId}`,
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			}
+		}
+
+		const token = await this.resolveGitHubTokenValue(installationToken);
+		if (!token) {
+			throw this.gitHubWorkItemError("No GitHub token is available", 401);
+		}
+		const githubIssue = await this.fetchGitHubIssue(
+			workItem.repositoryFullName,
+			workItem.issueNumber,
+			token,
+		);
+		const runner = await this.createGitHubIssueRunner(
+			workItem,
+			githubIssue,
+			this.runnerResumeSessionId(session, workItem.runnerType),
+		);
+		this.agentSessionManager.addAgentRunner(workItem.sessionId, runner);
+		this.processedGitHubIssueCommentIds.add(commentKey);
+		void this.runGitHubIssueWorkItem(workItem, runner, prompt, token);
+	}
+
+	private async stopGitHubIssueWorkItem(
+		workItemId: string,
+		_request: GitHubIssueStopRequest,
+	): Promise<void> {
+		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
+		if (!workItem) return;
+		this.setGitHubIssueWorkItemStatus(workItem, "stopped");
+		const session = this.agentSessionManager.getSession(workItem.sessionId);
+		if (session) {
+			this.agentSessionManager.requestSessionStop(workItem.sessionId);
+			session.agentRunner?.stop();
+			this.agentSessionManager.removeSession(workItem.sessionId);
+		}
+		await this.gitService.deleteWorktree(workItem.issueIdentifier, {
+			repositories: [workItem.repository],
+		});
+		this.gitHubIssueWorkItemSessions.delete(workItemId);
+		await this.savePersistedState();
+		await this.reportGitHubWorkItemStatus(workItemId, {
+			status: "stopped",
+			sessionId: workItem.sessionId,
+			runnerType: workItem.runnerType,
+		});
+	}
+
+	private async createGitHubIssueRunner(
+		workItem: GitHubIssueWorkItemSession,
+		githubIssue: {
+			id: number;
+			title: string;
+			body: string | null;
+			labels?: Array<{ name?: string }>;
+		},
+		resumeSessionId?: string,
+	): Promise<IAgentRunner> {
+		const session = this.agentSessionManager.getSession(workItem.sessionId);
+		if (!session) throw new Error(`Missing session ${workItem.sessionId}`);
+		const labels = (githubIssue.labels ?? [])
+			.map((label) => label.name)
+			.filter((name): name is string => Boolean(name));
+		const allowedTools = this.toolPermissionResolver.buildGithubAllowedTools(
+			workItem.repository,
+		);
+		const disallowedTools = this.buildDisallowedTools(workItem.repository);
+		const allowedDirectories = [
+			workItem.repository.repositoryPath,
+			...this.gitService.getGitMetadataDirectoriesForWorkspace(
+				session.workspace,
+			),
+		];
+		const systemPrompt = this.buildGitHubIssueSystemPrompt(workItem);
+		const selectorDescription = `${githubIssue.body ?? ""}\n\n[agent=${workItem.runnerType}]`;
+		const { config, runnerType } = await this.buildAgentRunnerConfig(
+			session,
+			workItem.repository,
+			workItem.sessionId,
+			systemPrompt,
+			allowedTools,
+			allowedDirectories,
+			disallowedTools,
+			resumeSessionId,
+			labels,
+			selectorDescription,
+			200,
+			undefined,
+			this.buildSkillSessionContext(workItem.repository, undefined, session),
+			"github",
+		);
+		if (runnerType !== workItem.runnerType) {
+			throw new Error(
+				`Runner selection mismatch: requested ${workItem.runnerType}, resolved ${runnerType}`,
+			);
+		}
+		return this.createRunnerForType(runnerType, config);
+	}
+
+	private async runGitHubIssueWorkItem(
+		workItem: GitHubIssueWorkItemSession,
+		runner: IAgentRunner,
+		prompt: string,
+		token: string,
+	): Promise<void> {
+		this.setGitHubIssueWorkItemStatus(workItem, "in_progress");
+		await this.reportGitHubWorkItemStatus(workItem.workItemId, {
+			status: "in_progress",
+			sessionId: workItem.sessionId,
+			runnerType: workItem.runnerType,
+		});
+		try {
+			if (runner.supportsStreamingInput && runner.startStreaming) {
+				await runner.startStreaming(prompt);
+			} else {
+				await runner.start(prompt);
+			}
+			const prUrl = await this.findGitHubIssuePullRequest(workItem, token);
+			if (
+				workItem.status === "stopped" ||
+				!this.gitHubIssueWorkItemSessions.has(workItem.workItemId)
+			)
+				return;
+			if (!prUrl) {
+				throw new Error(
+					"Agent finished without opening a pull request for this issue",
+				);
+			}
+			await this.gitHubCommentService.postIssueComment({
+				token,
+				owner: workItem.repositoryFullName.split("/")[0]!,
+				repo: workItem.repositoryFullName.split("/")[1]!,
+				issueNumber: workItem.issueNumber,
+				body: `Cyrus finished the implementation. Pull request: ${prUrl}`,
+			});
+			await this.reportGitHubWorkItemStatus(workItem.workItemId, {
+				status: "awaiting_review",
+				sessionId: workItem.sessionId,
+				runnerType: workItem.runnerType,
+				prUrl,
+			});
+			this.setGitHubIssueWorkItemStatus(workItem, "awaiting_review");
+			this.emit("session:ended", workItem.issue.id, 0, workItem.repository.id);
+			this.config.handlers?.onSessionEnd?.(
+				workItem.issue.id,
+				0,
+				workItem.repository.id,
+			);
+		} catch (error) {
+			if (
+				workItem.status === "stopped" ||
+				!this.gitHubIssueWorkItemSessions.has(workItem.workItemId)
+			)
+				return;
+			const err = error instanceof Error ? error : new Error(String(error));
+			this.logger.error(
+				`GitHub Issue session failed for ${workItem.repositoryFullName}#${workItem.issueNumber}`,
+				err,
+			);
+			await this.reportGitHubWorkItemStatus(workItem.workItemId, {
+				status: "failed",
+				sessionId: workItem.sessionId,
+				runnerType: workItem.runnerType,
+				error: err.message,
+			});
+			this.setGitHubIssueWorkItemStatus(workItem, "failed");
+			this.emit("session:ended", workItem.issue.id, 1, workItem.repository.id);
+			this.config.handlers?.onSessionEnd?.(
+				workItem.issue.id,
+				1,
+				workItem.repository.id,
+			);
+		}
+		await this.savePersistedState();
+	}
+
+	private async fetchGitHubIssue(
+		repositoryFullName: string,
+		issueNumber: number,
+		token: string,
+	): Promise<{
+		id: number;
+		number: number;
+		title: string;
+		body: string | null;
+		state: string;
+		html_url: string;
+		url: string;
+		user: {
+			login: string;
+			id: number;
+			avatar_url: string;
+			html_url: string;
+			type: string;
+		};
+		labels?: Array<{ id?: number; name?: string; color?: string }>;
+		pull_request?: unknown;
+		created_at?: string;
+		updated_at?: string;
+	}> {
+		const response = await fetch(
+			`https://api.github.com/repos/${repositoryFullName}/issues/${issueNumber}`,
+			{
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			},
+		);
+		if (!response.ok) {
+			throw this.gitHubWorkItemError(
+				`GitHub Issue lookup failed (${response.status})`,
+				response.status === 404 ? 404 : 502,
+			);
+		}
+		return (await response.json()) as Awaited<
+			ReturnType<EdgeWorker["fetchGitHubIssue"]>
+		>;
+	}
+
+	private buildSyntheticGitHubIssue(
+		issueMinimal: IssueMinimal,
+		githubIssue: Awaited<ReturnType<EdgeWorker["fetchGitHubIssue"]>>,
+	): Issue {
+		const labels = (githubIssue.labels ?? []).map((label, index) => ({
+			id: String(label.id ?? index),
+			name: label.name ?? "",
+			color: label.color ?? "",
+		}));
+		return {
+			...issueMinimal,
+			description: githubIssue.body,
+			url: githubIssue.html_url,
+			assigneeId: null,
+			stateId: null,
+			teamId: null,
+			labelIds: labels.map((label) => label.id),
+			priority: 0,
+			createdAt: new Date(githubIssue.created_at ?? Date.now()),
+			updatedAt: new Date(githubIssue.updated_at ?? Date.now()),
+			archivedAt: null,
+			state: Promise.resolve(undefined),
+			assignee: Promise.resolve(undefined),
+			team: Promise.resolve(undefined),
+			parent: Promise.resolve(undefined),
+			project: Promise.resolve(undefined),
+			labels: () => Promise.resolve({ nodes: labels }),
+			comments: () => Promise.resolve({ nodes: [] }),
+			attachments: () => Promise.resolve({ nodes: [] }),
+			children: () => Promise.resolve({ nodes: [] }),
+			inverseRelations: () => Promise.resolve({ nodes: [] }),
+			update: () =>
+				Promise.resolve({ success: true, issue: undefined, lastSyncId: 0 }),
+		} as unknown as Issue;
+	}
+
+	private buildGitHubIssueSystemPrompt(
+		workItem: GitHubIssueWorkItemSession,
+	): string {
+		return `You are implementing a GitHub Issue for ${workItem.repositoryFullName}.
+
+Work only in the checked-out branch \`${workItem.branchName}\`. Implement and verify the requested change, commit it, push the branch, and open a pull request against \`${workItem.repository.baseBranch}\`. The pull request body must contain \`Fixes #${workItem.issueNumber}\` so GitHub closes the issue when the PR is merged. Do not mark the source issue closed yourself.`;
+	}
+
+	private buildGitHubIssueTaskPrompt(
+		githubIssue: Awaited<ReturnType<EdgeWorker["fetchGitHubIssue"]>>,
+		repositoryFullName: string,
+	): string {
+		return `# GitHub Issue ${repositoryFullName}#${githubIssue.number}: ${githubIssue.title}\n\n${githubIssue.body ?? "No description provided."}`;
+	}
+
+	private githubIssueSlug(title: string): string {
+		return title
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-|-$/g, "")
+			.slice(0, 40);
+	}
+
+	private runnerResumeSessionId(
+		session: CyrusAgentSession,
+		runnerType: RunnerType,
+	): string | undefined {
+		switch (runnerType) {
+			case "claude":
+				return session.claudeSessionId;
+			case "gemini":
+				return session.geminiSessionId;
+			case "codex":
+				return session.codexSessionId;
+			case "cursor":
+				return session.cursorSessionId;
+		}
+	}
+
+	private async findGitHubIssuePullRequest(
+		workItem: GitHubIssueWorkItemSession,
+		token: string,
+	): Promise<string | undefined> {
+		const [owner] = workItem.repositoryFullName.split("/");
+		const params = new URLSearchParams({
+			state: "open",
+			head: `${owner}:${workItem.branchName}`,
+			base: workItem.repository.baseBranch,
+			per_page: "1",
+		});
+		const response = await fetch(
+			`https://api.github.com/repos/${workItem.repositoryFullName}/pulls?${params}`,
+			{
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			},
+		);
+		if (!response.ok) return undefined;
+		const pulls = (await response.json()) as Array<{ html_url?: string }>;
+		return pulls[0]?.html_url;
+	}
+
+	private async reportGitHubWorkItemStatus(
+		workItemId: string,
+		event: {
+			status:
+				| "starting"
+				| "in_progress"
+				| "awaiting_review"
+				| "failed"
+				| "stopped";
+			sessionId: string;
+			runnerType: RunnerType;
+			prUrl?: string;
+			error?: string;
+		},
+	): Promise<void> {
+		const apiKey = process.env.CYRUS_API_KEY;
+		const teamId = process.env.CYRUS_TEAM_ID;
+		if (!apiKey || !teamId) return;
+		try {
+			const response = await fetch(
+				`${getCyrusAppUrl().replace(/\/$/, "")}/api/work-items/${encodeURIComponent(workItemId)}/events`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${apiKey}`,
+						"X-Cyrus-Team-Id": teamId,
+					},
+					body: JSON.stringify({
+						eventId: randomUUID(),
+						occurredAt: new Date().toISOString(),
+						...event,
+					}),
+					signal: AbortSignal.timeout(5_000),
+				},
+			);
+			if (!response.ok) {
+				this.logger.warn(
+					`Work-item status callback failed (${response.status}) for ${workItemId}`,
+				);
+			}
+		} catch (error) {
+			this.logger.warn(
+				`Work-item status callback failed for ${workItemId}`,
+				error instanceof Error ? error : new Error(String(error)),
+			);
+		}
+	}
+
+	private gitHubWorkItemError(message: string, statusCode: number): Error {
+		return Object.assign(new Error(message), { statusCode });
+	}
+
+	private getGitHubIssueWorkItemSession(
+		workItemId: string,
+	): GitHubIssueWorkItemSession | undefined {
+		const active = this.gitHubIssueWorkItemSessions.get(workItemId);
+		if (active) return active;
+
+		const persistedSession = this.agentSessionManager
+			.getAllSessions()
+			.find(
+				(session) =>
+					session.metadata?.githubWorkItem?.workItemId === workItemId,
+			);
+		const metadata = persistedSession?.metadata?.githubWorkItem;
+		if (!persistedSession?.issue || !metadata) return undefined;
+		const repository = this.findRepositoryByGitHubUrl(
+			metadata.repositoryFullName,
+		);
+		if (!repository) return undefined;
+
+		const recovered: GitHubIssueWorkItemSession = {
+			workItemId,
+			sessionId: persistedSession.id,
+			repository,
+			repositoryFullName: metadata.repositoryFullName,
+			issueNumber: metadata.issueNumber,
+			issueIdentifier: metadata.issueIdentifier,
+			branchName: metadata.branchName,
+			runnerType: metadata.runnerType,
+			issue: persistedSession.issue,
+			// Runners are process-local. A previously running session must resume
+			// through the normal retry path after a worker restart.
+			status:
+				metadata.status === "awaiting_review" ? "awaiting_review" : "failed",
+		};
+		this.gitHubIssueWorkItemSessions.set(workItemId, recovered);
+		return recovered;
+	}
+
+	private setGitHubIssueWorkItemStatus(
+		workItem: GitHubIssueWorkItemSession,
+		status: GitHubIssueWorkItemSession["status"],
+	): void {
+		workItem.status = status;
+		const session = this.agentSessionManager.getSession(workItem.sessionId);
+		if (session?.metadata?.githubWorkItem) {
+			session.metadata.githubWorkItem.status = status;
+		}
 	}
 
 	private async handleGitHubWebhook(
