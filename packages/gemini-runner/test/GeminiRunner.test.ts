@@ -220,6 +220,30 @@ describe("GeminiRunner", () => {
 			expect(messages.length).toBeGreaterThan(0);
 		});
 
+		it("should pass additionalEnv through to the Gemini CLI process", async () => {
+			const envRunner = new GeminiRunner({
+				...defaultConfig,
+				additionalEnv: { GH_TOKEN: "ghs_token", GITHUB_TOKEN: "ghs_token" },
+			});
+			const promise = envRunner.start("Hello Gemini");
+			await new Promise((resolve) => setImmediate(resolve));
+
+			expect(mockSpawn).toHaveBeenCalledWith(
+				"gemini",
+				expect.anything(),
+				expect.objectContaining({
+					env: expect.objectContaining({
+						GH_TOKEN: "ghs_token",
+						GITHUB_TOKEN: "ghs_token",
+					}),
+				}),
+			);
+
+			processEmulator.emitEvent(createResultEvent("success"));
+			processEmulator.emitClose(0);
+			await promise;
+		});
+
 		it("should extract session ID from init event", async () => {
 			const promise = runner.start("Test prompt");
 

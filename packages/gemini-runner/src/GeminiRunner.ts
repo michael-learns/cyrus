@@ -318,8 +318,10 @@ export class GeminiRunner extends EventEmitter implements IAgentRunner {
 				useStdin = true;
 			}
 
-			// Prepare environment variables for Gemini CLI
-			const geminiEnv = { ...process.env };
+			// Prepare environment variables for Gemini CLI. `additionalEnv` carries
+			// per-session credentials (e.g. a GitHub App installation token) that
+			// exist only in memory and would otherwise never reach the child.
+			const geminiEnv = { ...process.env, ...this.config.additionalEnv };
 
 			if (this.config.appendSystemPrompt) {
 				try {

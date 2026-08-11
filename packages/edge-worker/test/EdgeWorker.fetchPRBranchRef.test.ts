@@ -225,6 +225,9 @@ describe("EdgeWorker - fetchPRBranchRefs", () => {
 		it("should make unauthenticated request when neither token is available", async () => {
 			// Ensure no GITHUB_TOKEN in env
 			delete process.env.GITHUB_TOKEN;
+			vi.spyOn(edgeWorker as any, "resolveGitHubCliToken").mockReturnValue(
+				undefined,
+			);
 
 			// Create event without installationToken
 			const eventWithoutToken: GitHubWebhookEvent = {

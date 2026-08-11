@@ -112,6 +112,11 @@ export interface CyrusAgentSession {
 			issueNumber: number;
 			issueIdentifier: string;
 			branchName: string;
+			/** Multi-repository targets. Legacy sessions only have the singular fields above. */
+			targetRepositoryFullNames?: string[];
+			branchNames?: Record<string, string>;
+			prUrls?: string[];
+			error?: string;
 			runnerType: "claude" | "gemini" | "codex" | "cursor";
 			status:
 				| "starting"

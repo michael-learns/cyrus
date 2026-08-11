@@ -3,8 +3,11 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 export interface GitHubIssueStartRequest {
 	workItemId: string;
+	/** Repository that owns the source issue. */
 	repositoryFullName: string;
 	issueNumber: number;
+	/** Configured repositories whose worktrees participate in the fix. */
+	targetRepositoryFullNames?: string[];
 	runnerType: RunnerType;
 	requestId: string;
 }
@@ -189,6 +192,12 @@ export class GitHubIssueWorkItemController {
 			!Number.isInteger(body.issueNumber) ||
 			(body.issueNumber as number) <= 0 ||
 			!RUNNER_TYPES.includes(body.runnerType as RunnerType) ||
+			(body.targetRepositoryFullNames !== undefined &&
+				(!Array.isArray(body.targetRepositoryFullNames) ||
+					body.targetRepositoryFullNames.length === 0 ||
+					body.targetRepositoryFullNames.some(
+						(value) => !this.nonEmptyString(value),
+					))) ||
 			!this.nonEmptyString(body.requestId)
 		) {
 			return null;

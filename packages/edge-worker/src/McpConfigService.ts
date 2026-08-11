@@ -8,8 +8,8 @@ import {
 
 type CyrusToolsMcpContextEntry = {
 	contextId: string;
-	linearToken: string;
-	linearClient: LinearClient;
+	linearToken?: string;
+	linearClient?: LinearClient;
 	parentSessionId?: string;
 	prebuiltServer?: ReturnType<typeof createCyrusToolsServer>;
 	createdAt: number;
@@ -74,17 +74,10 @@ export class McpConfigService {
 		// Prebuild one SDK server for this context so callback wiring remains deterministic.
 		const linearToken = this.deps.getLinearTokenForWorkspace(linearWorkspaceId);
 		const issueTracker = this.deps.getIssueTracker(linearWorkspaceId);
-		if (!linearToken || !issueTracker?.getClient) {
-			// CLI platform mode — no Linear client available, return config without cyrus-tools
-			const mcpConfig: Record<string, McpServerConfig> = {
-				"cyrus-docs": {
-					type: "http",
-					url: "https://atcyrus.com/docs/mcp",
-				},
-			};
-			return mcpConfig;
-		}
-		const linearClient = issueTracker.getClient();
+		const linearClient =
+			linearToken && issueTracker?.getClient
+				? issueTracker.getClient()
+				: undefined;
 		const prebuiltServer = createCyrusToolsServer(
 			linearClient,
 			this.deps.createCyrusToolsOptions(parentSessionId),
@@ -92,7 +85,7 @@ export class McpConfigService {
 
 		this.contexts.set(contextId, {
 			contextId,
-			linearToken,
+			linearToken: linearToken ?? undefined,
 			linearClient,
 			parentSessionId,
 			prebuiltServer,
@@ -105,13 +98,6 @@ export class McpConfigService {
 		// Workspace-level MCP servers — configured once regardless of repo count
 		// https://linear.app/docs/mcp
 		const mcpConfig: Record<string, McpServerConfig> = {
-			linear: {
-				type: "http",
-				url: "https://mcp.linear.app/mcp",
-				headers: {
-					Authorization: `Bearer ${linearToken}`,
-				},
-			},
 			"cyrus-tools": {
 				type: "http",
 				url: this.deps.getCyrusToolsMcpUrl(),
@@ -129,6 +115,13 @@ export class McpConfigService {
 				url: "https://atcyrus.com/docs/mcp",
 			},
 		};
+		if (linearToken) {
+			mcpConfig.linear = {
+				type: "http",
+				url: "https://mcp.linear.app/mcp",
+				headers: { Authorization: `Bearer ${linearToken}` },
+			};
+		}
 
 		// Inject the Slack MCP server whenever SLACK_BOT_TOKEN is available —
 		// per-platform availability is enforced upstream by the allowed-tools

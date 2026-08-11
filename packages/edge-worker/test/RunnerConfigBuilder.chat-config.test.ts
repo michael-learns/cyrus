@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { ILogger } from "cyrus-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type IChatToolResolver,
 	type IMcpConfigProvider,
@@ -15,12 +15,12 @@ const silentLogger: ILogger = {
 	error: () => {},
 } as unknown as ILogger;
 
-function makeBuilder(): RunnerConfigBuilder {
+function makeBuilder(buildMcpConfig = () => ({})): RunnerConfigBuilder {
 	const chatToolResolver: IChatToolResolver = {
 		buildChatAllowedTools: () => ["Read(**)"],
 	};
 	const mcpConfigProvider: IMcpConfigProvider = {
-		buildMcpConfig: () => ({}),
+		buildMcpConfig,
 		buildMergedMcpConfigPath: () => undefined,
 	};
 	const runnerSelector: IRunnerSelector = {
@@ -36,6 +36,39 @@ function makeBuilder(): RunnerConfigBuilder {
 }
 
 describe("RunnerConfigBuilder.buildChatConfig", () => {
+	it("loads cyrus-tools for GitHub-only chat sessions without a Linear workspace", () => {
+		const buildMcpConfig = vi.fn(() => ({
+			"cyrus-tools": { type: "http" as const, url: "http://localhost/mcp" },
+		}));
+		const builder = makeBuilder(buildMcpConfig);
+		const repository = {
+			id: "repo-1",
+			name: "private-repo",
+			repositoryPath: "/repos/private-repo",
+			workspaceBaseDir: "/worktrees",
+			baseBranch: "main",
+		} as never;
+
+		const config = builder.buildChatConfig({
+			workspacePath: "/tmp/slack-workspace",
+			workspaceName: "slack-thread-x",
+			systemPrompt: "test",
+			sessionId: "sess-1",
+			cyrusHome: "/tmp/cyrus-home-test",
+			platformName: "slack",
+			repository,
+			repositoryPaths: ["/repos/private-repo"],
+			logger: silentLogger,
+			onMessage: () => {},
+			onError: () => {},
+		});
+
+		expect(buildMcpConfig).toHaveBeenCalledWith("repo-1", "", "sess-1");
+		expect(config.mcpConfig).toEqual({
+			"cyrus-tools": { type: "http", url: "http://localhost/mcp" },
+		});
+	});
+
 	it("includes autoMemoryDirectory in allowedDirectories so the session can read existing memory files (CYPACK-1197)", () => {
 		const builder = makeBuilder();
 		const cyrusHome = "/tmp/cyrus-home-test";

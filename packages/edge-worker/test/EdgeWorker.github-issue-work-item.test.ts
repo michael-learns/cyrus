@@ -103,6 +103,7 @@ describe("EdgeWorker GitHub Issue work items", () => {
 				branchName: "cyrus/gh-17-fix-webhook-retries",
 			}),
 			githubIssue,
+			"ghs_token",
 		);
 		expect(worker.runGitHubIssueWorkItem).toHaveBeenCalledWith(
 			expect.objectContaining({ workItemId: "work-item-17" }),
@@ -110,6 +111,38 @@ describe("EdgeWorker GitHub Issue work items", () => {
 			"issue prompt",
 			"ghs_token",
 		);
+	});
+
+	it("rejects a second target set while a session for the same issue is live", async () => {
+		await worker.startGitHubIssueWorkItem(
+			{
+				workItemId: "work-item-17",
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 17,
+				runnerType: "codex",
+				requestId: "request-17",
+			},
+			"forwarded-token",
+		);
+		worker.gitService.createGitWorktree.mockClear();
+
+		// A different target set hashes to a different work item id, but the
+		// worktree path and branch name are still derived from the source repo
+		// and issue number alone — so the two sessions would collide.
+		await expect(
+			worker.startGitHubIssueWorkItem(
+				{
+					workItemId: "work-item-17-multi",
+					repositoryFullName: "cyrusagents/cyrus",
+					issueNumber: 17,
+					targetRepositoryFullNames: ["cyrusagents/cyrus", "cyrusagents/other"],
+					runnerType: "codex",
+					requestId: "request-17-multi",
+				},
+				"forwarded-token",
+			),
+		).rejects.toMatchObject({ statusCode: 409 });
+		expect(worker.gitService.createGitWorktree).not.toHaveBeenCalled();
 	});
 
 	it("rejects closed GitHub Issues before creating a worktree", async () => {
@@ -227,6 +260,7 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		expect(worker.createGitHubIssueRunner).toHaveBeenCalledWith(
 			failed,
 			githubIssue,
+			"ghs_token",
 			"codex-session-1",
 		);
 		expect(worker.gitService.createGitWorktree).not.toHaveBeenCalled();
