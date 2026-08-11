@@ -532,12 +532,12 @@ export class PromptBuilder {
 		const activeRepositoriesByWorkspace = new Map<string, RepositoryConfig[]>();
 
 		for (const repository of this.repositories.values()) {
-			if (repository.isActive === false) {
+			if (repository.isActive === false || !repository.linearWorkspaceId) {
 				continue;
 			}
 
 			// Keep a stable per-workspace bucket as we scan configured repositories.
-			const workspaceId = requireLinearWorkspaceId(repository);
+			const workspaceId = repository.linearWorkspaceId;
 			const repositories = activeRepositoriesByWorkspace.get(workspaceId) ?? [];
 			repositories.push(repository);
 			activeRepositoriesByWorkspace.set(workspaceId, repositories);

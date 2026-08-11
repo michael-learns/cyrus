@@ -475,4 +475,31 @@ Check workspace isolation
 		expect(context).toContain("`[repo=org/ws1-app]`");
 		expect(context).toContain("`[repo=org/ws2-service]`");
 	});
+
+	it("generateRoutingContextForAllWorkspaces ignores repositories without Linear", () => {
+		const worker = createTestWorker([
+			{
+				id: "github-only-a",
+				name: "GitHub Only App",
+				repositoryPath: "/test/github/app",
+				workspaceBaseDir: "/test/workspace",
+				baseBranch: "main",
+				githubUrl: "https://github.com/org/github-app",
+			},
+			{
+				id: "github-only-b",
+				name: "GitHub Only API",
+				repositoryPath: "/test/github/api",
+				workspaceBaseDir: "/test/workspace",
+				baseBranch: "main",
+				githubUrl: "https://github.com/org/github-api",
+			},
+		]);
+
+		const promptBuilder = (worker as any).promptBuilder as {
+			generateRoutingContextForAllWorkspaces: () => string;
+		};
+
+		expect(promptBuilder.generateRoutingContextForAllWorkspaces()).toBe("");
+	});
 });
