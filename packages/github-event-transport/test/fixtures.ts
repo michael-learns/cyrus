@@ -5,6 +5,7 @@ import type {
 	GitHubComment,
 	GitHubIssue,
 	GitHubIssueCommentPayload,
+	GitHubIssuesPayload,
 	GitHubPullRequest,
 	GitHubPullRequestReviewCommentPayload,
 	GitHubPullRequestReviewPayload,
@@ -88,7 +89,18 @@ export const testPlainIssue: GitHubIssue = {
 	html_url: "https://github.com/testorg/my-repo/issues/43",
 	url: "https://api.github.com/repos/testorg/my-repo/issues/43",
 	user: testUser,
+	labels: [{ id: 1, name: "bug", color: "d73a4a" }],
+	created_at: "2025-01-15T10:00:00Z",
+	updated_at: "2025-01-15T10:00:00Z",
 	// No pull_request field => this is a plain issue
+};
+
+export const issuesOpenedPayload: GitHubIssuesPayload = {
+	action: "opened",
+	issue: testPlainIssue,
+	repository: testRepository,
+	sender: testUser,
+	installation: { id: 55555, node_id: "MDIzOk" },
 };
 
 export const testPullRequest: GitHubPullRequest = {

@@ -160,6 +160,7 @@ Construct the manifest, substituting `AGENT_NAME`, `HOMEPAGE_URL`, and `CYRUS_BA
     "repository_hooks": "write"
   },
   "default_events": [
+    "issues",
     "issue_comment",
     "organization",
     "pull_request_review",

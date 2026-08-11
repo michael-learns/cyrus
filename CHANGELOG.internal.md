@@ -4,6 +4,10 @@ This changelog documents internal development changes, refactors, tooling update
 
 ## [Unreleased]
 
+### Added
+
+- Added typed GitHub `issues` webhook intake for issue creation and lifecycle updates, including setup support for subscribing Cyrus GitHub Apps to the event. ([#1](https://github.com/michael-learns/cyrus/pull/1))
+
 ## [0.2.68] - 2026-08-05
 
 ### Added

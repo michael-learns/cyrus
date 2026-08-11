@@ -42,12 +42,13 @@ export interface GitHubEventTransportEvents {
  * Processed GitHub webhook event that is emitted to listeners
  */
 export interface GitHubWebhookEvent {
-	/** The GitHub event type (e.g., 'issue_comment', 'pull_request_review_comment', 'pull_request_review', 'push') */
+	/** The GitHub event type (e.g., 'issues', 'issue_comment', 'pull_request_review_comment', 'pull_request_review', 'push') */
 	eventType: GitHubEventType;
 	/** Unique webhook delivery ID */
 	deliveryId: string;
 	/** The full GitHub webhook payload */
 	payload:
+		| GitHubIssuesPayload
 		| GitHubIssueCommentPayload
 		| GitHubPullRequestReviewCommentPayload
 		| GitHubPullRequestReviewPayload
@@ -60,6 +61,7 @@ export interface GitHubWebhookEvent {
  * Supported GitHub webhook event types
  */
 export type GitHubEventType =
+	| "issues"
 	| "issue_comment"
 	| "pull_request_review_comment"
 	| "pull_request_review"
@@ -68,7 +70,10 @@ export type GitHubEventType =
 /**
  * Comment-related GitHub event types (excludes push)
  */
-export type GitHubCommentEventType = Exclude<GitHubEventType, "push">;
+export type GitHubCommentEventType = Exclude<
+	GitHubEventType,
+	"issues" | "push"
+>;
 
 /**
  * Comment/review webhook event (excludes push events).
@@ -164,8 +169,20 @@ export interface GitHubIssue {
 	html_url: string;
 	url: string;
 	user: GitHubUser;
+	labels?: GitHubLabel[];
+	created_at?: string;
+	updated_at?: string;
+	closed_at?: string | null;
 	/** Present when the issue is a PR */
 	pull_request?: GitHubPullRequestMinimal;
+}
+
+/** GitHub issue label object (minimal). */
+export interface GitHubLabel {
+	id: number;
+	name: string;
+	color: string;
+	description?: string | null;
 }
 
 /**
@@ -193,6 +210,25 @@ export interface GitHubComment {
 export interface GitHubInstallation {
 	id: number;
 	node_id: string;
+}
+
+/**
+ * Payload for issue lifecycle webhook events.
+ * Pull requests also trigger GitHub's `issues` event in some API shapes, so
+ * callers must reject payloads whose issue contains `pull_request`.
+ * @see https://docs.github.com/en/webhooks/webhook-events-and-payloads#issues
+ */
+export interface GitHubIssuesPayload {
+	action: "opened" | "edited" | "closed" | "reopened" | "labeled" | "unlabeled";
+	issue: GitHubIssue;
+	label?: GitHubLabel;
+	changes?: {
+		title?: { from: string };
+		body?: { from: string | null };
+	};
+	repository: GitHubRepository;
+	sender: GitHubUser;
+	installation?: GitHubInstallation;
 }
 
 /**
