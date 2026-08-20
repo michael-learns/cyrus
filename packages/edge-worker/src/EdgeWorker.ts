@@ -8105,7 +8105,7 @@ ${taskSection}`;
 	): Promise<{ number: number; url: string } | undefined> {
 		const token = await this.resolveGitHubTokenValue();
 		if (!token) throw new Error("GitHub authentication is unavailable");
-		for (let page = 1; page <= 10; page++) {
+		for (let page = 1; ; page++) {
 			const response = await fetch(
 				`https://api.github.com/repos/${repository}/issues?state=all&per_page=100&page=${page}&sort=created&direction=desc`,
 				{

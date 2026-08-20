@@ -63,6 +63,48 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		}
 	});
 
+	it("follows GitHub pagination until there is no next page", async () => {
+		const priorFetch = globalThis.fetch;
+		const marker = "<!-- cyrus-slack-source:deep-source -->";
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			const page = Number(new URL(String(input)).searchParams.get("page"));
+			if (page === 11) {
+				return new Response(
+					JSON.stringify([
+						{
+							number: 84,
+							html_url: "https://github.com/acme/api/issues/84",
+							body: `body\n\n${marker}`,
+						},
+					]),
+					{ status: 200 },
+				);
+			}
+			return new Response(JSON.stringify([]), {
+				status: 200,
+				headers: {
+					link: `<https://api.github.com/repositories/1/issues?page=${page + 1}>; rel="next"`,
+				},
+			});
+		});
+		globalThis.fetch = fetchMock;
+		try {
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("token");
+
+			await expect(
+				worker.findSlackEngineeringIssueByMarker("acme/api", marker),
+			).resolves.toEqual({
+				number: 84,
+				url: "https://github.com/acme/api/issues/84",
+			});
+			expect(fetchMock).toHaveBeenCalledTimes(11);
+			expect(fetchMock.mock.calls[10]![0]).toContain("page=11");
+		} finally {
+			globalThis.fetch = priorFetch;
+		}
+	});
+
 	it("assembles the captured transcript before canonical capture-local images in message/file order", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "cyrus-slack-turn-"));
 		const transcriptPath = join(directory, "transcript.md");
