@@ -1,0 +1,17 @@
+{
+	"action": "kickoff",
+	"fixture": {
+		"channel": "C_ENGINEERING",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660200.000100",
+		"kickoffTs": "1755660206.000700",
+		"text": "Now implement a separate keyboard navigation improvement.",
+		"history": []
+	},
+	"engineering": {
+		"issueRepository": "f1-test/primary-repo",
+		"title": "Improve dashboard keyboard navigation",
+		"summary": "Add keyboard navigation as a distinct post-completion request.",
+		"targetRepositories": ["f1-test/primary-repo"]
+	}
+}

@@ -482,6 +482,62 @@ describe("ClaudeRunner", () => {
 				]),
 			).rejects.toThrow("Unsupported local image type");
 		});
+
+		it("rejects an image in a sibling directory whose name shares the allowed prefix", async () => {
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			await expect(
+				structuredRunner.startTurn([
+					{
+						type: "local_image",
+						path: "/tmp/allowed-escape/context.png",
+						mediaType: "image/png",
+					},
+				]),
+			).rejects.toThrow("Local image path is not allowed");
+		});
+
+		it("rejects traversal from an allowed directory", async () => {
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			await expect(
+				structuredRunner.startTurn([
+					{
+						type: "local_image",
+						path: "/tmp/allowed/../secret/context.png",
+						mediaType: "image/png",
+					},
+				]),
+			).rejects.toThrow("Local image path is not allowed");
+		});
+
+		it("rejects a symlink that canonicalizes outside the allowed directory", async () => {
+			vi.mocked(realpathSync).mockImplementation((path) =>
+				String(path) === "/tmp/allowed/link.png"
+					? "/tmp/outside/secret.png"
+					: String(path),
+			);
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			await expect(
+				structuredRunner.startTurn([
+					{
+						type: "local_image",
+						path: "/tmp/allowed/link.png",
+						mediaType: "image/png",
+					},
+				]),
+			).rejects.toThrow("Local image path is not allowed");
+		});
 	});
 
 	describe("stop()", () => {

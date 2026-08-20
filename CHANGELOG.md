@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Slack threads can now start new engineering work directly: Cyrus securely captures ordered text, supported images, and relevant links, asks for a repository when routing is ambiguous, creates exactly one GitHub Issue, accepts follow-up guidance, and reliably returns pull-request or terminal status after retries and restarts.
 - Connected GitHub Issues can now be started manually from the Cyrus work inbox with a selected agent. Cyrus creates an isolated branch and worktree, accepts follow-up comments, reports progress and pull-request status, supports safe retries, and stops and cleans up when requested by the control plane. ([#2](https://github.com/michael-learns/cyrus/pull/2))
 - Slack threads now show task-specific live activity statuses while Cyrus is thinking, inspecting repositories, searching or editing code, running checks, and waiting for background work. ([#5](https://github.com/michael-learns/cyrus/pull/5))
 - Slack conversations can now inspect private GitHub Issues and naturally start, guide, monitor, or stop code fixes without special commands. Cyrus can coordinate one issue across multiple repositories and replies with every pull request it opens. ([#8](https://github.com/michael-learns/cyrus/pull/8))

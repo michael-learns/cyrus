@@ -1,0 +1,23 @@
+{
+	"action": "followup",
+	"fixture": {
+		"channel": "C_ENGINEERING",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660200.000100",
+		"kickoffTs": "1755660203.000400",
+		"text": "Also keep the legend visible below 480px.",
+		"history": [
+			{
+				"ts": "1755660200.000100",
+				"user": "U_REPORTER",
+				"text": "The dashboard chart is clipped at mobile widths."
+			},
+			{
+				"ts": "1755660202.000300",
+				"user": "U_REQUESTER",
+				"text": "Implement the clipped chart fix."
+			}
+		]
+	},
+	"message": "untrusted summary that must not replace the latest Slack message"
+}

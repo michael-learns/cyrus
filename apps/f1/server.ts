@@ -18,18 +18,29 @@
  *   CYRUS_PORT=3600 CYRUS_REPO_PATH=/path/to/repo bun run server.ts
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getAllTools } from "cyrus-claude-runner";
 import {
+	type AgentRunnerConfig,
+	type AgentSessionInfo,
+	type AgentTurn,
 	type EdgeWorkerConfig,
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
+	type IAgentRunner,
+	type IMessageFormatter,
 	type RepositoryConfig,
 } from "cyrus-core";
 import { EdgeWorker } from "cyrus-edge-worker";
 import type { SlackWebhookEvent } from "cyrus-slack-event-transport";
+import {
+	normalizeSlackEngineeringFixture,
+	type SlackEngineeringFixture,
+} from "./src/slackEngineeringFixture.js";
+import { SyntheticSlackEngineeringBackend } from "./src/syntheticSlackEngineeringBackend.js";
 import { bold, cyan, dim, gray, green, success } from "./src/utils/colors.js";
 
 // ============================================================================
@@ -41,7 +52,8 @@ const CYRUS_REPO_PATH = process.env.CYRUS_REPO_PATH || process.cwd();
 const CYRUS_REPO_GITHUB_URL =
 	process.env.CYRUS_REPO_GITHUB_URL ||
 	"https://github.com/f1-test/primary-repo";
-const CYRUS_HOME = join(tmpdir(), `cyrus-f1-${Date.now()}`);
+const CYRUS_HOME =
+	process.env.CYRUS_HOME || join(tmpdir(), `cyrus-f1-${Date.now()}`);
 const DEFAULT_REPOS_BASE_DIR = getDefaultReposDir(CYRUS_HOME);
 const DEFAULT_WORKTREES_BASE_DIR = getDefaultWorktreesDir(CYRUS_HOME);
 // Optional second repository path for multi-repo orchestration testing
@@ -50,6 +62,160 @@ const CYRUS_REPO_GITHUB_URL_2 =
 	process.env.CYRUS_REPO_GITHUB_URL_2 ||
 	"https://github.com/f1-test/secondary-repo";
 const MULTI_REPO_MODE = Boolean(CYRUS_REPO_PATH_2);
+const SLACK_ENGINEERING_MODE = process.env.CYRUS_F1_SLACK_ENGINEERING === "1";
+
+const formatter: IMessageFormatter = {
+	formatTodoWriteParameter: (value) => value,
+	formatTaskParameter: (name) => name,
+	formatToolParameter: (name) => name,
+	formatToolActionName: (name) => name,
+	formatToolResult: (_name, _input, result) => result,
+};
+
+class SyntheticAgentRunner implements IAgentRunner {
+	readonly supportsStreamingInput = true;
+	readonly turns: AgentTurn[] = [];
+	readonly streamMessages: string[] = [];
+	private running = false;
+	private resolveEngineering?: () => void;
+	private readonly messages: ReturnType<IAgentRunner["getMessages"]> = [];
+
+	constructor(
+		readonly config: AgentRunnerConfig,
+		readonly kind: "chat" | "engineering",
+	) {}
+
+	async start(prompt: string): Promise<AgentSessionInfo> {
+		this.streamMessages.push(prompt);
+		return this.startCommon();
+	}
+
+	async startStreaming(prompt?: string): Promise<AgentSessionInfo> {
+		if (prompt) this.streamMessages.push(prompt);
+		this.running = true;
+		return this.info();
+	}
+
+	async startTurn(turn: AgentTurn): Promise<AgentSessionInfo> {
+		this.turns.push(structuredClone(turn));
+		this.running = true;
+		this.commitSyntheticChange();
+		if (this.kind === "engineering") {
+			await new Promise<void>((resolve) => {
+				this.resolveEngineering = resolve;
+			});
+		}
+		return this.finish();
+	}
+
+	addStreamMessage(message: string): void {
+		this.streamMessages.push(message);
+	}
+
+	addStreamTurn(turn: AgentTurn): void {
+		this.turns.push(structuredClone(turn));
+	}
+
+	completeEngineering(): void {
+		this.messages.push({
+			type: "result",
+			subtype: "success",
+			is_error: false,
+			duration_ms: 1,
+			duration_api_ms: 1,
+			num_turns: 1,
+			result:
+				"Implemented the synthetic F1 change and opened the pull request.",
+			session_id: `f1-${this.kind}`,
+			total_cost_usd: 0,
+			stop_reason: null,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: `f1-${this.kind}-result`,
+		} as unknown as ReturnType<IAgentRunner["getMessages"]>[number]);
+		this.running = false;
+		this.resolveEngineering?.();
+		this.resolveEngineering = undefined;
+	}
+
+	completeStream(): void {}
+	isStreaming(): boolean {
+		return this.running;
+	}
+	stop(): void {
+		this.running = false;
+		this.resolveEngineering?.();
+	}
+	isRunning(): boolean {
+		return this.running;
+	}
+	getMessages(): ReturnType<IAgentRunner["getMessages"]> {
+		return [...this.messages];
+	}
+	getFormatter(): IMessageFormatter {
+		return formatter;
+	}
+
+	private async startCommon(): Promise<AgentSessionInfo> {
+		this.running = true;
+		return this.kind === "engineering" ? this.finish() : this.info();
+	}
+
+	private finish(): AgentSessionInfo {
+		this.running = false;
+		return this.info();
+	}
+
+	private info(): AgentSessionInfo {
+		return {
+			sessionId: `f1-${this.kind}`,
+			startedAt: new Date(),
+			isRunning: this.running,
+		};
+	}
+
+	private commitSyntheticChange(): void {
+		if (this.kind !== "engineering") return;
+		const candidates = [
+			this.config.workingDirectory,
+			...(this.config.allowedDirectories ?? []),
+		].filter((value): value is string => Boolean(value));
+		const worktree = candidates.find((candidate) => {
+			try {
+				return (
+					execFileSync(
+						"git",
+						["-C", candidate, "rev-parse", "--is-inside-work-tree"],
+						{
+							encoding: "utf8",
+							stdio: ["ignore", "pipe", "ignore"],
+						},
+					).trim() === "true" && candidate.includes("worktrees")
+				);
+			} catch {
+				return false;
+			}
+		});
+		if (!worktree) return;
+		appendFileSync(
+			join(worktree, ".f1-slack-engineering-proof"),
+			"validated\n",
+		);
+		execFileSync("git", ["-C", worktree, "add", ".f1-slack-engineering-proof"]);
+		execFileSync("git", [
+			"-C",
+			worktree,
+			"-c",
+			"user.name=F1 Validation",
+			"-c",
+			"user.email=f1@example.invalid",
+			"commit",
+			"-m",
+			"test: synthetic Slack engineering change",
+		]);
+	}
+}
 
 // Validate port
 if (Number.isNaN(CYRUS_PORT) || CYRUS_PORT < 1 || CYRUS_PORT > 65535) {
@@ -106,6 +272,9 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 		linearWorkspaceId: "cli-workspace",
 		workspaceBaseDir: DEFAULT_WORKTREES_BASE_DIR,
 		isActive: true,
+		...(process.env.CYRUS_REPO_MODEL && {
+			model: process.env.CYRUS_REPO_MODEL,
+		}),
 		// Routing configuration for multi-repo support
 		routingLabels: ["primary", "main-repo"],
 		teamKeys: ["PRIMARY"],
@@ -146,6 +315,9 @@ function createEdgeWorkerConfig(): EdgeWorkerConfig {
 			linearWorkspaceId: "cli-workspace", // Same workspace for routing test
 			workspaceBaseDir: join(DEFAULT_WORKTREES_BASE_DIR, "secondary"),
 			isActive: true,
+			...(process.env.CYRUS_REPO_MODEL_2 && {
+				model: process.env.CYRUS_REPO_MODEL_2,
+			}),
 			// Different routing labels for second repo
 			routingLabels: ["secondary", "backend"],
 			teamKeys: ["SECONDARY"],
@@ -285,12 +457,46 @@ async function startServer(): Promise<void> {
 	try {
 		// Setup directories
 		setupDirectories();
+		const syntheticBackend = SLACK_ENGINEERING_MODE
+			? new SyntheticSlackEngineeringBackend(
+					join(CYRUS_HOME, "state", "f1-slack-engineering-backend.json"),
+				)
+			: undefined;
+		if (syntheticBackend) {
+			globalThis.fetch = syntheticBackend.fetch;
+			process.env.GITHUB_TOKEN = "ghs-f1-synthetic";
+		}
 
 		// Create EdgeWorker configuration
 		const config = createEdgeWorkerConfig();
 
 		// Initialize EdgeWorker
 		const edgeWorker = new EdgeWorker(config);
+		const syntheticRunners: SyntheticAgentRunner[] = [];
+		if (syntheticBackend) {
+			const workerWithRunnerFactory = edgeWorker as unknown as {
+				createRunnerForType: (
+					runnerType: "claude" | "gemini" | "codex" | "cursor",
+					config: AgentRunnerConfig,
+				) => IAgentRunner;
+			};
+			workerWithRunnerFactory.createRunnerForType = (
+				runnerType,
+				runnerConfig,
+			) => {
+				if (runnerType !== "claude") {
+					throw new Error(
+						`F1 Slack engineering expected Claude, received ${runnerType}`,
+					);
+				}
+				const kind = runnerConfig.workingDirectory?.includes("slack-workspaces")
+					? "chat"
+					: "engineering";
+				const runner = new SyntheticAgentRunner(runnerConfig, kind);
+				syntheticRunners.push(runner);
+				return runner;
+			};
+		}
 
 		// Setup graceful shutdown
 		const shutdown = async (signal: string): Promise<void> => {
@@ -349,6 +555,150 @@ async function startServer(): Promise<void> {
 				reply.code(500).send({ ok: false, error: message });
 			}
 		});
+
+		if (syntheticBackend) {
+			fastify.post("/cli/slack-engineering", async (request, reply) => {
+				const body = request.body as {
+					action:
+						| "chat"
+						| "repositories"
+						| "kickoff"
+						| "retry"
+						| "followup"
+						| "status"
+						| "complete"
+						| "stop";
+					fixture?: SlackEngineeringFixture;
+					engineering?: {
+						issueRepository: string;
+						title: string;
+						summary: string;
+						targetRepositories?: string[];
+					};
+					message?: string;
+					failSlackDelivery?: boolean;
+				};
+				try {
+					syntheticBackend.failSlackDelivery =
+						body.failSlackDelivery ?? syntheticBackend.failSlackDelivery;
+					let threadKey: string | undefined;
+					let parentSessionId: string | undefined;
+					if (body.fixture) {
+						const normalized = normalizeSlackEngineeringFixture(body.fixture);
+						syntheticBackend.setThread(
+							body.fixture.channel,
+							body.fixture.threadTs,
+							normalized.messages,
+						);
+						for (const [id, file] of normalized.files) {
+							syntheticBackend.setFile(id, file.bytes, file.mimeType);
+						}
+						const replayHarness = edgeWorker as unknown as {
+							replayPendingSlackEngineeringDeliveriesForEvent: (
+								event: SlackWebhookEvent,
+							) => Promise<void>;
+						};
+						await replayHarness.replayPendingSlackEngineeringDeliveriesForEvent(
+							normalized.event,
+						);
+						await edgeWorker.dispatchChatTestEvent(normalized.event);
+						threadKey = `${body.fixture.channel}:${body.fixture.threadTs}`;
+						parentSessionId = edgeWorker
+							.listChatThreads()
+							.find((thread) => thread.threadKey === threadKey)?.sessionId;
+					}
+
+					const workerHarness = edgeWorker as unknown as {
+						createAndStartSlackEngineering: (
+							parentSessionId: string,
+							input: NonNullable<typeof body.engineering>,
+						) => Promise<unknown>;
+						promptSlackEngineering: (
+							parentSessionId: string,
+							message: string,
+						) => Promise<unknown>;
+						slackEngineeringOrchestrator: {
+							listRepositories: () => unknown;
+							current: (parentSessionId: string) => unknown;
+							stop: (parentSessionId: string) => Promise<unknown>;
+						};
+					};
+
+					if (!parentSessionId && body.action !== "complete") {
+						throw new Error(
+							"fixture must resolve an active Slack parent session",
+						);
+					}
+					let result: unknown;
+					switch (body.action) {
+						case "chat":
+							result = { accepted: true, engineeringStarted: false };
+							break;
+						case "repositories":
+							result =
+								workerHarness.slackEngineeringOrchestrator.listRepositories();
+							break;
+						case "kickoff":
+						case "retry":
+							if (!body.engineering)
+								throw new Error("engineering input required");
+							result = await workerHarness.createAndStartSlackEngineering(
+								parentSessionId!,
+								body.engineering,
+							);
+							break;
+						case "followup":
+							result = await workerHarness.promptSlackEngineering(
+								parentSessionId!,
+								body.message ?? body.fixture?.text ?? "follow-up",
+							);
+							break;
+						case "status":
+							result = workerHarness.slackEngineeringOrchestrator.current(
+								parentSessionId!,
+							);
+							break;
+						case "stop":
+							result = await workerHarness.slackEngineeringOrchestrator.stop(
+								parentSessionId!,
+							);
+							break;
+						case "complete": {
+							const runner = [...syntheticRunners]
+								.reverse()
+								.find((candidate) => candidate.kind === "engineering");
+							if (!runner) throw new Error("no synthetic engineering runner");
+							runner.completeEngineering();
+							await new Promise((resolve) => setTimeout(resolve, 300));
+							result = { completed: true };
+							break;
+						}
+					}
+
+					reply.send({
+						ok: true,
+						threadKey,
+						parentSessionId,
+						result,
+						backend: syntheticBackend.snapshot(),
+						runners: syntheticRunners.map((runner) => ({
+							kind: runner.kind,
+							model: runner.config.model,
+							fallbackModel: runner.config.fallbackModel,
+							workingDirectory: runner.config.workingDirectory,
+							turns: runner.turns,
+							streamMessages: runner.streamMessages,
+						})),
+					});
+				} catch (error) {
+					reply.code(400).send({
+						ok: false,
+						error: error instanceof Error ? error.message : String(error),
+						backend: syntheticBackend.snapshot(),
+					});
+				}
+			});
+		}
 
 		// List active chat threads (threadKey → sessionId)
 		fastify.get("/cli/chat-threads", async (_request, reply) => {

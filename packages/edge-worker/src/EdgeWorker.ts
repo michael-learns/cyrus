@@ -2302,9 +2302,9 @@ export class EdgeWorker extends EventEmitter {
 	): Promise<IAgentRunner> {
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (!session) throw new Error(`Missing session ${workItem.sessionId}`);
-		const slackEngineering = Boolean(
-			this.slackEngineeringOrchestrator?.byWorkItem(workItem.workItemId),
-		);
+		const slackEngineeringReceipt =
+			this.slackEngineeringOrchestrator?.byWorkItem(workItem.workItemId);
+		const slackEngineering = Boolean(slackEngineeringReceipt);
 		const labels = (slackEngineering ? [] : (githubIssue.labels ?? []))
 			.map((label) => label.name)
 			.filter((name): name is string => Boolean(name));
@@ -2318,6 +2318,7 @@ export class EdgeWorker extends EventEmitter {
 			...this.gitService.getGitMetadataDirectoriesForWorkspace(
 				session.workspace,
 			),
+			...(slackEngineeringReceipt?.contextDirectories ?? []),
 		];
 		const systemPrompt = this.buildGitHubIssueSystemPrompt(workItem);
 		const selectorDescription = slackEngineering
@@ -7810,7 +7811,7 @@ ${taskSection}`;
 				) {
 					turn.push({
 						type: "local_image",
-						path: file.localPath,
+						path: resolve(capture.directory, file.localPath),
 						mediaType: file.mimeType,
 					});
 				}

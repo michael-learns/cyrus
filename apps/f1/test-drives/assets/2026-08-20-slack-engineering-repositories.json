@@ -1,0 +1,11 @@
+{
+	"action": "repositories",
+	"fixture": {
+		"channel": "C_ENGINEERING",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660000.000100",
+		"kickoffTs": "1755660000.000100",
+		"text": "Please implement the dashboard fix, but I am not sure which repository owns it.",
+		"history": []
+	}
+}

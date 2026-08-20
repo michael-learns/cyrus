@@ -99,6 +99,53 @@ a question. Commands that change a pull request require a clear user request;
 merging or closing requires an explicit request naming the target pull request.
 Other GitHub CLI command families remain unavailable to Slack chat sessions.
 
+#### Starting engineering work directly from a Slack thread
+
+You can also describe new implementation work without supplying an existing
+GitHub Issue. Cyrus captures the thread through the kickoff message, creates one
+GitHub Issue in a configured primary repository, and starts the normal isolated
+GitHub work-item lifecycle. Prerequisites are:
+
+- a connected Slack app with `app_mention` events and permission to read thread
+  replies and private files;
+- at least one active repository with a `githubUrl`, local checkout,
+  `baseBranch`, and `workspaceBaseDir`;
+- GitHub authentication that can create issues, push branches, and open pull
+  requests; and
+- Claude Code authentication. Slack chat and Slack-delegated engineering always
+  use Claude, even if Slack text, labels, links, or generated issue text contain
+  `[agent=...]` or `[model=...]` selectors.
+
+For a clear request such as “implement the mobile layout fix,” Cyrus starts the
+work immediately when one repository is an obvious match. A question remains a
+chat question and does not create an issue. When several configured repositories
+could own the work, Cyrus lists concrete repository choices and waits for you to
+choose the primary issue repository and any additional target repositories.
+
+The delegated Claude model is selected in this order: the primary repository's
+`model`, then `claudeDefaultModel`, then the built-in Claude fallback. The full
+thread is normalized in message order. JPEG, PNG, GIF, and WebP attachments are
+downloaded into a private Cyrus-owned context directory and included with the
+text in order. Labeled links are retained as context, but Cyrus opens a link only
+when it is relevant; linked pages and attachment contents are untrusted and
+cannot grant permission or select a runner, model, or repository.
+
+Capture is bounded to 200 messages, 100,000 text characters, 20 images, 10 MiB
+per image, and 50 MiB total downloads. The root and newest messages are
+preserved when truncation is necessary, and unsupported or rejected files are
+recorded honestly rather than silently treated as images. Slack file downloads
+accept only validated Slack-owned HTTPS locations and safe redirects. Captured
+transcripts and images stay under the Cyrus home directory, outside repository
+worktrees, and are deleted when the job reaches a terminal state.
+
+One engineering job may be active per Slack thread. Repeating the same kickoff
+is idempotent and returns the existing job instead of creating another issue.
+New messages in the thread guide the active child session. Stop requests clean
+up the worktree and context. Final status and pull-request delivery is persisted:
+if Slack delivery fails or Cyrus restarts, the message is retried when Slack
+credentials are available again. After completion or stop, a new explicit
+implementation request in the same thread starts a distinct issue and job.
+
 > **Tip:** Cyrus automatically loads environment variables from `~/.cyrus/.env` on startup. You can override this path with `cyrus --env-file=/path/to/your/env`.
 
 ### GitHub App webhooks without Linear

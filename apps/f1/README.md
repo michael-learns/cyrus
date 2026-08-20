@@ -57,6 +57,12 @@ pnpm run server:dev
 - `CYRUS_REPO_GITHUB_URL` - GitHub URL matched by GitHub Issue work-item requests (default: the synthetic F1 repository URL)
 - `CYRUS_REPO_PATH_2` / `CYRUS_REPO_GITHUB_URL_2` - optional second local clone and GitHub URL for coordinated multi-repository tests
 - `CYRUS_CLAUDE_MODEL` - optional Claude model override for real harness runs
+- `CYRUS_F1_SLACK_ENGINEERING=1` - enable the synthetic Slack/GitHub engineering
+  boundary for credential-free production-path validation
+- `CYRUS_HOME` - optional persistent F1 state directory; reuse it across server
+  restarts to validate pending Slack delivery restoration
+- `CYRUS_REPO_MODEL` / `CYRUS_REPO_MODEL_2` - optional repository-level Claude
+  models for model-precedence validation
 
 Once started, the server displays:
 ```
@@ -133,6 +139,24 @@ The F1 CLI provides the following commands:
 # Stop an active session
 ./f1 stop-session --session-id "session-456"
 ```
+
+### Synthetic Slack engineering fixtures
+
+With `CYRUS_F1_SLACK_ENGINEERING=1`, fixtures can describe Slack thread history,
+labeled links, supported images, kickoff retries, follow-ups, completion, and
+stop actions:
+
+```bash
+./f1 run-slack-engineering-fixture \
+  --fixture test-drives/assets/2026-08-20-slack-engineering-kickoff.json
+```
+
+The harness replaces only external Slack, GitHub, and Claude execution edges.
+It still runs production Slack thread fetching, context normalization and secure
+image capture, Slack engineering orchestration and persistence, GitHub work-item
+startup, model resolution, follow-up routing, terminal cleanup, and delivery
+replay. It creates local disposable git worktrees and synthetic in-memory/on-disk
+GitHub issues; it never creates an external issue or pull request.
 
 ## Server Architecture
 

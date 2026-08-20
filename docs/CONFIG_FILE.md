@@ -367,6 +367,22 @@ default is read-only for files, permits configured-repository refreshes with
 command families. Supplying this field replaces the built-in list, so include
 every tool the Slack session should retain.
 
+Slack engineering kickoffs are available when an active repository has a
+`githubUrl` and GitHub authentication can create issues and pull requests.
+Conversational Slack sessions and their delegated engineering jobs are locked
+to Claude. For delegated work, model precedence is the primary repository's
+`model`, then top-level `claudeDefaultModel`, then the built-in Claude fallback;
+Slack text and generated issue labels or `[agent=...]` / `[model=...]` selectors
+cannot override this selection.
+
+Thread capture is stored beneath `<cyrusHome>/slack-context`, never inside a
+repository. It includes up to 200 messages, 100,000 text characters, 20 JPEG,
+PNG, GIF, or WebP images, 10 MiB per image, and 50 MiB total downloads. Only
+validated Slack-owned private-file URLs are authenticated. Context directories
+are granted to the delegated Claude session for that job and removed at terminal
+cleanup. Configure `cyrusHome` and `workspaceBaseDir` on storage with enough
+space for these temporary limits.
+
 ### `promptDefaults` (object)
 
 Sets default allowed tools for each prompt type across all repositories. Repository-specific configurations override these defaults.

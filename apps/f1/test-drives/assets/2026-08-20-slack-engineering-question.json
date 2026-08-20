@@ -1,0 +1,11 @@
+{
+	"action": "chat",
+	"fixture": {
+		"channel": "C_QUESTIONS",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660100.000100",
+		"kickoffTs": "1755660100.000100",
+		"text": "Which repository contains the dashboard code?",
+		"history": []
+	}
+}

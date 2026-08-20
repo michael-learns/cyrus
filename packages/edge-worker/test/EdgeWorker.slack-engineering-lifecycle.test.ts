@@ -5,13 +5,14 @@ import { describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 
 describe("EdgeWorker Slack engineering lifecycle", () => {
-	it("assembles the captured transcript before images in message/file order", async () => {
+	it("assembles the captured transcript before canonical capture-local images in message/file order", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "cyrus-slack-turn-"));
 		const transcriptPath = join(directory, "transcript.md");
 		await writeFile(transcriptPath, "authoritative transcript");
 		const worker: any = Object.create(EdgeWorker.prototype);
 
 		const turn = await worker.buildSlackEngineeringContextTurn({
+			directory,
 			transcriptPath,
 			manifest: {
 				messages: [
@@ -19,7 +20,7 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 						files: [
 							{
 								status: "downloaded",
-								localPath: "/context/one.png",
+								localPath: "images/one.png",
 								mimeType: "image/png",
 							},
 						],
@@ -28,12 +29,12 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 						files: [
 							{
 								status: "failed",
-								localPath: "/context/skip.png",
+								localPath: "images/skip.png",
 								mimeType: "image/png",
 							},
 							{
 								status: "downloaded",
-								localPath: "/context/two.jpg",
+								localPath: "images/two.jpg",
 								mimeType: "image/jpeg",
 							},
 						],
@@ -44,10 +45,14 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 
 		expect(turn).toEqual([
 			{ type: "text", text: "authoritative transcript" },
-			{ type: "local_image", path: "/context/one.png", mediaType: "image/png" },
 			{
 				type: "local_image",
-				path: "/context/two.jpg",
+				path: join(directory, "images/one.png"),
+				mediaType: "image/png",
+			},
+			{
+				type: "local_image",
+				path: join(directory, "images/two.jpg"),
 				mediaType: "image/jpeg",
 			},
 		]);

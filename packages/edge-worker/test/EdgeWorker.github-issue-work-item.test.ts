@@ -161,7 +161,30 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		);
 	});
 
-	it("locks Slack-created work items to Claude and repository model without trusting issue selectors", async () => {
+	it.each([
+		{
+			caseName: "repository model",
+			repositoryModel: "repo-claude",
+			defaultModel: "default-claude",
+			expectedModel: "repo-claude",
+		},
+		{
+			caseName: "workspace Claude default",
+			repositoryModel: undefined,
+			defaultModel: "default-claude",
+			expectedModel: "default-claude",
+		},
+		{
+			caseName: "built-in Claude fallback",
+			repositoryModel: undefined,
+			defaultModel: undefined,
+			expectedModel: "opus",
+		},
+	])("locks Slack-created work items to Claude and $caseName without trusting issue selectors", async ({
+		repositoryModel,
+		defaultModel,
+		expectedModel,
+	}) => {
 		const lockedWorker: any = Object.create(EdgeWorker.prototype);
 		lockedWorker.agentSessionManager = {
 			getSession: vi
@@ -185,10 +208,13 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		lockedWorker.createRunnerForType = vi.fn().mockReturnValue(runner);
 		lockedWorker.updateSlackWorkItemActivity = vi.fn();
 		lockedWorker.slackEngineeringOrchestrator = {
-			byWorkItem: vi.fn().mockReturnValue({ sourceKey: "source-key" }),
+			byWorkItem: vi.fn().mockReturnValue({
+				sourceKey: "source-key",
+				contextDirectories: ["/cyrus/slack-context/source-key"],
+			}),
 		};
-		lockedWorker.config = { claudeDefaultModel: "default-claude" };
-		const modelRepository = { ...repository, model: "repo-claude" };
+		lockedWorker.config = { claudeDefaultModel: defaultModel };
+		const modelRepository = { ...repository, model: repositoryModel };
 
 		await lockedWorker.createGitHubIssueRunner(
 			{
@@ -219,9 +245,10 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		const args = lockedWorker.buildAgentRunnerConfig.mock.calls[0];
 		expect(args[8]).toEqual([]);
 		expect(args[9]).toBe("[agent=claude]");
+		expect(args[5]).toContain("/cyrus/slack-context/source-key");
 		expect(lockedWorker.createRunnerForType).toHaveBeenCalledWith(
 			"claude",
-			expect.objectContaining({ model: "repo-claude" }),
+			expect.objectContaining({ model: expectedModel }),
 		);
 	});
 

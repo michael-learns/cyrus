@@ -1,0 +1,12 @@
+{
+	"action": "complete",
+	"failSlackDelivery": true,
+	"fixture": {
+		"channel": "C_ENGINEERING",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660200.000100",
+		"kickoffTs": "1755660204.000500",
+		"text": "Finish the implementation and report the pull request.",
+		"history": []
+	}
+}

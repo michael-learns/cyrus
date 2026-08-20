@@ -1,0 +1,12 @@
+{
+	"action": "status",
+	"failSlackDelivery": false,
+	"fixture": {
+		"channel": "C_ENGINEERING",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660200.000100",
+		"kickoffTs": "1755660205.000600",
+		"text": "What is the status after restart?",
+		"history": []
+	}
+}

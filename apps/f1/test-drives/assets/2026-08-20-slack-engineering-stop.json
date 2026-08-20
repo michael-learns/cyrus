@@ -1,0 +1,11 @@
+{
+	"action": "stop",
+	"fixture": {
+		"channel": "C_ENGINEERING",
+		"user": "U_REQUESTER",
+		"threadTs": "1755660200.000100",
+		"kickoffTs": "1755660207.000800",
+		"text": "Stop the new keyboard navigation task.",
+		"history": []
+	}
+}
