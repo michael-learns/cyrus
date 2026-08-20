@@ -224,6 +224,75 @@ describe("SlackMessageService", () => {
 	});
 
 	describe("fetchThreadMessages", () => {
+		it("fetches every root-to-trigger page in chronological order with structured content and a permalink", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						messages: [
+							{
+								user: "U2",
+								text: "second",
+								ts: "2.000",
+								blocks: [{ type: "section", elements: [] }],
+								files: [
+									{ id: "F1", name: "diagram.png", mimetype: "image/png" },
+								],
+							},
+							{ user: "U1", text: "root", ts: "1.000", attachments: [] },
+						],
+						has_more: true,
+						response_metadata: { next_cursor: "next-page" },
+					}),
+				})
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						messages: [
+							{ user: "U3", text: "kickoff", ts: "3.000" },
+							{ user: "U4", text: "too late", ts: "4.000" },
+						],
+						has_more: false,
+					}),
+				})
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						permalink: "https://workspace.slack.com/archives/C1/p1000",
+					}),
+				});
+
+			const result = await service.fetchThreadThrough({
+				token: "xoxb-secret",
+				channel: "C1",
+				thread_ts: "1.000",
+				trigger_ts: "3.000",
+			});
+
+			expect(result).toEqual({
+				messages: [
+					{ user: "U1", text: "root", ts: "1.000", attachments: [] },
+					{
+						user: "U2",
+						text: "second",
+						ts: "2.000",
+						blocks: [{ type: "section", elements: [] }],
+						files: [{ id: "F1", name: "diagram.png", mimetype: "image/png" }],
+					},
+					{ user: "U3", text: "kickoff", ts: "3.000" },
+				],
+				permalink: "https://workspace.slack.com/archives/C1/p1000",
+			});
+			const secondPage = new URL(mockFetch.mock.calls[1][0]);
+			expect(secondPage.searchParams.get("cursor")).toBe("next-page");
+			const permalinkCall = new URL(mockFetch.mock.calls[2][0]);
+			expect(permalinkCall.pathname).toBe("/api/chat.getPermalink");
+			expect(permalinkCall.searchParams.get("message_ts")).toBe("1.000");
+		});
+
 		it("fetches thread messages with correct GET params and Bearer auth", async () => {
 			mockFetch.mockResolvedValueOnce({
 				ok: true,

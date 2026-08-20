@@ -1,9 +1,11 @@
 export { SlackEventTransport } from "./SlackEventTransport.js";
 export type {
 	SlackFetchThreadParams,
+	SlackFetchThreadThroughParams,
 	SlackPostMessageParams,
 	SlackSetAssistantThreadStatusParams,
 	SlackThreadMessage,
+	SlackThreadSnapshot,
 } from "./SlackMessageService.js";
 export { SlackMessageService } from "./SlackMessageService.js";
 export {
@@ -15,13 +17,16 @@ export type { SlackReactionParams } from "./SlackReactionService.js";
 export { SlackReactionService } from "./SlackReactionService.js";
 export type {
 	SlackAppMentionEvent,
+	SlackBlock,
 	SlackChannel,
 	SlackEventEnvelope,
 	SlackEventPayload,
 	SlackEventTransportConfig,
 	SlackEventTransportEvents,
 	SlackEventType,
+	SlackFile,
 	SlackMessageAttachment,
+	SlackMessageAuthorProfile,
 	SlackMessageEvent,
 	SlackUser,
 	SlackVerificationMode,

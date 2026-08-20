@@ -1,3 +1,10 @@
+import type {
+	SlackBlock,
+	SlackFile,
+	SlackMessageAttachment,
+	SlackMessageAuthorProfile,
+} from "./types.js";
+
 /**
  * Service for posting messages to Slack channels.
  *
@@ -19,6 +26,29 @@ export interface SlackThreadMessage {
 	bot_id?: string;
 	/** Message subtype (e.g., "bot_message") */
 	subtype?: string;
+	/** Display name supplied for legacy/app-authored messages. */
+	username?: string;
+	/** Rich blocks, including labeled links. */
+	blocks?: SlackBlock[];
+	/** Shared/unfurled content. */
+	attachments?: SlackMessageAttachment[];
+	/** File metadata used by secure artifact capture. */
+	files?: SlackFile[];
+	/** Resolved human profile when supplied by Slack. */
+	user_profile?: SlackMessageAuthorProfile;
+	/** Resolved bot profile when supplied by Slack. */
+	bot_profile?: SlackMessageAuthorProfile;
+}
+
+export interface SlackFetchThreadThroughParams
+	extends Omit<SlackFetchThreadParams, "limit" | "oldest"> {
+	/** Include messages no later than this kickoff/trigger timestamp. */
+	trigger_ts: string;
+}
+
+export interface SlackThreadSnapshot {
+	messages: SlackThreadMessage[];
+	permalink: string;
 }
 
 /**
@@ -267,5 +297,81 @@ export class SlackMessageService {
 
 		// Enforce limit
 		return messages.slice(0, limit);
+	}
+
+	/** Fetch the complete thread through a trigger and its stable Slack permalink. */
+	async fetchThreadThrough(
+		params: SlackFetchThreadThroughParams,
+	): Promise<SlackThreadSnapshot> {
+		const { token, channel, thread_ts, trigger_ts } = params;
+		const messages: SlackThreadMessage[] = [];
+		let cursor: string | undefined;
+
+		do {
+			const query = new URLSearchParams({
+				channel,
+				ts: thread_ts,
+				latest: trigger_ts,
+				inclusive: "true",
+				limit: "200",
+			});
+			if (cursor) query.set("cursor", cursor);
+			const response = await fetch(
+				`${this.apiBaseUrl}/conversations.replies?${query.toString()}`,
+				{ method: "GET", headers: { Authorization: `Bearer ${token}` } },
+			);
+			if (!response.ok) {
+				throw new Error(
+					`[SlackMessageService] Failed to fetch thread messages: ${response.status} ${response.statusText}`,
+				);
+			}
+			const body = (await response.json()) as {
+				ok: boolean;
+				error?: string;
+				messages?: SlackThreadMessage[];
+				has_more?: boolean;
+				response_metadata?: { next_cursor?: string };
+			};
+			if (!body.ok) {
+				throw new Error(
+					`[SlackMessageService] Slack API error: ${body.error ?? "unknown"}`,
+				);
+			}
+			messages.push(...(body.messages ?? []));
+			cursor = body.has_more
+				? body.response_metadata?.next_cursor || undefined
+				: undefined;
+		} while (cursor);
+
+		const permalinkQuery = new URLSearchParams({
+			channel,
+			message_ts: thread_ts,
+		});
+		const permalinkResponse = await fetch(
+			`${this.apiBaseUrl}/chat.getPermalink?${permalinkQuery.toString()}`,
+			{ method: "GET", headers: { Authorization: `Bearer ${token}` } },
+		);
+		if (!permalinkResponse.ok) {
+			throw new Error(
+				`[SlackMessageService] Failed to fetch thread permalink: ${permalinkResponse.status} ${permalinkResponse.statusText}`,
+			);
+		}
+		const permalinkBody = (await permalinkResponse.json()) as {
+			ok: boolean;
+			error?: string;
+			permalink?: string;
+		};
+		if (!permalinkBody.ok || !permalinkBody.permalink) {
+			throw new Error(
+				`[SlackMessageService] Slack API error: ${permalinkBody.error ?? "missing_permalink"}`,
+			);
+		}
+
+		return {
+			messages: messages
+				.filter((message) => message.ts <= trigger_ts)
+				.sort((a, b) => a.ts.localeCompare(b.ts)),
+			permalink: permalinkBody.permalink,
+		};
 	}
 }

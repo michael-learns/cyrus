@@ -131,6 +131,17 @@ export interface SlackRichTextElement {
 	elements?: SlackRichTextElement[];
 }
 
+/** File metadata Slack includes on message events and thread replies. */
+export interface SlackFile {
+	id: string;
+	name?: string;
+	mimetype?: string;
+	filetype?: string;
+	size?: number;
+	url_private?: string;
+	url_private_download?: string;
+}
+
 /** A Slack block (rich_text or layout). */
 export interface SlackBlock {
 	/** Block kind (e.g. "rich_text", "section"). */
@@ -177,6 +188,12 @@ export interface SlackMessageAttachment {
 	channel_name?: string;
 	/** Footer line (e.g. the source app/integration name). */
 	footer?: string;
+	/** Link label Slack renders for an unfurled attachment. */
+	title?: string;
+	/** Link destination paired with `title`. */
+	title_link?: string;
+	/** Original URL that produced an unfurl. */
+	from_url?: string;
 	/** True when this attachment is a forwarded/shared message. */
 	is_share?: boolean;
 	/** True when this attachment is an unfurled message link. */
@@ -208,6 +225,14 @@ export interface SlackAppMentionEvent {
 	event_ts: string;
 	/** Message attachments (see {@link SlackMessageAttachment}). */
 	attachments?: SlackMessageAttachment[];
+	/** Rich message layout retained for context capture. */
+	blocks?: SlackBlock[];
+	/** Files attached to this message. */
+	files?: SlackFile[];
+	/** Resolved sender profile when Slack includes it. */
+	user_profile?: SlackMessageAuthorProfile;
+	/** Resolved bot profile for bot-authored messages. */
+	bot_profile?: SlackMessageAuthorProfile;
 }
 
 /**
@@ -244,6 +269,21 @@ export interface SlackMessageEvent {
 	event_ts: string;
 	/** Message attachments (see {@link SlackMessageAttachment}). */
 	attachments?: SlackMessageAttachment[];
+	/** Rich message layout retained for context capture. */
+	blocks?: SlackBlock[];
+	/** Files attached to this message. */
+	files?: SlackFile[];
+	/** Resolved sender profile when Slack includes it. */
+	user_profile?: SlackMessageAuthorProfile;
+	/** Resolved bot profile for bot-authored messages. */
+	bot_profile?: SlackMessageAuthorProfile;
+}
+
+/** Resolved sender identity Slack sometimes embeds in a message. */
+export interface SlackMessageAuthorProfile {
+	name?: string;
+	real_name?: string;
+	display_name?: string;
 }
 
 /**
