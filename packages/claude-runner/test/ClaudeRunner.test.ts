@@ -10,7 +10,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 vi.mock("fs", () => ({
 	mkdirSync: vi.fn(),
 	existsSync: vi.fn(() => false),
-	readFileSync: vi.fn(() => ""),
+	readFileSync: vi.fn((_path, encoding) =>
+		encoding ? "" : Buffer.from("image bytes"),
+	),
+	realpathSync: vi.fn((path) => path),
 	createWriteStream: vi.fn(() => ({
 		write: vi.fn(),
 		end: vi.fn(),
@@ -23,6 +26,7 @@ vi.mock("os", () => ({
 	homedir: vi.fn(() => "/mock/home"),
 }));
 
+import { readFileSync, realpathSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { AbortError, ClaudeRunner } from "../src/ClaudeRunner";
 import type { ClaudeRunnerConfig, SDKMessage } from "../src/types";
@@ -293,6 +297,190 @@ describe("ClaudeRunner", () => {
 			await runner.start("test");
 
 			expect(completeHandler).toHaveBeenCalledWith(mockMessages);
+		});
+	});
+
+	describe("structured turns", () => {
+		it("sends an initial text-image-text turn as one ordered SDK user message", async () => {
+			const capturedMessages: unknown[] = [];
+			mockQuery.mockImplementation(async function* ({ prompt }: any) {
+				for await (const message of prompt) capturedMessages.push(message);
+				yield {
+					type: "assistant",
+					message: { content: [] },
+					parent_tool_use_id: null,
+					session_id: "test-session",
+				} as any;
+			});
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			await structuredRunner.startTurn([
+				{ type: "text", text: "before" },
+				{
+					type: "local_image",
+					path: "/tmp/allowed/context.png",
+					mediaType: "image/png",
+				},
+				{ type: "text", text: "after" },
+			]);
+
+			expect(capturedMessages).toEqual([
+				{
+					type: "user",
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: "before" },
+							{
+								type: "image",
+								source: {
+									type: "base64",
+									media_type: "image/png",
+									data: "aW1hZ2UgYnl0ZXM=",
+								},
+							},
+							{ type: "text", text: "after" },
+						],
+					},
+					parent_tool_use_id: null,
+					session_id: "pending",
+				},
+			]);
+		});
+
+		it("streams ordered structured turns after a structured initial turn", async () => {
+			const capturedMessages: unknown[] = [];
+			let initialReceived!: () => void;
+			const received = new Promise<void>((resolve) => {
+				initialReceived = resolve;
+			});
+			mockQuery.mockImplementation(async function* ({ prompt }: any) {
+				const iterator = prompt[Symbol.asyncIterator]();
+				capturedMessages.push((await iterator.next()).value);
+				initialReceived();
+				capturedMessages.push((await iterator.next()).value);
+				yield {
+					type: "assistant",
+					message: { content: [] },
+					parent_tool_use_id: null,
+					session_id: "test-session",
+				} as any;
+			});
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			const startPromise = structuredRunner.startStreamingTurn([
+				{ type: "text", text: "initial" },
+			]);
+			await received;
+			structuredRunner.addStreamTurn([
+				{
+					type: "local_image",
+					path: "/tmp/allowed/follow-up.webp",
+					mediaType: "image/webp",
+				},
+				{ type: "text", text: "follow-up" },
+			]);
+			structuredRunner.completeStream();
+			await startPromise;
+
+			expect(capturedMessages).toEqual([
+				{
+					type: "user",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: "initial" }],
+					},
+					parent_tool_use_id: null,
+					session_id: "pending",
+				},
+				{
+					type: "user",
+					message: {
+						role: "user",
+						content: [
+							{
+								type: "image",
+								source: {
+									type: "base64",
+									media_type: "image/webp",
+									data: "aW1hZ2UgYnl0ZXM=",
+								},
+							},
+							{ type: "text", text: "follow-up" },
+						],
+					},
+					parent_tool_use_id: null,
+					session_id: "pending",
+				},
+			]);
+		});
+
+		it("rejects disallowed and unreadable local images without exposing paths", async () => {
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			await expect(
+				structuredRunner.startTurn([
+					{
+						type: "local_image",
+						path: "/secret/private.png",
+						mediaType: "image/png",
+					},
+				]),
+			).rejects.toThrow("Local image path is not allowed");
+
+			vi.mocked(realpathSync).mockImplementationOnce(() => {
+				throw new Error("ENOENT: /tmp/allowed/missing.png");
+			});
+			await expect(
+				structuredRunner.startTurn([
+					{
+						type: "local_image",
+						path: "/tmp/allowed/missing.png",
+						mediaType: "image/png",
+					},
+				]),
+			).rejects.toThrow("Unable to load local image");
+
+			vi.mocked(readFileSync).mockImplementationOnce(() => {
+				throw new Error("EACCES: /tmp/allowed/private.png");
+			});
+			const error = await structuredRunner
+				.startTurn([
+					{
+						type: "local_image",
+						path: "/tmp/allowed/private.png",
+						mediaType: "image/png",
+					},
+				])
+				.catch((caught) => caught as Error);
+			expect(error.message).toBe("Unable to load local image");
+			expect(error.message).not.toContain("/tmp/allowed/private.png");
+		});
+
+		it("rejects unsupported image media types at runtime", async () => {
+			const structuredRunner = new ClaudeRunner({
+				...defaultConfig,
+				allowedDirectories: ["/tmp/allowed"],
+			});
+
+			await expect(
+				structuredRunner.startTurn([
+					{
+						type: "local_image",
+						path: "/tmp/allowed/context.svg",
+						mediaType: "image/svg+xml",
+					} as any,
+				]),
+			).rejects.toThrow("Unsupported local image type");
 		});
 	});
 

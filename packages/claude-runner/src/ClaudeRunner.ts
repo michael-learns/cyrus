@@ -4,10 +4,11 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	realpathSync,
 	type WriteStream,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import {
 	type BackgroundTaskSummary,
 	type CanUseTool,
@@ -21,7 +22,12 @@ import {
 	type SessionCronSummary,
 	type StopHookInput,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentPendingWork, AskUserQuestionInput } from "cyrus-core";
+import type {
+	AgentLocalImagePart,
+	AgentPendingWork,
+	AgentTurn,
+	AskUserQuestionInput,
+} from "cyrus-core";
 import {
 	createLogger,
 	type IAgentRunner,
@@ -103,6 +109,13 @@ function serializeQueryOptionsReplacer(_key: string, value: unknown): unknown {
  * troubleshooting is unaffected.
  */
 type SanitizedQueryOptions = Record<string, unknown>;
+
+const SUPPORTED_LOCAL_IMAGE_MEDIA_TYPES = new Set([
+	"image/jpeg",
+	"image/png",
+	"image/gif",
+	"image/webp",
+]);
 
 function buildSanitizedQueryOptions(
 	queryOptions: Parameters<typeof query>[0],
@@ -417,6 +430,70 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		};
 	}
 
+	private toClaudeContent(
+		turn: AgentTurn,
+	): SDKUserMessage["message"]["content"] {
+		return turn.map((part) => {
+			if (part.type === "text") {
+				return { type: "text" as const, text: part.text };
+			}
+
+			return this.loadLocalImage(part);
+		});
+	}
+
+	private loadLocalImage(part: AgentLocalImagePart) {
+		if (!SUPPORTED_LOCAL_IMAGE_MEDIA_TYPES.has(part.mediaType)) {
+			throw new Error("Unsupported local image type");
+		}
+
+		let resolvedImagePath: string;
+		try {
+			resolvedImagePath = realpathSync(part.path);
+		} catch {
+			throw new Error("Unable to load local image");
+		}
+
+		const isAllowed = (this.config.allowedDirectories ?? []).some(
+			(allowedDirectory) => {
+				let resolvedAllowedDirectory: string;
+				try {
+					resolvedAllowedDirectory = realpathSync(allowedDirectory);
+				} catch {
+					return false;
+				}
+				const pathFromAllowedDirectory = relative(
+					resolvedAllowedDirectory,
+					resolvedImagePath,
+				);
+				return (
+					pathFromAllowedDirectory !== ".." &&
+					!pathFromAllowedDirectory.startsWith(`..${sep}`) &&
+					!isAbsolute(pathFromAllowedDirectory)
+				);
+			},
+		);
+		if (!isAllowed) {
+			throw new Error("Local image path is not allowed");
+		}
+
+		let data: Buffer;
+		try {
+			data = readFileSync(resolvedImagePath);
+		} catch {
+			throw new Error("Unable to load local image");
+		}
+
+		return {
+			type: "image" as const,
+			source: {
+				type: "base64" as const,
+				media_type: part.mediaType,
+				data: data.toString("base64"),
+			},
+		};
+	}
+
 	/**
 	 * Start a new Claude session with string prompt (legacy mode)
 	 */
@@ -424,11 +501,30 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		return this.startWithPrompt(prompt);
 	}
 
+	/** Start a new Claude session with one ordered structured user turn. */
+	async startTurn(turn: AgentTurn): Promise<ClaudeSessionInfo> {
+		if (this.isRunning()) {
+			throw new Error("Claude session already running");
+		}
+		return this.startWithPrompt(null, undefined, this.toClaudeContent(turn));
+	}
+
 	/**
 	 * Start a new Claude session with streaming input
 	 */
 	async startStreaming(initialPrompt?: string): Promise<ClaudeSessionInfo> {
 		return this.startWithPrompt(null, initialPrompt);
+	}
+
+	/** Start a new Claude session with structured streaming input. */
+	async startStreamingTurn(
+		initialTurn?: AgentTurn,
+	): Promise<ClaudeSessionInfo> {
+		if (this.isRunning()) {
+			throw new Error("Claude session already running");
+		}
+		const content = initialTurn ? this.toClaudeContent(initialTurn) : undefined;
+		return this.startWithPrompt(null, undefined, undefined, content);
 	}
 
 	/**
@@ -439,6 +535,14 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			throw new Error("Cannot add stream message when not in streaming mode");
 		}
 		this.streamingPrompt.addMessage(content);
+	}
+
+	/** Add an ordered structured user turn to the active stream. */
+	addStreamTurn(turn: AgentTurn): void {
+		if (!this.streamingPrompt) {
+			throw new Error("Cannot add stream turn when not in streaming mode");
+		}
+		this.streamingPrompt.addMessage(this.toClaudeContent(turn));
 	}
 
 	/**
@@ -456,6 +560,8 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	private async startWithPrompt(
 		stringPrompt?: string | null,
 		streamingInitialPrompt?: string,
+		oneShotContent?: SDKUserMessage["message"]["content"],
+		streamingInitialContent?: SDKUserMessage["message"]["content"],
 	): Promise<ClaudeSessionInfo> {
 		if (this.isRunning()) {
 			throw new Error("Claude session already running");
@@ -515,6 +621,14 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					`Starting query with string prompt length: ${stringPrompt.length} characters`,
 				);
 				promptForQuery = stringPrompt;
+			} else if (oneShotContent) {
+				// The SDK accepts structured content through its SDKUserMessage stream.
+				// Complete this one-message stream immediately so startTurn() retains
+				// start()'s one-shot lifecycle.
+				const oneShotPrompt = new StreamingPrompt(null);
+				oneShotPrompt.addMessage(oneShotContent);
+				oneShotPrompt.complete();
+				promptForQuery = oneShotPrompt;
 			} else {
 				// Streaming mode
 				this.logger.debug("Starting query with streaming prompt");
@@ -522,6 +636,9 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					null,
 					streamingInitialPrompt,
 				);
+				if (streamingInitialContent) {
+					this.streamingPrompt.addMessage(streamingInitialContent);
+				}
 				promptForQuery = this.streamingPrompt;
 			}
 

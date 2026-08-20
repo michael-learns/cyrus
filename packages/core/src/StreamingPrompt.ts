@@ -24,7 +24,7 @@ export class StreamingPrompt {
 		this.sessionId = sessionId;
 	}
 
-	addMessage(content: string): void {
+	addMessage(content: SDKUserMessage["message"]["content"]): void {
 		if (this.isComplete) {
 			throw new Error("Cannot add message to completed stream");
 		}

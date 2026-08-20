@@ -14,6 +14,35 @@ import type { AskUserQuestionInput as SDKAskUserQuestionInput } from "@anthropic
 import type { ILogger } from "./logging/ILogger.js";
 
 // ============================================================================
+// AGENT INPUT TYPES
+// ============================================================================
+
+/** Image media types accepted in provider-independent structured turns. */
+export type AgentImageMediaType =
+	| "image/jpeg"
+	| "image/png"
+	| "image/gif"
+	| "image/webp";
+
+/** A text segment in an ordered agent turn. */
+export interface AgentTextPart {
+	type: "text";
+	text: string;
+}
+
+/** A local image segment in an ordered agent turn. */
+export interface AgentLocalImagePart {
+	type: "local_image";
+	path: string;
+	mediaType: AgentImageMediaType;
+}
+
+export type AgentTurnPart = AgentTextPart | AgentLocalImagePart;
+
+/** Ordered text and local-image input supplied as one user turn. */
+export type AgentTurn = AgentTurnPart[];
+
+// ============================================================================
 // ASK USER QUESTION TYPES
 // ============================================================================
 // Re-export the SDK's AskUserQuestionInput type as the canonical input type.
@@ -258,6 +287,12 @@ export interface IAgentRunner {
 	start(prompt: string): Promise<AgentSessionInfo>;
 
 	/**
+	 * Start a session with one ordered structured user turn.
+	 * Optional so existing text-only runner implementations remain compatible.
+	 */
+	startTurn?(turn: AgentTurn): Promise<AgentSessionInfo>;
+
+	/**
 	 * Start a new agent session with streaming input support
 	 *
 	 * This method enables adding messages to the session dynamically after it has started.
@@ -280,6 +315,12 @@ export interface IAgentRunner {
 	startStreaming?(initialPrompt?: string): Promise<AgentSessionInfo>;
 
 	/**
+	 * Start a streaming session with an optional structured initial turn.
+	 * Optional so providers without structured input remain compatible.
+	 */
+	startStreamingTurn?(initialTurn?: AgentTurn): Promise<AgentSessionInfo>;
+
+	/**
 	 * Add a message to the streaming prompt
 	 *
 	 * Only works when the session was started with `startStreaming()`.
@@ -296,6 +337,9 @@ export interface IAgentRunner {
 	 * ```
 	 */
 	addStreamMessage?(content: string): void;
+
+	/** Add one ordered structured user turn to an active input stream. */
+	addStreamTurn?(turn: AgentTurn): void;
 
 	/**
 	 * Complete the streaming prompt (no more messages will be added)
