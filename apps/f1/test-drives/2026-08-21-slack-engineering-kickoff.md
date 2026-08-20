@@ -82,7 +82,7 @@ restart-status fixture.
 | Ordered text/image/link context | PASS | Structured turn contained issue text, then normalized transcript with the labeled acceptance-criteria link, then a canonical absolute PNG path under the private capture directory. |
 | Exactly one issue and retry | PASS | First kickoff created issue 1; identical retry retained the same source key/issue and issue count stayed 1. |
 | Claude lock/model precedence | PASS | Global default runner was deliberately `codex`; both Slack runners were recorded as Claude. Chat used `claude-f1-default`; delegated work used repository model `claude-f1-repo-model`. Slack/issue `[agent=codex]` and `[model=untrusted-model]` selectors did not change them. Focused unit coverage separately proves repository model → `claudeDefaultModel` → `opus` fallback. |
-| Active follow-up guidance | PASS | Latest authoritative Slack text, “Also keep the legend visible below 480px,” and its image reached the child in order. The image was validated and exclusively staged beneath a fresh random directory such as `initial-context/.followup-wpUUJT/image-001.png`; the separate source capture was cleaned. |
+| Active follow-up guidance | PASS | Latest authoritative Slack text, “Also keep the legend visible below 480px,” and its image reached the child in order. The image was validated and exclusively created as a collision-resistant hidden file directly under the canonical initial context, such as `initial-context/.followup-ec96e730-566a-415d-8df3-4f4f420305df-image-001.png`; the separate source capture was cleaned. |
 | PR/final delivery | PASS (synthetic boundary) | Production commit detection found the local synthetic commit, GitHub boundary returned PR 101, and the persisted Slack message contained the final summary and PR link. No live push/PR occurred. |
 | Failed delivery and restart | PASS | First Slack post was recorded `ok: false`; receipt restored after restart. A later verified Slack event triggered production replay and the identical post was recorded `ok: true`. |
 | Restored MCP status | PASS | After restart, `engineering_status` resolved the persisted receipt by verified Slack team/channel/thread identity and returned `awaiting_review`, issue 1, delivered status, and PR 101. |
@@ -155,6 +155,26 @@ attacker symlink. The fresh Fix Round 2 F1 drive at
 `/tmp/cyrus-f1-slack-fixround2-q7Uvl0` recorded the follow-up image at
 `.followup-wpUUJT/image-001.png`, kept issue count at one across retry, reported
 `externalRequests: []`, and removed the complete initial context on MCP stop.
+
+Fix Round 3 removed the intermediate `.followup-*` directory after identifying
+the remaining parent-substitution window between its validation and child-file
+creation. The RED mutation checks expected direct files but found only the old
+intermediate directory. GREEN revalidates the canonical initial context before
+each image, creates the final randomized hidden file there with
+`O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0600`, writes and syncs through the
+already-open handle, and requires the canonical result's parent to equal the
+trust root before exposure. A filesystem watcher attempts the old directory
+rename/symlink substitution; direct-file production gives it no directory to
+swap. Existing `followups` and `.followup-*` symlinks remain untouched, no
+outside file appears, and a real ClaudeRunner rejection removes every partial
+direct file plus the source capture.
+
+The Fix Round 3 F1 rerun used a fresh
+`/tmp/cyrus-f1-slack-fixround2-q7Uvl0/cyrus-home-fix3` state directory. Kickoff
+and retry remained issue 1, the follow-up turn recorded
+`.followup-ec96e730-566a-415d-8df3-4f4f420305df-image-001.png` directly below
+the initial context, all snapshots retained `externalRequests: []`, and MCP stop
+removed the full context and worktree.
 
 ## Limitations
 
