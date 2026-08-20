@@ -130,6 +130,74 @@ describe("SlackEngineeringOrchestrator", () => {
 		expect(retry.audit).toHaveBeenCalledWith("recovery", expect.any(Object));
 	});
 
+	it("fails closed after one uncertain POST until exact issue listing can see the marker", async () => {
+		const first = setup();
+		first.createIssue.mockRejectedValueOnce(
+			new Error("socket closed after POST"),
+		);
+		await expect(
+			first.service.createAndStart(source, {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			}),
+		).rejects.toThrow("socket closed after POST");
+		const uncertain = first.service.allReceipts();
+		expect(uncertain[0]).toMatchObject({ issueCreationState: "uncertain" });
+
+		const hidden = setup(uncertain);
+		await expect(
+			hidden.service.createAndStart(source, {
+				issueRepository: "acme/api",
+				title: "ignored",
+				summary: "ignored",
+			}),
+		).rejects.toThrow("visibility is uncertain");
+		expect(hidden.findIssueByMarker).toHaveBeenCalledOnce();
+		expect(hidden.createIssue).not.toHaveBeenCalled();
+
+		const visible = setup(hidden.service.allReceipts());
+		visible.findIssueByMarker.mockResolvedValue({
+			number: 42,
+			url: "https://github.com/acme/api/issues/42",
+		});
+		await visible.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "ignored",
+			summary: "ignored",
+		});
+		expect(visible.createIssue).not.toHaveBeenCalled();
+		expect(first.createIssue).toHaveBeenCalledOnce();
+	});
+
+	it("durably keeps a stop requested during delayed issue creation and never starts a child", async () => {
+		const { service, createIssue, startWorkItem, saves } = setup();
+		let releaseCreate!: () => void;
+		const createGate = new Promise<void>((resolve) => {
+			releaseCreate = resolve;
+		});
+		createIssue.mockImplementation(async () => {
+			await createGate;
+			return { number: 42, url: "https://github.com/acme/api/issues/42" };
+		});
+		const creating = service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+		});
+		await vi.waitFor(() => expect(createIssue).toHaveBeenCalledOnce());
+
+		const stopped = await service.stop(source.parentSessionId);
+		expect(stopped.status).toBe("stopped");
+		expect(saves.at(-1)?.[0]?.status).toBe("stopped");
+		releaseCreate();
+		const result = await creating;
+
+		expect(result.status).toBe("stopped");
+		expect(service.current(source.parentSessionId)?.status).toBe("stopped");
+		expect(startWorkItem).not.toHaveBeenCalled();
+	});
+
 	it("enforces one active job per thread and allows a later kickoff after terminal state", async () => {
 		const { service, createIssue } = setup();
 		const first = await service.createAndStart(source, {
@@ -199,12 +267,39 @@ describe("SlackEngineeringOrchestrator", () => {
 		expect(startWorkItem).not.toHaveBeenCalled();
 	});
 
+	it("can post after restoring a receipt whose durable pre-POST attempt never began", async () => {
+		const initial = setup();
+		const neverAttempted: SlackEngineeringReceipt = {
+			...source,
+			sourceKey:
+				"e30c15136e038aa126e57d878a36d9635772ab2b88bfdb07ba86043d1bedd982",
+			marker:
+				"<!-- cyrus-slack-source:e30c15136e038aa126e57d878a36d9635772ab2b88bfdb07ba86043d1bedd982 -->",
+			status: "creating",
+			issueCreationState: "not_attempted",
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+			targetRepositories: ["acme/api"],
+		};
+		initial.service.restore([neverAttempted]);
+
+		await initial.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "ignored",
+			summary: "ignored",
+		});
+
+		expect(initial.findIssueByMarker).not.toHaveBeenCalled();
+		expect(initial.createIssue).toHaveBeenCalledOnce();
+	});
+
 	it("propagates starting persistence failure before child startup", async () => {
 		const { service, createIssue, startWorkItem } = setup();
 		let writes = 0;
 		(service as any).deps.persist = vi.fn().mockImplementation(async () => {
 			writes++;
-			if (writes === 2) throw new Error("second write failed");
+			if (writes === 3) throw new Error("starting write failed");
 		});
 
 		await expect(
@@ -213,7 +308,7 @@ describe("SlackEngineeringOrchestrator", () => {
 				title: "Fix",
 				summary: "Fix",
 			}),
-		).rejects.toThrow("second write failed");
+		).rejects.toThrow("starting write failed");
 		expect(createIssue).toHaveBeenCalledOnce();
 		expect(startWorkItem).not.toHaveBeenCalled();
 	});

@@ -6,6 +6,63 @@ import { describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 
 describe("EdgeWorker Slack engineering lifecycle", () => {
+	it("recovers by paginated repository issue listing and an exact hidden marker line", async () => {
+		const priorFetch = globalThis.fetch;
+		const marker = "<!-- cyrus-slack-source:exact-source -->";
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify([
+						{
+							number: 1,
+							html_url: "https://github.com/acme/api/issues/1",
+							body: `${marker}-lookalike`,
+						},
+					]),
+					{
+						status: 200,
+						headers: {
+							link: '<https://api.github.com/repositories/1/issues?page=2>; rel="next"',
+						},
+					},
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify([
+						{
+							number: 42,
+							html_url: "https://github.com/acme/api/issues/42",
+							body: `body\n\n${marker}`,
+						},
+					]),
+					{ status: 200 },
+				),
+			);
+		globalThis.fetch = fetchMock;
+		try {
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("token");
+
+			await expect(
+				worker.findSlackEngineeringIssueByMarker("acme/api", marker),
+			).resolves.toEqual({
+				number: 42,
+				url: "https://github.com/acme/api/issues/42",
+			});
+			expect(fetchMock.mock.calls[0]![0]).toContain(
+				"/repos/acme/api/issues?state=all&per_page=100&page=1",
+			);
+			expect(fetchMock.mock.calls[1]![0]).toContain("page=2");
+			expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(
+				"/search/issues",
+			);
+		} finally {
+			globalThis.fetch = priorFetch;
+		}
+	});
+
 	it("assembles the captured transcript before canonical capture-local images in message/file order", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "cyrus-slack-turn-"));
 		const transcriptPath = join(directory, "transcript.md");
@@ -220,6 +277,115 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 				},
 			]),
 		).toThrow("Unable to load local image");
+	});
+
+	it("resumes an inactive Claude runner with exact ordered image bytes before capture cleanup", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-resume-"));
+		const followupContext = join(cyrusHome, "slack-context", "followup");
+		await mkdir(join(followupContext, "images"), { recursive: true });
+		await writeFile(join(followupContext, "images", "one.png"), "one");
+		await writeFile(join(followupContext, "images", "two.jpg"), "two");
+		const runner = new ClaudeRunner({
+			cyrusHome,
+			workingDirectory: cyrusHome,
+		});
+		let finishRunner!: () => void;
+		const runnerGate = new Promise<void>((resolve) => {
+			finishRunner = resolve;
+		});
+		const startWithPrompt = vi
+			.spyOn(runner as any, "startWithPrompt")
+			.mockImplementation(async () => {
+				await runnerGate;
+				return {
+					sessionId: "resumed",
+					startedAt: new Date(),
+					isRunning: false,
+				};
+			});
+		const workItem = {
+			workItemId: "work",
+			sessionId: "child",
+			runnerType: "claude",
+			repositoryFullName: "acme/api",
+			issueNumber: 42,
+			issue: { title: "Fix" },
+		};
+		const receipt = { workItemId: "work" };
+		const worker: any = Object.create(EdgeWorker.prototype);
+		worker.cyrusHome = cyrusHome;
+		worker.logger = { warn: vi.fn() };
+		worker.slackEngineeringOrchestrator = {
+			isActive: vi.fn().mockReturnValue(true),
+			current: vi.fn().mockReturnValue(receipt),
+		};
+		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+			manifest: {
+				directory: followupContext,
+				manifest: {
+					messages: [
+						{
+							text: "resume with screenshots",
+							files: [
+								{
+									status: "downloaded",
+									localPath: "images/one.png",
+									mimeType: "image/png",
+								},
+								{
+									status: "downloaded",
+									localPath: "images/two.jpg",
+									mimeType: "image/jpeg",
+								},
+							],
+						},
+					],
+				},
+			},
+		});
+		worker.getGitHubIssueWorkItemSession = vi.fn().mockReturnValue(workItem);
+		worker.agentSessionManager = {
+			getSession: vi.fn().mockReturnValue({ agentRunner: undefined }),
+			addAgentRunner: vi.fn(),
+		};
+		worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("token");
+		worker.fetchGitHubIssue = vi.fn().mockResolvedValue({
+			id: 42,
+			title: "Fix",
+			body: "Fix",
+		});
+		worker.runnerResumeSessionId = vi.fn().mockReturnValue("claude-old");
+		worker.createGitHubIssueRunner = vi.fn().mockResolvedValue(runner);
+		worker.runGitHubIssueWorkItem = vi.fn();
+
+		await worker.promptSlackEngineering("parent", "untrusted summary");
+
+		const content = startWithPrompt.mock.calls[0]?.[2];
+		expect(content?.map((part: { type: string }) => part.type)).toEqual([
+			"text",
+			"image",
+			"image",
+		]);
+		expect(content?.[0]).toEqual({
+			type: "text",
+			text: "resume with screenshots",
+		});
+		expect(content?.[1].source.data).toBe(
+			Buffer.from("one").toString("base64"),
+		);
+		expect(content?.[2].source.data).toBe(
+			Buffer.from("two").toString("base64"),
+		);
+		await expect(readFile(followupContext, "utf8")).rejects.toThrow();
+		expect(worker.runGitHubIssueWorkItem).toHaveBeenCalledWith(
+			workItem,
+			runner,
+			"",
+			"token",
+			undefined,
+			expect.any(Promise),
+		);
+		finishRunner();
 	});
 
 	it("never authorizes a capture that canonicalizes outside Slack context", async () => {

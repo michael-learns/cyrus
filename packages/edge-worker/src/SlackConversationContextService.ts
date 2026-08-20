@@ -14,6 +14,7 @@ const MAX_TEXT_CHARS = 100_000;
 const MAX_IMAGES = 20;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const SUPPORTED_IMAGES = new Map([
 	["image/jpeg", "jpg"],
 	["image/png", "png"],
@@ -95,6 +96,7 @@ export interface SlackConversationContextServiceOptions {
 	cyrusHome: string;
 	fetch?: typeof fetch;
 	logger?: CaptureLogger;
+	requestTimeoutMs?: number;
 }
 
 function isPrivateSlackFileUrl(value: string): boolean {
@@ -362,11 +364,14 @@ export class SlackConversationContextService {
 	private readonly cyrusHome: string;
 	private readonly fetchImpl: typeof fetch;
 	private readonly logger?: CaptureLogger;
+	private readonly requestTimeoutMs: number;
 
 	constructor(options: SlackConversationContextServiceOptions) {
 		this.cyrusHome = options.cyrusHome;
 		this.fetchImpl = options.fetch ?? fetch;
 		this.logger = options.logger;
+		this.requestTimeoutMs =
+			options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 	}
 
 	async capture(input: SlackConversationCaptureInput): Promise<{
@@ -638,8 +643,10 @@ export class SlackConversationContextService {
 				response = await this.fetchImpl(url.toString(), {
 					redirect: "manual",
 					headers: { Authorization: `Bearer ${token}` },
+					signal: AbortSignal.timeout(this.requestTimeoutMs),
 				});
 				if (![301, 302, 303, 307, 308].includes(response.status)) break;
+				await response.body?.cancel().catch(() => undefined);
 				if (redirects === 5)
 					return {
 						file: { ...result, reason: "unsafe_redirect" },

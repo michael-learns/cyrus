@@ -1558,41 +1558,12 @@ export class EdgeWorker extends EventEmitter {
 		status: "awaiting_review" | "failed" | "stopped",
 	): Promise<void> {
 		const events = this.slackWorkItemEvents?.get(workItem.workItemId);
-		const receipt = this.slackEngineeringOrchestrator?.byWorkItem(
+		const receipt = this.slackEngineeringOrchestrator?.byWorkItem?.(
 			workItem.workItemId,
 		);
 		if (receipt) {
-			const finalSummary = this.githubWorkItemFinalSummary(workItem);
-			const text =
-				status === "awaiting_review"
-					? `Finished *${workItem.issue.title}*.${finalSummary ? `\n\n${finalSummary}` : ""}\n\nPull request${workItem.prUrls.length === 1 ? "" : "s"}:\n${workItem.prUrls.map((url) => `- <${url}|${url}>`).join("\n")}`
-					: status === "stopped"
-						? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
-						: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
-			try {
-				await this.slackEngineeringOrchestrator.markTerminalDeliveryPending(
-					workItem.workItemId,
-					status,
-					text,
-					{ prUrls: workItem.prUrls, error: workItem.error },
-				);
-			} catch {
-				const liveToken = events?.get(receipt.parentSessionId)?.slackBotToken;
-				if (liveToken) {
-					this.slackRuntimeTokens ??= new Map();
-					this.slackRuntimeTokens.set(receipt.teamId, liveToken);
-				}
-				this.slackEngineeringOrchestrator.auditDecision(
-					"delivery_persistence_deferred",
-					receipt,
-				);
-				this.logger.warn("Slack engineering delivery persistence deferred", {
-					sourceKey: receipt.sourceKey,
-					decision: "delivery_persistence_deferred",
-				});
-				this.scheduleSlackEngineeringDeliveryRetry(receipt.teamId);
+			if (!(await this.persistSlackWorkItemTerminalReceipt(workItem, status)))
 				return;
-			}
 			try {
 				await this.cleanupSlackContextDirectories(receipt);
 				this.chatSessionHandler?.setDelegatedWorkActive(
@@ -1658,6 +1629,57 @@ export class EdgeWorker extends EventEmitter {
 		}
 		this.slackWorkItemEvents?.delete(workItem.workItemId);
 		await this.savePersistedState();
+	}
+
+	private slackWorkItemTerminalMessage(
+		workItem: GitHubIssueWorkItemSession,
+		status: "awaiting_review" | "failed" | "stopped",
+	): string {
+		const finalSummary = this.githubWorkItemFinalSummary(workItem);
+		return status === "awaiting_review"
+			? `Finished *${workItem.issue.title}*.${finalSummary ? `\n\n${finalSummary}` : ""}\n\nPull request${workItem.prUrls.length === 1 ? "" : "s"}:\n${workItem.prUrls.map((url) => `- <${url}|${url}>`).join("\n")}`
+			: status === "stopped"
+				? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
+				: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
+	}
+
+	private async persistSlackWorkItemTerminalReceipt(
+		workItem: GitHubIssueWorkItemSession,
+		status: "awaiting_review" | "failed" | "stopped",
+	): Promise<boolean> {
+		const receipt = this.slackEngineeringOrchestrator?.byWorkItem?.(
+			workItem.workItemId,
+		);
+		if (!receipt) return true;
+		if (receipt.status === status && receipt.deliveryStatus === "pending")
+			return true;
+		try {
+			await this.slackEngineeringOrchestrator!.markTerminalDeliveryPending(
+				workItem.workItemId,
+				status,
+				this.slackWorkItemTerminalMessage(workItem, status),
+				{ prUrls: workItem.prUrls, error: workItem.error },
+			);
+			return true;
+		} catch {
+			const event = this.slackWorkItemEvents
+				?.get(workItem.workItemId)
+				?.get(receipt.parentSessionId);
+			if (event?.slackBotToken) {
+				this.slackRuntimeTokens ??= new Map();
+				this.slackRuntimeTokens.set(receipt.teamId, event.slackBotToken);
+			}
+			this.slackEngineeringOrchestrator!.auditDecision(
+				"delivery_persistence_deferred",
+				receipt,
+			);
+			this.logger.warn("Slack engineering delivery persistence deferred", {
+				sourceKey: receipt.sourceKey,
+				decision: "delivery_persistence_deferred",
+			});
+			this.scheduleSlackEngineeringDeliveryRetry(receipt.teamId);
+			return false;
+		}
 	}
 
 	private async deliverSlackEngineeringReceipt(
@@ -2225,6 +2247,17 @@ export class EdgeWorker extends EventEmitter {
 			);
 			return { sessionId, status: "starting" };
 		} catch (error) {
+			workItemSession.error =
+				error instanceof Error ? error.message : String(error);
+			if (
+				!(await this.persistSlackWorkItemTerminalReceipt(
+					workItemSession,
+					"failed",
+				))
+			) {
+				workItemSession.status = "failed";
+				throw error;
+			}
 			this.gitHubIssueWorkItemSessions.delete(request.workItemId);
 			this.agentSessionManager.removeSession(sessionId);
 			await this.gitService.deleteWorktree(issueIdentifier, {
@@ -2304,6 +2337,8 @@ export class EdgeWorker extends EventEmitter {
 	): Promise<void> {
 		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
 		if (!workItem) return;
+		if (!(await this.persistSlackWorkItemTerminalReceipt(workItem, "stopped")))
+			return;
 		this.setGitHubIssueWorkItemStatus(workItem, "stopped");
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (session) {
@@ -2416,6 +2451,7 @@ export class EdgeWorker extends EventEmitter {
 		prompt: string,
 		token: string,
 		initialTurn?: AgentTurn,
+		startedTurn?: Promise<unknown>,
 	): Promise<void> {
 		this.setGitHubIssueWorkItemStatus(workItem, "in_progress");
 		await this.slackEngineeringOrchestrator?.setStatus(
@@ -2428,7 +2464,9 @@ export class EdgeWorker extends EventEmitter {
 			runnerType: workItem.runnerType,
 		});
 		try {
-			if (initialTurn && runner.startTurn) {
+			if (startedTurn) {
+				await startedTurn;
+			} else if (initialTurn && runner.startTurn) {
 				await runner.startTurn([
 					{ type: "text", text: prompt },
 					...initialTurn,
@@ -2450,6 +2488,15 @@ export class EdgeWorker extends EventEmitter {
 				);
 			}
 			workItem.prUrls = prUrls;
+			if (
+				!(await this.persistSlackWorkItemTerminalReceipt(
+					workItem,
+					"awaiting_review",
+				))
+			) {
+				workItem.status = "awaiting_review";
+				return;
+			}
 			await this.gitHubCommentService.postIssueComment({
 				token,
 				owner: workItem.repositoryFullName.split("/")[0]!,
@@ -2484,6 +2531,12 @@ export class EdgeWorker extends EventEmitter {
 				`GitHub Issue session failed for ${workItem.repositoryFullName}#${workItem.issueNumber}`,
 				err,
 			);
+			if (
+				!(await this.persistSlackWorkItemTerminalReceipt(workItem, "failed"))
+			) {
+				workItem.status = "failed";
+				return;
+			}
 			await this.reportGitHubWorkItemStatus(workItem.workItemId, {
 				status: "failed",
 				sessionId: workItem.sessionId,
@@ -7921,20 +7974,18 @@ ${taskSection}`;
 					"No active engineering job exists for this Slack thread",
 				);
 			const workItem = this.getGitHubIssueWorkItemSession(receipt.workItemId);
-			const runner =
-				workItem &&
-				this.agentSessionManager.getSession(workItem.sessionId)?.agentRunner;
-			if (runner?.isRunning() && runner.addStreamTurn && images.length) {
-				if (!runner.allowLocalImageDirectory)
-					throw new Error(
-						"Agent runner cannot authorize follow-up Slack images",
-					);
+			const session =
+				workItem && this.agentSessionManager.getSession(workItem.sessionId);
+			const runner = session?.agentRunner;
+			if (images.length) {
 				const canonicalCapture = await this.containedSlackContextDirectory(
 					manifest.directory,
 				);
 				if (!canonicalCapture)
 					throw new Error("Follow-up capture escaped Slack context");
-				const capturedImages: AgentTurn = [];
+				const capturedTurn: AgentTurn = [
+					{ type: "text", text: authoritativeText },
+				];
 				for (const file of images) {
 					const canonicalImage = await realpath(
 						resolve(canonicalCapture, file.localPath!),
@@ -7948,7 +7999,7 @@ ${taskSection}`;
 						throw new Error(
 							"Follow-up image escaped its captured Slack context",
 						);
-					capturedImages.push({
+					capturedTurn.push({
 						type: "local_image",
 						path: canonicalImage,
 						mediaType: file.mimeType as
@@ -7958,11 +8009,52 @@ ${taskSection}`;
 							| "image/webp",
 					});
 				}
-				imageDirectoryLease = runner.allowLocalImageDirectory(canonicalCapture);
-				runner.addStreamTurn([
-					{ type: "text", text: authoritativeText },
-					...capturedImages,
-				]);
+				if (runner?.isRunning()) {
+					if (!runner.addStreamTurn || !runner.allowLocalImageDirectory)
+						throw new Error(
+							"Active Claude runner cannot accept follow-up Slack images",
+						);
+					imageDirectoryLease =
+						runner.allowLocalImageDirectory(canonicalCapture);
+					runner.addStreamTurn(capturedTurn);
+					return receipt;
+				}
+				if (!workItem || !session)
+					throw new Error("Engineering Claude session is no longer available");
+				if (workItem.runnerType !== "claude")
+					throw new Error("Slack engineering follow-ups require Claude");
+				const token = await this.resolveGitHubTokenValue();
+				if (!token) throw new Error("GitHub authentication is unavailable");
+				const githubIssue = await this.fetchGitHubIssue(
+					workItem.repositoryFullName,
+					workItem.issueNumber,
+					token,
+				);
+				const resumedRunner = await this.createGitHubIssueRunner(
+					workItem,
+					githubIssue,
+					token,
+					this.runnerResumeSessionId(session, "claude"),
+				);
+				if (!resumedRunner.startTurn || !resumedRunner.allowLocalImageDirectory)
+					throw new Error(
+						"Resumed Claude runner cannot accept follow-up Slack images",
+					);
+				this.agentSessionManager.addAgentRunner(
+					workItem.sessionId,
+					resumedRunner,
+				);
+				imageDirectoryLease =
+					resumedRunner.allowLocalImageDirectory(canonicalCapture);
+				const startedTurn = resumedRunner.startTurn(capturedTurn);
+				void this.runGitHubIssueWorkItem(
+					workItem,
+					resumedRunner,
+					"",
+					token,
+					undefined,
+					startedTurn,
+				);
 				return receipt;
 			}
 			return await this.slackEngineeringOrchestrator.prompt(
@@ -8013,36 +8105,35 @@ ${taskSection}`;
 	): Promise<{ number: number; url: string } | undefined> {
 		const token = await this.resolveGitHubTokenValue();
 		if (!token) throw new Error("GitHub authentication is unavailable");
-		const markerKey = marker.replace(/^<!-- cyrus-slack-source:| -->$/g, "");
-		const query = encodeURIComponent(
-			`repo:${repository} is:issue in:body cyrus-slack-source:${markerKey}`,
-		);
-		const response = await fetch(
-			`https://api.github.com/search/issues?q=${query}&per_page=100`,
-			{
-				headers: {
-					Accept: "application/vnd.github+json",
-					Authorization: `Bearer ${token}`,
-					"User-Agent": "cyrus-ai",
-					"X-GitHub-Api-Version": "2022-11-28",
+		for (let page = 1; page <= 10; page++) {
+			const response = await fetch(
+				`https://api.github.com/repos/${repository}/issues?state=all&per_page=100&page=${page}&sort=created&direction=desc`,
+				{
+					headers: {
+						Accept: "application/vnd.github+json",
+						Authorization: `Bearer ${token}`,
+						"User-Agent": "cyrus-ai",
+						"X-GitHub-Api-Version": "2022-11-28",
+					},
 				},
-			},
-		);
-		if (!response.ok)
-			throw new Error(`GitHub Issue recovery failed (${response.status})`);
-		const payload = (await response.json()) as {
-			items?: Array<{
+			);
+			if (!response.ok)
+				throw new Error(`GitHub Issue recovery failed (${response.status})`);
+			const issues = (await response.json()) as Array<{
 				number: number;
 				html_url: string;
 				body?: string | null;
 				pull_request?: unknown;
 			}>;
-		};
-		const issues = payload.items ?? [];
-		const found = issues.find(
-			(issue) => !issue.pull_request && issue.body?.includes(marker),
-		);
-		return found ? { number: found.number, url: found.html_url } : undefined;
+			const found = issues.find(
+				(issue) =>
+					!issue.pull_request &&
+					issue.body?.split(/\r?\n/).some((line) => line.trim() === marker),
+			);
+			if (found) return { number: found.number, url: found.html_url };
+			if (!response.headers.get("link")?.includes('rel="next"')) break;
+		}
+		return undefined;
 	}
 
 	private handleChildSessionMapping(

@@ -142,6 +142,31 @@ describe("SyntheticSlackEngineeringBackend", () => {
 		});
 	});
 
+	it("lists issues only from the requested repository for exact marker recovery", async () => {
+		const backend = new SyntheticSlackEngineeringBackend();
+		for (const repository of ["acme/app", "other/app"]) {
+			await backend.fetch(`https://api.github.com/repos/${repository}/issues`, {
+				method: "POST",
+				body: JSON.stringify({
+					title: repository,
+					body: "details\n<!-- cyrus-slack-source:shared123 -->",
+				}),
+			});
+		}
+
+		const response = await backend.fetch(
+			"https://api.github.com/repos/other/app/issues?state=all&per_page=100&page=1",
+		);
+
+		expect(await response.json()).toEqual([
+			expect.objectContaining({
+				number: 2,
+				body: expect.stringContaining("shared123"),
+			}),
+		]);
+		expect(backend.snapshot().externalRequests).toEqual([]);
+	});
+
 	it("restores synthetic issues across an F1 server restart", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "cyrus-f1-backend-"));
 		const statePath = join(directory, "backend.json");

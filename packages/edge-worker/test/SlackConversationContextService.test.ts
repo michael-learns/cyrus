@@ -335,6 +335,97 @@ describe("SlackConversationContextService", () => {
 		).toEqual(["unsafe_host", "unsafe_redirect"]);
 	});
 
+	it("aborts each Slack media request at its configured timeout", async () => {
+		let observedSignal: AbortSignal | undefined;
+		fetchMock.mockImplementation(async (_url, init) => {
+			observedSignal = init?.signal ?? undefined;
+			if (!observedSignal) throw new Error("missing abort signal");
+			await new Promise((_, reject) => {
+				observedSignal!.addEventListener("abort", () =>
+					reject(observedSignal!.reason),
+				);
+			});
+			throw new Error("unreachable");
+		});
+		const timedService = new SlackConversationContextService({
+			cyrusHome,
+			fetch: fetchMock as typeof fetch,
+			requestTimeoutMs: 5,
+		});
+
+		const result = await timedService.capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "file",
+					ts: "1",
+					files: [
+						{
+							id: "F1",
+							name: "one.png",
+							mimetype: "image/png",
+							url_private: "https://files.slack.com/one.png",
+						},
+					],
+				},
+			],
+		});
+
+		expect(observedSignal?.aborted).toBe(true);
+		expect(result.manifest.messages[0].files[0]).toEqual(
+			expect.objectContaining({ status: "failed", reason: "download_failed" }),
+		);
+	});
+
+	it("cancels a redirect response body before following it", async () => {
+		let redirectCancelled = false;
+		fetchMock
+			.mockResolvedValueOnce({
+				status: 302,
+				headers: new Headers({ location: "https://files.slack.com/two.png" }),
+				body: new ReadableStream({
+					cancel() {
+						redirectCancelled = true;
+					},
+				}),
+			} as Response)
+			.mockResolvedValueOnce(
+				new Response(PNG, { headers: { "content-type": "image/png" } }),
+			);
+
+		await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "file",
+					ts: "1",
+					files: [
+						{
+							id: "F1",
+							name: "one.png",
+							mimetype: "image/png",
+							url_private: "https://files.slack.com/one.png",
+						},
+					],
+				},
+			],
+		});
+
+		expect(redirectCancelled).toBe(true);
+	});
+
 	it.each([
 		"https://slack.com/file.png",
 		"https://api.slack.com/file.png",

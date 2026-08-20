@@ -469,6 +469,209 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		);
 	});
 
+	it.each([
+		{
+			outcome: "completion",
+			runnerError: undefined,
+			status: "awaiting_review",
+		},
+		{
+			outcome: "failure",
+			runnerError: new Error("agent crashed"),
+			status: "failed",
+		},
+	])("persists the terminal Slack receipt before $outcome reporting", async ({
+		runnerError,
+		status,
+	}) => {
+		worker.runGitHubIssueWorkItem = EdgeWorker.prototype.runGitHubIssueWorkItem;
+		runner.start = runnerError
+			? vi.fn().mockRejectedValue(runnerError)
+			: vi.fn().mockResolvedValue(undefined);
+		worker.findGitHubIssuePullRequests = vi
+			.fn()
+			.mockResolvedValue(["https://github.com/cyrusagents/cyrus/pull/18"]);
+		worker.gitHubCommentService = { postIssueComment: vi.fn() };
+		worker.logger = { error: vi.fn(), warn: vi.fn() };
+		worker.scheduleSlackEngineeringDeliveryRetry = vi.fn();
+		worker.slackWorkItemEvents = new Map();
+		const receipt = {
+			sourceKey: "source",
+			workItemId: "work-item-17",
+			teamId: "T1",
+			parentSessionId: "parent",
+		};
+		const order: string[] = [];
+		worker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue(receipt),
+			setStatus: vi.fn(),
+			markTerminalDeliveryPending: vi.fn(async () => {
+				order.push("persist-terminal");
+				return receipt;
+			}),
+			clearContextDirectories: vi.fn(),
+			markDeliveryDelivered: vi.fn(),
+			auditDecision: vi.fn(),
+		};
+		worker.cleanupSlackContextDirectories = vi.fn();
+		worker.reportGitHubWorkItemStatus = vi.fn(async (_id, update) => {
+			if (update.status === status) order.push("report-terminal");
+		});
+		const workItem: any = {
+			workItemId: "work-item-17",
+			sessionId: "github-issue-work-item-17",
+			repository,
+			repositoryFullName: "cyrusagents/cyrus",
+			issueNumber: 17,
+			prUrls: [],
+			runnerType: "claude",
+			issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+			status: "starting",
+		};
+		worker.gitHubIssueWorkItemSessions.set(workItem.workItemId, workItem);
+
+		await worker.runGitHubIssueWorkItem(workItem, runner, "implement", "token");
+
+		expect(order.slice(0, 2)).toEqual(["persist-terminal", "report-terminal"]);
+	});
+
+	it.each([
+		{ outcome: "completion", runnerError: undefined },
+		{ outcome: "failure", runnerError: new Error("agent crashed") },
+	])("does not report or clean up $outcome when terminal receipt persistence rejects", async ({
+		runnerError,
+	}) => {
+		worker.runGitHubIssueWorkItem = EdgeWorker.prototype.runGitHubIssueWorkItem;
+		runner.start = runnerError
+			? vi.fn().mockRejectedValue(runnerError)
+			: vi.fn().mockResolvedValue(undefined);
+		worker.findGitHubIssuePullRequests = vi
+			.fn()
+			.mockResolvedValue(["https://github.com/cyrusagents/cyrus/pull/18"]);
+		worker.gitHubCommentService = { postIssueComment: vi.fn() };
+		worker.logger = { error: vi.fn(), warn: vi.fn() };
+		worker.scheduleSlackEngineeringDeliveryRetry = vi.fn();
+		worker.slackWorkItemEvents = new Map();
+		worker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue({
+				sourceKey: "source",
+				workItemId: "work-item-17",
+				teamId: "T1",
+				parentSessionId: "parent",
+			}),
+			setStatus: vi.fn(),
+			markTerminalDeliveryPending: vi
+				.fn()
+				.mockRejectedValue(new Error("disk unavailable")),
+			auditDecision: vi.fn(),
+		};
+		const workItem: any = {
+			workItemId: "work-item-17",
+			sessionId: "github-issue-work-item-17",
+			repository,
+			repositoryFullName: "cyrusagents/cyrus",
+			issueNumber: 17,
+			prUrls: [],
+			runnerType: "claude",
+			issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+			status: "starting",
+		};
+		worker.gitHubIssueWorkItemSessions.set(workItem.workItemId, workItem);
+
+		await worker.runGitHubIssueWorkItem(workItem, runner, "implement", "token");
+
+		expect(worker.reportGitHubWorkItemStatus).not.toHaveBeenCalledWith(
+			"work-item-17",
+			expect.objectContaining({
+				status: expect.stringMatching(/awaiting_review|failed/),
+			}),
+		);
+		expect(worker.agentSessionManager.removeSession).not.toHaveBeenCalled();
+		expect(worker.gitService.deleteWorktree).not.toHaveBeenCalled();
+	});
+
+	it("does not destructively stop before the stopped receipt is durable", async () => {
+		worker.gitHubIssueWorkItemSessions.set("work-item-17", {
+			workItemId: "work-item-17",
+			sessionId: "github-issue-work-item-17",
+			repository,
+			repositories: [repository],
+			repositoryFullName: "cyrusagents/cyrus",
+			issueNumber: 17,
+			issueIdentifier: "GH-cyrus-17",
+			branchName: "cyrus/fix",
+			prUrls: [],
+			runnerType: "claude",
+			issue: { id: "42", title: "Fix" },
+			status: "in_progress",
+		});
+		worker.logger = { warn: vi.fn() };
+		worker.scheduleSlackEngineeringDeliveryRetry = vi.fn();
+		worker.slackWorkItemEvents = new Map();
+		worker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue({
+				sourceKey: "source",
+				workItemId: "work-item-17",
+				teamId: "T1",
+				parentSessionId: "parent",
+			}),
+			markTerminalDeliveryPending: vi
+				.fn()
+				.mockRejectedValue(new Error("disk unavailable")),
+			auditDecision: vi.fn(),
+		};
+
+		await worker.stopGitHubIssueWorkItem("work-item-17", {
+			requestId: "stop",
+			reason: "user_requested",
+		});
+
+		expect(worker.agentSessionManager.removeSession).not.toHaveBeenCalled();
+		expect(worker.gitService.deleteWorktree).not.toHaveBeenCalled();
+		expect(worker.reportGitHubWorkItemStatus).not.toHaveBeenCalledWith(
+			"work-item-17",
+			expect.objectContaining({ status: "stopped" }),
+		);
+	});
+
+	it("does not remove a failed startup session before its terminal receipt is durable", async () => {
+		worker.createGitHubIssueRunner.mockRejectedValue(
+			new Error("runner startup failed"),
+		);
+		worker.logger = { warn: vi.fn() };
+		worker.scheduleSlackEngineeringDeliveryRetry = vi.fn();
+		worker.slackWorkItemEvents = new Map();
+		worker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue({
+				sourceKey: "source",
+				workItemId: "work-item-17",
+				teamId: "T1",
+				parentSessionId: "parent",
+			}),
+			markTerminalDeliveryPending: vi
+				.fn()
+				.mockRejectedValue(new Error("disk unavailable")),
+			auditDecision: vi.fn(),
+		};
+
+		await expect(
+			worker.startGitHubIssueWorkItem({
+				workItemId: "work-item-17",
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 17,
+				runnerType: "claude",
+				requestId: "request-17",
+			}),
+		).rejects.toThrow("runner startup failed");
+
+		expect(worker.agentSessionManager.removeSession).not.toHaveBeenCalled();
+		expect(worker.gitService.deleteWorktree).not.toHaveBeenCalled();
+		expect(worker.reportGitHubWorkItemStatus).not.toHaveBeenCalledWith(
+			"work-item-17",
+			expect.objectContaining({ status: "failed" }),
+		);
+	});
+
 	it("streams each human GitHub comment only once", async () => {
 		runner.isRunning.mockReturnValue(true);
 		runner.supportsStreamingInput = true;

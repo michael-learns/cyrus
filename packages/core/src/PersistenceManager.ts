@@ -1,5 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	open,
+	readFile,
+	rename,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -92,6 +100,11 @@ export interface SerializableEdgeWorkerState {
 		targetRepositories: string[];
 		issueNumber?: number;
 		issueUrl?: string;
+		issueCreationState?:
+			| "not_attempted"
+			| "attempting"
+			| "uncertain"
+			| "created";
 		workItemId?: string;
 		sessionId?: string;
 		prUrls?: string[];
@@ -120,6 +133,7 @@ export interface V3SerializableEdgeWorkerState {
 export class PersistenceManager {
 	private persistencePath: string;
 	private logger: ILogger;
+	private saveQueue: Promise<void> = Promise.resolve();
 
 	constructor(persistencePath?: string, logger?: ILogger) {
 		this.persistencePath =
@@ -145,18 +159,56 @@ export class PersistenceManager {
 	 * Save EdgeWorker state to disk (single file for all repositories)
 	 */
 	async saveEdgeWorkerState(state: SerializableEdgeWorkerState): Promise<void> {
-		try {
-			await this.ensurePersistenceDirectory();
-			const stateFile = this.getEdgeWorkerStateFilePath();
-			const stateData = {
+		const stateData = JSON.stringify(
+			{
 				version: PERSISTENCE_VERSION,
 				savedAt: new Date().toISOString(),
 				state,
-			};
-			await writeFile(stateFile, JSON.stringify(stateData, null, 2), "utf8");
+			},
+			null,
+			2,
+		);
+		const operation = this.saveQueue.then(async () => {
+			try {
+				await this.ensurePersistenceDirectory();
+				const stateFile = this.getEdgeWorkerStateFilePath();
+				await this.writeStateAtomically(stateFile, stateData);
+			} catch (error) {
+				this.logger.error("Failed to save EdgeWorker state:", error);
+				throw error;
+			}
+		});
+		this.saveQueue = operation.catch(() => undefined);
+		return operation;
+	}
+
+	private async writeStateAtomically(
+		stateFile: string,
+		stateData: string,
+	): Promise<void> {
+		const tempFile = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
+		try {
+			await this.writeTempFile(tempFile, stateData);
+			await rename(tempFile, stateFile);
+			const directoryHandle = await open(this.persistencePath, "r");
+			try {
+				await directoryHandle.sync();
+			} finally {
+				await directoryHandle.close();
+			}
 		} catch (error) {
-			this.logger.error("Failed to save EdgeWorker state:", error);
+			await unlink(tempFile).catch(() => undefined);
 			throw error;
+		}
+	}
+
+	private async writeTempFile(path: string, data: string): Promise<void> {
+		await writeFile(path, data, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		const handle = await open(path, "r");
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
 		}
 	}
 

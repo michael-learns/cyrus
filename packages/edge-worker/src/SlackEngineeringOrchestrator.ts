@@ -36,6 +36,7 @@ export interface SlackEngineeringReceipt extends SlackEngineeringSource {
 	targetRepositories: string[];
 	issueNumber?: number;
 	issueUrl?: string;
+	issueCreationState?: "not_attempted" | "attempting" | "uncertain" | "created";
 	workItemId?: string;
 	sessionId?: string;
 	prUrls?: string[];
@@ -306,6 +307,7 @@ export class SlackEngineeringOrchestrator {
 				title: input.title,
 				summary: input.summary,
 				targetRepositories: Array.from(new Set(targets)),
+				issueCreationState: "not_attempted",
 				contextDirectories: source.contextDirectory
 					? [source.contextDirectory]
 					: [],
@@ -317,31 +319,49 @@ export class SlackEngineeringOrchestrator {
 			receipt.issueNumber && receipt.issueUrl
 				? { number: receipt.issueNumber, url: receipt.issueUrl }
 				: undefined;
-		if (!issue && recoveringCreatingReceipt) {
+		if (
+			!issue &&
+			recoveringCreatingReceipt &&
+			receipt.issueCreationState !== "not_attempted"
+		) {
 			this.audit("recovery", receipt);
-			for (const delayMs of [0, 250, 1_000]) {
-				if (delayMs > 0)
-					await new Promise((resolve) => setTimeout(resolve, delayMs));
-				issue = await this.deps.findIssueByMarker(
-					receipt.issueRepository,
-					receipt.marker,
+			issue = await this.deps.findIssueByMarker(
+				receipt.issueRepository,
+				receipt.marker,
+			);
+			if (!issue)
+				throw new Error(
+					"GitHub Issue creation visibility is uncertain; retry later",
 				);
-				if (issue) break;
+		}
+		if (!issue) {
+			receipt.issueCreationState = "attempting";
+			await this.persist();
+			try {
+				issue = await this.deps.createIssue({
+					repository: receipt.issueRepository,
+					title: receipt.title,
+					body: `${receipt.summary}\n\nRepositories:\n${receipt.targetRepositories.map((repository) => `- ${repository}`).join("\n")}\n\nSlack thread: ${receipt.permalink}\n\n${receipt.marker}`,
+					marker: receipt.marker,
+				});
+			} catch (error) {
+				receipt.issueCreationState = "uncertain";
+				await this.persist();
+				throw error;
 			}
 		}
-		if (!issue)
-			issue = await this.deps.createIssue({
-				repository: receipt.issueRepository,
-				title: receipt.title,
-				body: `${receipt.summary}\n\nRepositories:\n${receipt.targetRepositories.map((repository) => `- ${repository}`).join("\n")}\n\nSlack thread: ${receipt.permalink}\n\n${receipt.marker}`,
-				marker: receipt.marker,
-			});
 		receipt.issueNumber = issue.number;
 		receipt.issueUrl = issue.url;
+		receipt.issueCreationState = "created";
+		if (receipt.status === "stopped") {
+			await this.persist();
+			return receipt;
+		}
 		receipt.workItemId ??= `slack-${receipt.sourceKey}`;
 		receipt.status = "starting";
 		receipt.error = undefined;
 		await this.persist();
+		if (this.isStopped(receipt)) return receipt;
 		let started: Awaited<ReturnType<Dependencies["startWorkItem"]>>;
 		try {
 			started = await this.deps.startWorkItem({
@@ -456,9 +476,9 @@ export class SlackEngineeringOrchestrator {
 	}
 	async stop(parentSessionId: string): Promise<SlackEngineeringReceipt> {
 		const receipt = this.requireCurrent(parentSessionId);
-		if (receipt.workItemId) await this.deps.stopWorkItem(receipt.workItemId);
 		receipt.status = "stopped";
 		await this.persist();
+		if (receipt.workItemId) await this.deps.stopWorkItem(receipt.workItemId);
 		this.audit("stop", receipt);
 		return receipt;
 	}
@@ -467,6 +487,9 @@ export class SlackEngineeringOrchestrator {
 		if (!receipt)
 			throw new Error("No engineering job exists for this Slack thread");
 		return receipt;
+	}
+	private isStopped(receipt: SlackEngineeringReceipt): boolean {
+		return receipt.status === "stopped";
 	}
 	private index(receipt: SlackEngineeringReceipt): void {
 		this.receipts.set(receipt.sourceKey, receipt);

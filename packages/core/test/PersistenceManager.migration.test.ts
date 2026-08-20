@@ -19,6 +19,12 @@ vi.mock("node:fs/promises", () => ({
 	mkdir: vi.fn(),
 	readFile: vi.fn(),
 	writeFile: vi.fn(),
+	rename: vi.fn(),
+	unlink: vi.fn(),
+	open: vi.fn().mockResolvedValue({
+		sync: vi.fn().mockResolvedValue(undefined),
+		close: vi.fn().mockResolvedValue(undefined),
+	}),
 }));
 
 describe("PersistenceManager", () => {

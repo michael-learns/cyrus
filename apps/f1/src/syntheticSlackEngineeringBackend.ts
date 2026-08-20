@@ -175,6 +175,17 @@ export class SyntheticSlackEngineeringBackend {
 				this.persist();
 				return json({ number, html_url: htmlUrl }, 201);
 			}
+			if (issueCollection && method === "GET") {
+				return json(
+					this.issues
+						.filter((issue) => issue.repository === issueCollection[1])
+						.map((issue) => ({
+							number: issue.number,
+							html_url: issue.htmlUrl,
+							body: issue.body,
+						})),
+				);
+			}
 
 			if (url.pathname === "/search/issues") {
 				const query = url.searchParams.get("q") ?? "";
