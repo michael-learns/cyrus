@@ -34,6 +34,9 @@ function setup(initial: SlackEngineeringReceipt[] = []) {
 		sessionId: "github-issue-slack-source-work",
 		status: "starting" as const,
 	});
+	const promptWorkItem = vi.fn();
+	const stopWorkItem = vi.fn();
+	const audit = vi.fn();
 	const service = new SlackEngineeringOrchestrator(
 		{
 			repositories: () => repositories,
@@ -42,12 +45,22 @@ function setup(initial: SlackEngineeringReceipt[] = []) {
 			createIssue,
 			findIssueByMarker,
 			startWorkItem,
-			promptWorkItem: vi.fn(),
-			stopWorkItem: vi.fn(),
+			promptWorkItem,
+			stopWorkItem,
+			audit,
 		},
 		initial,
 	);
-	return { service, saves, createIssue, findIssueByMarker, startWorkItem };
+	return {
+		service,
+		saves,
+		createIssue,
+		findIssueByMarker,
+		startWorkItem,
+		promptWorkItem,
+		stopWorkItem,
+		audit,
+	};
 }
 
 describe("SlackEngineeringOrchestrator", () => {
@@ -114,6 +127,7 @@ describe("SlackEngineeringOrchestrator", () => {
 			"acme/api",
 			persisted[0]!.marker,
 		);
+		expect(retry.audit).toHaveBeenCalledWith("recovery", expect.any(Object));
 	});
 
 	it("enforces one active job per thread and allows a later kickoff after terminal state", async () => {
@@ -166,5 +180,289 @@ describe("SlackEngineeringOrchestrator", () => {
 				targetRepositories: ["acme/api", "unknown/repo"],
 			}),
 		).rejects.toThrow("not an active configured GitHub repository");
+	});
+
+	it("propagates creating persistence failure before GitHub POST", async () => {
+		const { service, createIssue, startWorkItem } = setup();
+		(service as any).deps.persist = vi
+			.fn()
+			.mockRejectedValue(new Error("disk full"));
+
+		await expect(
+			service.createAndStart(source, {
+				issueRepository: "acme/api",
+				title: "Fix",
+				summary: "Fix",
+			}),
+		).rejects.toThrow("disk full");
+		expect(createIssue).not.toHaveBeenCalled();
+		expect(startWorkItem).not.toHaveBeenCalled();
+	});
+
+	it("propagates starting persistence failure before child startup", async () => {
+		const { service, createIssue, startWorkItem } = setup();
+		let writes = 0;
+		(service as any).deps.persist = vi.fn().mockImplementation(async () => {
+			writes++;
+			if (writes === 2) throw new Error("second write failed");
+		});
+
+		await expect(
+			service.createAndStart(source, {
+				issueRepository: "acme/api",
+				title: "Fix",
+				summary: "Fix",
+			}),
+		).rejects.toThrow("second write failed");
+		expect(createIssue).toHaveBeenCalledOnce();
+		expect(startWorkItem).not.toHaveBeenCalled();
+	});
+
+	it("recovers a restored starting receipt by retrying the same child start", async () => {
+		const initial = setup();
+		await initial.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+		});
+		const restored = initial.service
+			.allReceipts()
+			.map((receipt) => ({ ...receipt, status: "starting" as const }));
+		const retry = setup(restored);
+
+		const result = await retry.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "ignored",
+			summary: "ignored",
+		});
+
+		expect(retry.createIssue).not.toHaveBeenCalled();
+		expect(retry.startWorkItem).toHaveBeenCalledOnce();
+		expect(retry.startWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({
+				workItemId: restored[0]!.workItemId,
+				issueNumber: 42,
+			}),
+		);
+		expect(result.sessionId).toBe("github-issue-slack-source-work");
+	});
+
+	it("durably marks failed startup and permits same-source recovery", async () => {
+		const first = setup();
+		first.startWorkItem.mockRejectedValueOnce(new Error("startup failed"));
+		await expect(
+			first.service.createAndStart(source, {
+				issueRepository: "acme/api",
+				title: "Fix",
+				summary: "Fix",
+			}),
+		).rejects.toThrow("startup failed");
+		expect(first.saves.at(-1)?.[0]).toMatchObject({
+			status: "failed",
+			error: "startup failed",
+		});
+		const retry = setup(first.saves.at(-1)!);
+
+		await retry.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "ignored",
+			summary: "ignored",
+		});
+		expect(retry.createIssue).not.toHaveBeenCalled();
+		expect(retry.startWorkItem).toHaveBeenCalledOnce();
+	});
+
+	it("shares one in-flight create across truly concurrent calls", async () => {
+		const { service, createIssue, startWorkItem } = setup();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		createIssue.mockImplementation(async () => {
+			await gate;
+			return { number: 42, url: "https://github.com/acme/api/issues/42" };
+		});
+		const input = { issueRepository: "acme/api", title: "Fix", summary: "Fix" };
+
+		const first = service.createAndStart(source, input);
+		const second = service.createAndStart(source, input);
+		release();
+		const [a, b] = await Promise.all([first, second]);
+
+		expect(a).toBe(b);
+		expect(createIssue).toHaveBeenCalledOnce();
+		expect(startWorkItem).toHaveBeenCalledOnce();
+	});
+
+	it("normalizes the primary repository first and removes duplicate targets", async () => {
+		const { service, startWorkItem } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+			targetRepositories: ["acme/web", "api", "acme/web"],
+		});
+		expect(receipt.targetRepositories).toEqual(["acme/api", "acme/web"]);
+		expect(startWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({
+				targetRepositoryFullNames: ["acme/api", "acme/web"],
+			}),
+		);
+	});
+
+	it("scopes current, status actions, prompt, and stop to the parent thread", async () => {
+		const { service, promptWorkItem, stopWorkItem } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+		});
+		expect(service.current("other-session")).toBeUndefined();
+		await expect(service.prompt("other-session", "change it")).rejects.toThrow(
+			"No engineering job exists",
+		);
+		await service.prompt(source.parentSessionId, "change it");
+		expect(promptWorkItem).toHaveBeenCalledWith(
+			receipt.workItemId,
+			"change it",
+		);
+		await expect(service.stop("other-session")).rejects.toThrow(
+			"No engineering job exists",
+		);
+		await service.stop(source.parentSessionId);
+		expect(stopWorkItem).toHaveBeenCalledWith(receipt.workItemId);
+	});
+
+	it("rejects new context artifacts for terminal receipts", async () => {
+		const { service } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+		});
+		await service.setStatus(receipt.workItemId!, "awaiting_review");
+		await expect(
+			service.addContextDirectory(source.parentSessionId, "/tmp/new-context"),
+		).rejects.toThrow("No active engineering job");
+	});
+
+	it("persists pending terminal delivery before marking it delivered", async () => {
+		const { service, saves } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+		});
+		await service.markTerminalDeliveryPending(
+			receipt.workItemId!,
+			"awaiting_review",
+			"Finished work",
+		);
+		expect(saves.at(-1)?.[0]).toMatchObject({
+			status: "awaiting_review",
+			deliveryStatus: "pending",
+			deliveryMessage: "Finished work",
+		});
+		await service.markDeliveryDelivered(receipt.workItemId!);
+		expect(saves.at(-1)?.[0]?.deliveryStatus).toBe("delivered");
+	});
+
+	it("keeps delivery pending in memory when the delivered write fails", async () => {
+		const { service } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix",
+			summary: "Fix",
+		});
+		await service.markTerminalDeliveryPending(
+			receipt.workItemId!,
+			"awaiting_review",
+			"Finished work",
+		);
+		(service as any).deps.persist = vi
+			.fn()
+			.mockRejectedValue(new Error("disk unavailable"));
+
+		await expect(
+			service.markDeliveryDelivered(receipt.workItemId!),
+		).rejects.toThrow("disk unavailable");
+		expect(service.pendingDeliveries()).toHaveLength(1);
+	});
+
+	it("restore replaces all receipt and index state", async () => {
+		const first = setup();
+		await first.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Old",
+			summary: "Old",
+		});
+		const replacement = {
+			...first.service.allReceipts()[0]!,
+			sourceKey: "replacement",
+			parentSessionId: "new-parent",
+			kickoffTs: "999.0",
+		};
+		first.service.restore([replacement]);
+		expect(first.service.current(source.parentSessionId)).toBeUndefined();
+		expect(first.service.current("new-parent")?.sourceKey).toBe("replacement");
+	});
+
+	it("emits body-free structured audit decisions", async () => {
+		const { service, audit } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "secret title",
+			summary: "secret body",
+		});
+		service.listRepositories();
+		service.current(source.parentSessionId);
+		service.status(source.parentSessionId);
+		await service.setStatus(receipt.workItemId!, "in_progress");
+		await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "secret title",
+			summary: "secret body",
+		});
+		await service.prompt(source.parentSessionId, "secret follow-up");
+		await service.stop(source.parentSessionId);
+		await service.markTerminalDeliveryPending(
+			receipt.workItemId!,
+			"stopped",
+			"secret delivery body",
+		);
+		await service.markDeliveryDelivered(receipt.workItemId!);
+		await expect(
+			service.createAndStart(
+				{ ...source, kickoffTs: "999" },
+				{
+					issueRepository: "unknown/private-repository",
+					title: "secret rejected title",
+					summary: "secret rejected body",
+				},
+			),
+		).rejects.toThrow();
+		const decisions = audit.mock.calls.map(([decision]) => decision);
+		expect(decisions).toEqual(
+			expect.arrayContaining([
+				"create_and_start",
+				"repositories_list",
+				"current",
+				"status",
+				"duplicate_return",
+				"prompt",
+				"stop",
+				"delivery_pending",
+				"delivery_delivered",
+				"validation_rejected",
+			]),
+		);
+		const serialized = JSON.stringify(audit.mock.calls);
+		expect(serialized).not.toContain("secret title");
+		expect(serialized).not.toContain("secret body");
+		expect(serialized).not.toContain("secret follow-up");
+		expect(serialized).not.toContain("secret delivery body");
+		expect(serialized).not.toContain("unknown/private-repository");
+		expect(serialized).not.toContain("example.slack.com");
+		expect(serialized).not.toContain("/tmp/context");
 	});
 });

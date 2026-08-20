@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
 	McpServerConfig,
@@ -27,6 +27,7 @@ import type {
 	AgentRunnerConfig,
 	AgentSessionCreatedWebhook,
 	AgentSessionPromptedWebhook,
+	AgentTurn,
 	BaseBranchResolution,
 	ContentUpdateMessage,
 	CyrusAgentSession,
@@ -885,6 +886,7 @@ export class EdgeWorker extends EventEmitter {
 		this.registerGitHubEventTransport();
 		this.registerGitLabEventTransport();
 		this.registerSlackEventTransport();
+		await this.replayPendingSlackEngineeringDeliveries();
 
 		// 3. Create and register ConfigUpdater (both platforms)
 		this.configUpdater = new ConfigUpdater(
@@ -1535,35 +1537,44 @@ export class EdgeWorker extends EventEmitter {
 		workItem: GitHubIssueWorkItemSession,
 		status: "awaiting_review" | "failed" | "stopped",
 	): Promise<void> {
-		let events = this.slackWorkItemEvents?.get(workItem.workItemId);
+		const events = this.slackWorkItemEvents?.get(workItem.workItemId);
 		const receipt = this.slackEngineeringOrchestrator?.byWorkItem(
 			workItem.workItemId,
 		);
-		if (
-			(!events || events.size === 0) &&
-			receipt &&
-			process.env.SLACK_BOT_TOKEN
-		) {
-			events = new Map([
-				[
-					receipt.parentSessionId,
-					{
-						eventType: "message",
-						eventId: `restored-${receipt.sourceKey}`,
-						teamId: receipt.teamId,
-						slackBotToken: process.env.SLACK_BOT_TOKEN,
-						payload: {
-							type: "message",
-							user: receipt.userId,
-							text: "",
-							ts: receipt.kickoffTs,
-							event_ts: receipt.kickoffTs,
-							channel: receipt.channelId,
-							thread_ts: receipt.threadTs,
-						},
-					} as SlackWebhookEvent,
-				],
-			]);
+		if (receipt) {
+			const finalSummary = this.githubWorkItemFinalSummary(workItem);
+			const text =
+				status === "awaiting_review"
+					? `Finished *${workItem.issue.title}*.${finalSummary ? `\n\n${finalSummary}` : ""}\n\nPull request${workItem.prUrls.length === 1 ? "" : "s"}:\n${workItem.prUrls.map((url) => `- <${url}|${url}>`).join("\n")}`
+					: status === "stopped"
+						? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
+						: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
+			await this.slackEngineeringOrchestrator.markTerminalDeliveryPending(
+				workItem.workItemId,
+				status,
+				text,
+				{ prUrls: workItem.prUrls, error: workItem.error },
+			);
+			await this.cleanupSlackContextDirectories(receipt);
+			this.chatSessionHandler?.setDelegatedWorkActive(
+				receipt.parentSessionId,
+				false,
+				workItem.workItemId,
+			);
+			await this.deliverSlackEngineeringReceipt(
+				receipt,
+				events?.get(receipt.parentSessionId),
+				false,
+			);
+			const event = events?.get(receipt.parentSessionId);
+			if (
+				event &&
+				this.slackChatAdapter &&
+				!this.chatSessionHandler?.hasDelegatedWork(receipt.parentSessionId)
+			)
+				await this.slackChatAdapter.clearActivityStatus(event);
+			this.slackWorkItemEvents?.delete(workItem.workItemId);
+			return;
 		}
 		if (events && this.slackChatAdapter) {
 			const finalSummary = this.githubWorkItemFinalSummary(workItem);
@@ -1595,27 +1606,104 @@ export class EdgeWorker extends EventEmitter {
 			);
 		}
 		this.slackWorkItemEvents?.delete(workItem.workItemId);
-		await this.slackEngineeringOrchestrator?.setStatus(
-			workItem.workItemId,
-			status,
-			{ prUrls: workItem.prUrls, error: workItem.error },
-		);
-		if (receipt) {
-			const directories = new Set([
-				...(receipt.contextDirectories ?? []),
-				...(receipt.contextDirectory ? [receipt.contextDirectory] : []),
-			]);
-			await Promise.all(
-				Array.from(directories).map((directory) =>
-					rm(directory, { recursive: true, force: true }),
-				),
-			);
-			receipt.contextDirectory = undefined;
-			receipt.contextManifestPath = undefined;
-			receipt.contextTranscriptPath = undefined;
-			receipt.contextDirectories = [];
-		}
 		await this.savePersistedState();
+	}
+
+	private async deliverSlackEngineeringReceipt(
+		receipt: SlackEngineeringReceipt,
+		liveEvent?: SlackWebhookEvent,
+		replay = true,
+	): Promise<void> {
+		if (!this.slackChatAdapter || !receipt.deliveryMessage) return;
+		const token = liveEvent?.slackBotToken ?? process.env.SLACK_BOT_TOKEN;
+		if (!token) {
+			this.slackEngineeringOrchestrator.auditDecision(
+				"delivery_deferred",
+				receipt,
+			);
+			return;
+		}
+		const event =
+			liveEvent ??
+			({
+				eventType: "message",
+				eventId: `restored-${receipt.sourceKey}`,
+				teamId: receipt.teamId,
+				slackBotToken: token,
+				payload: {
+					type: "message",
+					user: receipt.userId,
+					text: "",
+					ts: receipt.kickoffTs,
+					event_ts: receipt.kickoffTs,
+					channel: receipt.channelId,
+					thread_ts: receipt.threadTs,
+				},
+			} as SlackWebhookEvent);
+		if (replay)
+			this.slackEngineeringOrchestrator.auditDecision(
+				"delivery_replay",
+				receipt,
+			);
+		try {
+			await this.slackChatAdapter.postDelegatedWorkMessage(
+				event,
+				receipt.deliveryMessage,
+			);
+			await this.slackEngineeringOrchestrator.markDeliveryDelivered(
+				receipt.workItemId!,
+			);
+			this.slackEngineeringOrchestrator.auditDecision(
+				"delivery_result",
+				receipt,
+			);
+		} catch {
+			this.slackEngineeringOrchestrator.auditDecision(
+				"delivery_failed",
+				receipt,
+			);
+			this.logger.warn("Slack engineering delivery remains pending", {
+				sourceKey: receipt.sourceKey,
+				decision: "delivery_failed",
+			});
+		}
+	}
+
+	private async replayPendingSlackEngineeringDeliveries(): Promise<void> {
+		for (const receipt of this.slackEngineeringOrchestrator.pendingDeliveries())
+			await this.deliverSlackEngineeringReceipt(receipt, undefined, true);
+	}
+
+	private async cleanupSlackContextDirectories(
+		receipt?: SlackEngineeringReceipt,
+		extraDirectories: string[] = [],
+	): Promise<void> {
+		const root = resolve(join(this.cyrusHome, "slack-context"));
+		const directories = new Set([
+			...(receipt?.contextDirectories ?? []),
+			...(receipt?.contextDirectory ? [receipt.contextDirectory] : []),
+			...extraDirectories,
+		]);
+		for (const directory of directories) {
+			const candidate = resolve(directory);
+			const rel = relative(root, candidate);
+			if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+				this.logger.warn("Ignored unsafe Slack context cleanup target", {
+					sourceKey: receipt?.sourceKey,
+					decision: "cleanup_rejected",
+				});
+				this.slackEngineeringOrchestrator.auditDecision(
+					"cleanup_rejected",
+					receipt,
+				);
+				continue;
+			}
+			await rm(candidate, { recursive: true, force: true });
+		}
+		if (receipt?.workItemId)
+			await this.slackEngineeringOrchestrator.clearContextDirectories(
+				receipt.workItemId,
+			);
 	}
 
 	private githubWorkItemFinalSummary(
@@ -1680,7 +1768,7 @@ export class EdgeWorker extends EventEmitter {
 				);
 				this.agentSessionManager.addAgentRunner(existing.sessionId, runner);
 				this.setGitHubIssueWorkItemStatus(existing, "starting");
-				void this.runGitHubIssueWorkItem(
+				this.launchGitHubIssueWorkItem(
 					existing,
 					runner,
 					this.buildGitHubIssueTaskPrompt(
@@ -1688,6 +1776,7 @@ export class EdgeWorker extends EventEmitter {
 						existing.repositoryFullName,
 					),
 					token,
+					request.initialTurn,
 				);
 				return { sessionId: existing.sessionId, status: "starting" };
 			}
@@ -1905,7 +1994,7 @@ export class EdgeWorker extends EventEmitter {
 				runnerType: request.runnerType,
 			});
 
-			void this.runGitHubIssueWorkItem(
+			this.launchGitHubIssueWorkItem(
 				workItemSession,
 				runner,
 				this.buildGitHubIssueTaskPrompt(
@@ -1913,6 +2002,7 @@ export class EdgeWorker extends EventEmitter {
 					request.repositoryFullName,
 				),
 				token,
+				request.initialTurn,
 			);
 			return { sessionId, status: "starting" };
 		} catch (error) {
@@ -2028,7 +2118,9 @@ export class EdgeWorker extends EventEmitter {
 	): Promise<IAgentRunner> {
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (!session) throw new Error(`Missing session ${workItem.sessionId}`);
-		const slackEngineering = workItem.workItemId.startsWith("slack-");
+		const slackEngineering = Boolean(
+			this.slackEngineeringOrchestrator?.byWorkItem(workItem.workItemId),
+		);
 		const labels = (slackEngineering ? [] : (githubIssue.labels ?? []))
 			.map((label) => label.name)
 			.filter((name): name is string => Boolean(name));
@@ -2094,15 +2186,25 @@ export class EdgeWorker extends EventEmitter {
 		runner: IAgentRunner,
 		prompt: string,
 		token: string,
+		initialTurn?: AgentTurn,
 	): Promise<void> {
 		this.setGitHubIssueWorkItemStatus(workItem, "in_progress");
+		await this.slackEngineeringOrchestrator?.setStatus(
+			workItem.workItemId,
+			"in_progress",
+		);
 		await this.reportGitHubWorkItemStatus(workItem.workItemId, {
 			status: "in_progress",
 			sessionId: workItem.sessionId,
 			runnerType: workItem.runnerType,
 		});
 		try {
-			if (runner.supportsStreamingInput && runner.startStreaming) {
+			if (initialTurn && runner.startTurn) {
+				await runner.startTurn([
+					{ type: "text", text: prompt },
+					...initialTurn,
+				]);
+			} else if (runner.supportsStreamingInput && runner.startStreaming) {
 				await runner.startStreaming(prompt);
 			} else {
 				await runner.start(prompt);
@@ -2169,6 +2271,26 @@ export class EdgeWorker extends EventEmitter {
 			);
 		}
 		await this.savePersistedState();
+	}
+
+	private launchGitHubIssueWorkItem(
+		workItem: GitHubIssueWorkItemSession,
+		runner: IAgentRunner,
+		prompt: string,
+		token: string,
+		initialTurn?: AgentTurn,
+	): void {
+		if (initialTurn) {
+			void this.runGitHubIssueWorkItem(
+				workItem,
+				runner,
+				prompt,
+				token,
+				initialTurn,
+			);
+			return;
+		}
+		void this.runGitHubIssueWorkItem(workItem, runner, prompt, token);
 	}
 
 	private async fetchGitHubIssue(
@@ -2520,14 +2642,6 @@ Investigate across every participating repository. Modify only repositories that
 		status: GitHubIssueWorkItemSession["status"],
 	): void {
 		workItem.status = status;
-		void this.slackEngineeringOrchestrator?.setStatus(
-			workItem.workItemId,
-			status,
-			{
-				prUrls: workItem.prUrls,
-				error: workItem.error,
-			},
-		);
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (session?.metadata?.githubWorkItem) {
 			session.metadata.githubWorkItem.status = status;
@@ -7342,7 +7456,7 @@ ${taskSection}`;
 				current: async () =>
 					this.slackEngineeringOrchestrator.current(parentSessionId) ?? null,
 				status: async () =>
-					this.slackEngineeringOrchestrator.current(parentSessionId) ?? null,
+					this.slackEngineeringOrchestrator.status(parentSessionId) ?? null,
 				prompt: ({ message }) =>
 					this.promptSlackEngineering(parentSessionId, message),
 				stop: () => this.slackEngineeringOrchestrator.stop(parentSessionId),
@@ -7374,7 +7488,7 @@ ${taskSection}`;
 							...(repository.projectKeys ?? []),
 						],
 					})),
-			persist: async () => this.savePersistedState(),
+			persist: async () => this.savePersistedStateStrict(),
 			createIssue: (input) =>
 				this.createSlackEngineeringIssue(
 					input.repository,
@@ -7399,6 +7513,8 @@ ${taskSection}`;
 					requestId: randomUUID(),
 					reason: "user_requested",
 				}),
+			audit: (decision, fields) =>
+				this.logger.info("Slack engineering audit", { ...fields, decision }),
 		});
 	}
 
@@ -7459,73 +7575,123 @@ ${taskSection}`;
 			targetRepositories?: string[];
 		},
 	): Promise<SlackEngineeringReceipt> {
-		const { source } =
+		try {
+			this.slackEngineeringOrchestrator.validateCreateInput(input);
+		} catch (error) {
+			const event =
+				this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
+			this.logger.info("Slack engineering audit", {
+				decision: "validation_rejected",
+				teamId: event?.teamId,
+				userId: event?.payload.user,
+				channelId: event?.payload.channel,
+				threadTs: event?.payload.thread_ts || event?.payload.ts,
+			});
+			throw error;
+		}
+		const { source, manifest } =
 			await this.captureSlackEngineeringSource(parentSessionId);
-		const receipt = await this.slackEngineeringOrchestrator.createAndStart(
-			source,
-			input,
-		);
+		let receipt: SlackEngineeringReceipt;
+		try {
+			const initialTurn = await this.buildSlackEngineeringContextTurn(manifest);
+			receipt = await this.slackEngineeringOrchestrator.createAndStart(
+				source,
+				input,
+				initialTurn,
+			);
+		} catch (error) {
+			await this.cleanupSlackContextDirectories(undefined, [
+				manifest.directory,
+			]);
+			throw error;
+		}
 		await this.attachSlackSubscriber(receipt.workItemId!, parentSessionId);
-		this.logger.info("Slack engineering decision", {
-			sourceKey: receipt.sourceKey,
-			teamId: receipt.teamId,
-			userId: receipt.userId,
-			channelId: receipt.channelId,
-			threadTs: receipt.threadTs,
-			repositories: receipt.targetRepositories,
-			issueUrl: receipt.issueUrl,
-			workItemId: receipt.workItemId,
-			status: receipt.status,
-			decision: "create_and_start",
-		});
 		return receipt;
+	}
+
+	private async buildSlackEngineeringContextTurn(
+		capture: Awaited<ReturnType<SlackConversationContextService["capture"]>>,
+	): Promise<AgentTurn> {
+		const transcript = await readFile(capture.transcriptPath, "utf8");
+		const turn: AgentTurn = [{ type: "text", text: transcript }];
+		for (const message of capture.manifest.messages) {
+			for (const file of message.files) {
+				if (
+					file.status === "downloaded" &&
+					file.localPath &&
+					(file.mimeType === "image/jpeg" ||
+						file.mimeType === "image/png" ||
+						file.mimeType === "image/gif" ||
+						file.mimeType === "image/webp")
+				) {
+					turn.push({
+						type: "local_image",
+						path: file.localPath,
+						mediaType: file.mimeType,
+					});
+				}
+			}
+		}
+		return turn;
 	}
 
 	private async promptSlackEngineering(
 		parentSessionId: string,
 		modelSummary: string,
 	): Promise<SlackEngineeringReceipt> {
+		if (!this.slackEngineeringOrchestrator.isActive(parentSessionId))
+			throw new Error("No active engineering job exists for this Slack thread");
 		const { manifest } =
 			await this.captureSlackEngineeringSource(parentSessionId);
-		await this.slackEngineeringOrchestrator.addContextDirectory(
-			parentSessionId,
-			manifest.directory,
-		);
-		const latest = manifest.manifest.messages.at(-1);
-		const authoritativeText = latest?.text?.trim() || modelSummary;
-		const images =
-			latest?.files.filter(
-				(file) =>
-					file.status === "downloaded" &&
-					file.localPath &&
-					file.mimeType?.startsWith("image/"),
-			) ?? [];
-		const receipt = this.slackEngineeringOrchestrator.current(parentSessionId);
-		if (!receipt?.workItemId)
-			throw new Error("No active engineering job exists for this Slack thread");
-		const workItem = this.getGitHubIssueWorkItemSession(receipt.workItemId);
-		const runner =
-			workItem &&
-			this.agentSessionManager.getSession(workItem.sessionId)?.agentRunner;
-		if (runner?.isRunning() && runner.addStreamTurn && images.length) {
-			runner.addStreamTurn([
-				{ type: "text", text: authoritativeText },
-				...images.map((file) => ({
-					type: "local_image" as const,
-					path: file.localPath!,
-					mediaType: file.mimeType as
-						| "image/jpeg"
-						| "image/png"
-						| "image/gif"
-						| "image/webp",
-				})),
+		try {
+			await this.slackEngineeringOrchestrator.addContextDirectory(
+				parentSessionId,
+				manifest.directory,
+			);
+			const latest = manifest.manifest.messages.at(-1);
+			const authoritativeText = latest?.text?.trim() || modelSummary;
+			const images =
+				latest?.files.filter(
+					(file) =>
+						file.status === "downloaded" &&
+						file.localPath &&
+						file.mimeType?.startsWith("image/"),
+				) ?? [];
+			const receipt =
+				this.slackEngineeringOrchestrator.current(parentSessionId);
+			if (!receipt?.workItemId)
+				throw new Error(
+					"No active engineering job exists for this Slack thread",
+				);
+			const workItem = this.getGitHubIssueWorkItemSession(receipt.workItemId);
+			const runner =
+				workItem &&
+				this.agentSessionManager.getSession(workItem.sessionId)?.agentRunner;
+			if (runner?.isRunning() && runner.addStreamTurn && images.length) {
+				runner.addStreamTurn([
+					{ type: "text", text: authoritativeText },
+					...images.map((file) => ({
+						type: "local_image" as const,
+						path: file.localPath!,
+						mediaType: file.mimeType as
+							| "image/jpeg"
+							| "image/png"
+							| "image/gif"
+							| "image/webp",
+					})),
+				]);
+				return receipt;
+			}
+			return this.slackEngineeringOrchestrator.prompt(
+				parentSessionId,
+				authoritativeText,
+			);
+		} catch (error) {
+			await this.cleanupSlackContextDirectories(undefined, [
+				manifest.directory,
 			]);
-			return receipt;
+			throw error;
 		}
-		return this.slackEngineeringOrchestrator.prompt(
-			parentSessionId,
-			authoritativeText,
-		);
 	}
 
 	private async createSlackEngineeringIssue(
@@ -8547,6 +8713,15 @@ ${input.userComment}
 		} catch (error) {
 			this.logger.error(`Failed to save persisted EdgeWorker state:`, error);
 		}
+	}
+
+	/** Atomic orchestration writes must fail closed before external side effects. */
+	private async savePersistedStateStrict(): Promise<void> {
+		const state = this.serializeMappings();
+		await this.persistenceManager.saveEdgeWorkerState(state);
+		this.logger.debug(
+			`Saved EdgeWorker state strictly for ${Object.keys(state.agentSessions || {}).length} sessions`,
+		);
 	}
 
 	/**

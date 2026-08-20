@@ -1,4 +1,4 @@
-import type { ILogger, RunnerType } from "cyrus-core";
+import type { AgentTurn, ILogger, RunnerType } from "cyrus-core";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 export interface GitHubIssueStartRequest {
@@ -10,6 +10,8 @@ export interface GitHubIssueStartRequest {
 	targetRepositoryFullNames?: string[];
 	runnerType: RunnerType;
 	requestId: string;
+	/** Trusted server-captured context. Never accepted by the HTTP parser. */
+	initialTurn?: AgentTurn;
 }
 
 export interface GitHubIssuePromptRequest {

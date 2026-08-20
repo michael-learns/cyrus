@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { AgentTurn } from "cyrus-core";
 
 export type SlackEngineeringStatus =
 	| "creating"
@@ -39,6 +40,8 @@ export interface SlackEngineeringReceipt extends SlackEngineeringSource {
 	sessionId?: string;
 	prUrls?: string[];
 	error?: string;
+	deliveryStatus?: "pending" | "delivered";
+	deliveryMessage?: string;
 }
 export interface SlackEngineeringCreateInput {
 	issueRepository: string;
@@ -66,6 +69,7 @@ interface Dependencies {
 		targetRepositoryFullNames: string[];
 		runnerType: "claude";
 		requestId: string;
+		initialTurn?: AgentTurn;
 	}) => Promise<{
 		workItemId?: string;
 		sessionId: string;
@@ -78,6 +82,7 @@ interface Dependencies {
 	}>;
 	promptWorkItem: (workItemId: string, message: string) => Promise<void>;
 	stopWorkItem: (workItemId: string) => Promise<void>;
+	audit?: (decision: string, fields: Record<string, unknown>) => void;
 }
 const TERMINAL = new Set<SlackEngineeringStatus>([
 	"awaiting_review",
@@ -107,6 +112,10 @@ export function slackEngineeringSourceKey(
 export class SlackEngineeringOrchestrator {
 	private readonly receipts = new Map<string, SlackEngineeringReceipt>();
 	private readonly threadIndex = new Map<string, string>();
+	private readonly inFlight = new Map<
+		string,
+		Promise<SlackEngineeringReceipt>
+	>();
 	constructor(
 		private readonly deps: Dependencies,
 		initial: SlackEngineeringReceipt[] = [],
@@ -114,6 +123,9 @@ export class SlackEngineeringOrchestrator {
 		for (const receipt of initial) this.index(receipt);
 	}
 	restore(receipts: SlackEngineeringReceipt[]): void {
+		this.receipts.clear();
+		this.threadIndex.clear();
+		this.inFlight.clear();
 		for (const receipt of receipts)
 			this.index({
 				...receipt,
@@ -124,6 +136,7 @@ export class SlackEngineeringOrchestrator {
 			});
 	}
 	listRepositories(): SlackEngineeringRepository[] {
+		this.audit("repositories_list");
 		return this.deps.repositories().map((repository) => ({
 			...repository,
 			routingHints: [...repository.routingHints],
@@ -140,9 +153,16 @@ export class SlackEngineeringOrchestrator {
 		}));
 	}
 	current(parentSessionId: string): SlackEngineeringReceipt | undefined {
-		return Array.from(this.receipts.values())
+		const receipt = Array.from(this.receipts.values())
 			.filter((receipt) => receipt.parentSessionId === parentSessionId)
 			.sort((a, b) => b.kickoffTs.localeCompare(a.kickoffTs))[0];
+		this.audit("current", receipt);
+		return receipt;
+	}
+	status(parentSessionId: string): SlackEngineeringReceipt | undefined {
+		const receipt = this.current(parentSessionId);
+		this.audit("status", receipt);
+		return receipt;
 	}
 	byWorkItem(workItemId: string): SlackEngineeringReceipt | undefined {
 		return Array.from(this.receipts.values()).find(
@@ -154,15 +174,87 @@ export class SlackEngineeringOrchestrator {
 		directory: string,
 	): Promise<void> {
 		const receipt = this.requireCurrent(parentSessionId);
+		if (TERMINAL.has(receipt.status))
+			throw new Error("No active engineering job exists for this Slack thread");
 		receipt.contextDirectories = Array.from(
 			new Set([...(receipt.contextDirectories ?? []), directory]),
 		);
 		await this.persist();
 	}
 
-	async createAndStart(
+	validateCreateInput(input: SlackEngineeringCreateInput): {
+		primary: SlackEngineeringRepository;
+		targets: string[];
+	} {
+		const repositories = this.deps.repositories();
+		const resolve = (value: string) =>
+			repositories.find(
+				(repository) =>
+					repository.name.toLowerCase() === value.toLowerCase() ||
+					repository.fullName.toLowerCase() === value.toLowerCase(),
+			);
+		const primary = resolve(input.issueRepository);
+		if (!primary)
+			throw new Error(
+				"Issue repository is not an active configured GitHub repository",
+			);
+		const requested = input.targetRepositories?.length
+			? input.targetRepositories
+			: [primary.fullName];
+		const resolved = requested.map((value) => {
+			const repository = resolve(value);
+			if (!repository)
+				throw new Error("Target is not an active configured GitHub repository");
+			return repository.fullName;
+		});
+		if (
+			!resolved.some(
+				(value) => value.toLowerCase() === primary.fullName.toLowerCase(),
+			)
+		)
+			throw new Error(
+				"targetRepositories must contain the primary issue repository",
+			);
+		return {
+			primary,
+			targets: [
+				primary.fullName,
+				...Array.from(new Set(resolved)).filter(
+					(value) => value.toLowerCase() !== primary.fullName.toLowerCase(),
+				),
+			],
+		};
+	}
+
+	isActive(parentSessionId: string): boolean {
+		const receipt = this.current(parentSessionId);
+		return Boolean(
+			receipt && !TERMINAL.has(receipt.status) && receipt.workItemId,
+		);
+	}
+
+	createAndStart(
 		source: SlackEngineeringSource,
 		input: SlackEngineeringCreateInput,
+		initialTurn?: AgentTurn,
+	): Promise<SlackEngineeringReceipt> {
+		const lockKey = this.threadKey(source);
+		const existing = this.inFlight.get(lockKey);
+		if (existing) return existing;
+		const operation = this.createAndStartLocked(source, input, initialTurn);
+		this.inFlight.set(lockKey, operation);
+		const release = () => {
+			if (this.inFlight.get(lockKey) === operation)
+				this.inFlight.delete(lockKey);
+		};
+		void operation.then(release, release);
+		return operation;
+	}
+
+	private async createAndStartLocked(
+		source: SlackEngineeringSource,
+		input: SlackEngineeringCreateInput,
+		initialTurn?: AgentTurn,
 	): Promise<SlackEngineeringReceipt> {
 		const threadKey = this.threadKey(source);
 		const currentKey = this.threadIndex.get(threadKey);
@@ -178,42 +270,30 @@ export class SlackEngineeringOrchestrator {
 				);
 				await this.persist();
 			}
-			if (current.sourceKey === sourceKey && current.status !== "creating")
+			if (
+				current.sourceKey === sourceKey &&
+				current.status !== "creating" &&
+				current.status !== "starting" &&
+				current.status !== "failed"
+			) {
+				this.audit("duplicate_return", current);
 				return current;
-			if (current.sourceKey !== sourceKey && !TERMINAL.has(current.status))
+			}
+			if (current.sourceKey !== sourceKey && !TERMINAL.has(current.status)) {
+				this.audit("duplicate_return", current);
 				return current;
+			}
 		}
-		const repositories = this.deps.repositories();
-		const resolve = (value: string) =>
-			repositories.find(
-				(repository) =>
-					repository.name.toLowerCase() === value.toLowerCase() ||
-					repository.fullName.toLowerCase() === value.toLowerCase(),
-			);
-		const primary = resolve(input.issueRepository);
-		if (!primary)
-			throw new Error(
-				`${input.issueRepository} is not an active configured GitHub repository`,
-			);
-		const requested = input.targetRepositories?.length
-			? input.targetRepositories
-			: [primary.fullName];
-		const targets = requested.map((value) => {
-			const repository = resolve(value);
-			if (!repository)
-				throw new Error(
-					`${value} is not an active configured GitHub repository`,
-				);
-			return repository.fullName;
-		});
-		if (
-			!targets.some(
-				(value) => value.toLowerCase() === primary.fullName.toLowerCase(),
-			)
-		)
-			throw new Error(
-				"targetRepositories must contain the primary issue repository",
-			);
+		let validated: ReturnType<
+			SlackEngineeringOrchestrator["validateCreateInput"]
+		>;
+		try {
+			validated = this.validateCreateInput(input);
+		} catch (error) {
+			this.audit("validation_rejected", undefined, source);
+			throw error;
+		}
+		const { primary, targets } = validated;
 		let receipt = this.receipts.get(sourceKey);
 		const recoveringCreatingReceipt = Boolean(receipt);
 		if (!receipt) {
@@ -238,6 +318,7 @@ export class SlackEngineeringOrchestrator {
 				? { number: receipt.issueNumber, url: receipt.issueUrl }
 				: undefined;
 		if (!issue && recoveringCreatingReceipt) {
+			this.audit("recovery", receipt);
 			for (const delayMs of [0, 250, 1_000]) {
 				if (delayMs > 0)
 					await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -257,22 +338,87 @@ export class SlackEngineeringOrchestrator {
 			});
 		receipt.issueNumber = issue.number;
 		receipt.issueUrl = issue.url;
-		receipt.workItemId = `slack-${receipt.sourceKey}`;
+		receipt.workItemId ??= `slack-${receipt.sourceKey}`;
 		receipt.status = "starting";
+		receipt.error = undefined;
 		await this.persist();
-		const started = await this.deps.startWorkItem({
-			workItemId: receipt.workItemId,
-			repositoryFullName: receipt.issueRepository,
-			issueNumber: receipt.issueNumber,
-			targetRepositoryFullNames: receipt.targetRepositories,
-			runnerType: "claude",
-			requestId: receipt.sourceKey,
-		});
+		let started: Awaited<ReturnType<Dependencies["startWorkItem"]>>;
+		try {
+			started = await this.deps.startWorkItem({
+				workItemId: receipt.workItemId,
+				repositoryFullName: receipt.issueRepository,
+				issueNumber: receipt.issueNumber,
+				targetRepositoryFullNames: receipt.targetRepositories,
+				runnerType: "claude",
+				requestId: receipt.sourceKey,
+				...(initialTurn ? { initialTurn } : {}),
+			});
+		} catch (error) {
+			receipt.status = "failed";
+			receipt.error = error instanceof Error ? error.message : String(error);
+			await this.persist();
+			this.audit("start_failed", receipt);
+			throw error;
+		}
 		receipt.workItemId = started.workItemId ?? receipt.workItemId;
 		receipt.sessionId = started.sessionId;
 		receipt.status = started.status;
 		await this.persist();
+		this.audit("create_and_start", receipt);
 		return receipt;
+	}
+
+	async markTerminalDeliveryPending(
+		workItemId: string,
+		status: Extract<
+			SlackEngineeringStatus,
+			"awaiting_review" | "failed" | "stopped"
+		>,
+		message: string,
+		update: { prUrls?: string[]; error?: string } = {},
+	): Promise<SlackEngineeringReceipt | undefined> {
+		const receipt = this.byWorkItem(workItemId);
+		if (!receipt) return undefined;
+		receipt.status = status;
+		receipt.deliveryStatus = "pending";
+		receipt.deliveryMessage = message;
+		if (update.prUrls) receipt.prUrls = [...update.prUrls];
+		if (update.error) receipt.error = update.error;
+		await this.persist();
+		this.audit("delivery_pending", receipt);
+		return receipt;
+	}
+	async clearContextDirectories(workItemId: string): Promise<void> {
+		const receipt = this.byWorkItem(workItemId);
+		if (!receipt) return;
+		receipt.contextDirectory = undefined;
+		receipt.contextManifestPath = undefined;
+		receipt.contextTranscriptPath = undefined;
+		receipt.contextDirectories = [];
+		await this.persist();
+		this.audit("context_cleaned", receipt);
+	}
+
+	async markDeliveryDelivered(workItemId: string): Promise<void> {
+		const receipt = this.byWorkItem(workItemId);
+		if (!receipt) return;
+		receipt.deliveryStatus = "delivered";
+		try {
+			await this.persist();
+		} catch (error) {
+			receipt.deliveryStatus = "pending";
+			throw error;
+		}
+		this.audit("delivery_delivered", receipt);
+	}
+
+	pendingDeliveries(): SlackEngineeringReceipt[] {
+		return this.allReceipts().filter(
+			(receipt) => receipt.deliveryStatus === "pending",
+		);
+	}
+	auditDecision(decision: string, receipt?: SlackEngineeringReceipt): void {
+		this.audit(decision, receipt);
 	}
 	async setStatus(
 		workItemId: string,
@@ -299,6 +445,7 @@ export class SlackEngineeringOrchestrator {
 		)
 			throw new Error("No active engineering job exists for this Slack thread");
 		await this.deps.promptWorkItem(receipt.workItemId, message);
+		this.audit("prompt", receipt);
 		return receipt;
 	}
 	async stop(parentSessionId: string): Promise<SlackEngineeringReceipt> {
@@ -306,6 +453,7 @@ export class SlackEngineeringOrchestrator {
 		if (receipt.workItemId) await this.deps.stopWorkItem(receipt.workItemId);
 		receipt.status = "stopped";
 		await this.persist();
+		this.audit("stop", receipt);
 		return receipt;
 	}
 	private requireCurrent(parentSessionId: string): SlackEngineeringReceipt {
@@ -329,5 +477,27 @@ export class SlackEngineeringOrchestrator {
 	}
 	private persist(): Promise<void> {
 		return this.deps.persist(this.allReceipts());
+	}
+	private audit(
+		decision: string,
+		receipt?: SlackEngineeringReceipt,
+		source?: SlackEngineeringSource,
+	): void {
+		const origin = receipt ?? source;
+		this.deps.audit?.(decision, {
+			...(origin && {
+				sourceKey: receipt?.sourceKey,
+				teamId: origin.teamId,
+				userId: origin.userId,
+				channelId: origin.channelId,
+				threadTs: origin.threadTs,
+			}),
+			...(receipt && {
+				repositories: receipt.targetRepositories,
+				workItemId: receipt.workItemId,
+				status: receipt.status,
+			}),
+			decision,
+		});
 	}
 }

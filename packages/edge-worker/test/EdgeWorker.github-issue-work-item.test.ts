@@ -184,6 +184,9 @@ describe("EdgeWorker GitHub Issue work items", () => {
 			.mockResolvedValue({ config: {}, runnerType: "claude" });
 		lockedWorker.createRunnerForType = vi.fn().mockReturnValue(runner);
 		lockedWorker.updateSlackWorkItemActivity = vi.fn();
+		lockedWorker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue({ sourceKey: "source-key" }),
+		};
 		lockedWorker.config = { claudeDefaultModel: "default-claude" };
 		const modelRepository = { ...repository, model: "repo-claude" };
 
@@ -220,6 +223,128 @@ describe("EdgeWorker GitHub Issue work items", () => {
 			"claude",
 			expect.objectContaining({ model: "repo-claude" }),
 		);
+	});
+
+	it("does not treat an arbitrary slack-prefixed work item id as Slack provenance", async () => {
+		const ordinaryWorker: any = Object.create(EdgeWorker.prototype);
+		ordinaryWorker.agentSessionManager = {
+			getSession: vi
+				.fn()
+				.mockReturnValue({ workspace: { path: "/work", repoPaths: {} } }),
+		};
+		ordinaryWorker.toolPermissionResolver = {
+			buildGithubAllowedTools: vi.fn().mockReturnValue([]),
+		};
+		ordinaryWorker.buildDisallowedTools = vi.fn().mockReturnValue([]);
+		ordinaryWorker.gitService = {
+			getGitMetadataDirectoriesForWorkspace: vi.fn().mockReturnValue([]),
+		};
+		ordinaryWorker.buildGitHubIssueSystemPrompt = vi
+			.fn()
+			.mockReturnValue("system");
+		ordinaryWorker.buildSkillSessionContext = vi.fn().mockReturnValue({});
+		ordinaryWorker.buildAgentRunnerConfig = vi
+			.fn()
+			.mockResolvedValue({ config: {}, runnerType: "codex" });
+		ordinaryWorker.createRunnerForType = vi.fn().mockReturnValue(runner);
+		ordinaryWorker.updateSlackWorkItemActivity = vi.fn();
+		ordinaryWorker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue(undefined),
+		};
+		ordinaryWorker.config = { claudeDefaultModel: "default-claude" };
+
+		await ordinaryWorker.createGitHubIssueRunner(
+			{
+				workItemId: "slack-but-not-a-receipt",
+				sessionId: "session",
+				repository,
+				repositories: [repository],
+				repositoryFullName: "cyrusagents/cyrus",
+				targetRepositoryFullNames: ["cyrusagents/cyrus"],
+				issueNumber: 17,
+				issueIdentifier: "GH-cyrus-17",
+				branchName: "cyrus/fix",
+				branchNames: { "repo-1": "cyrus/fix" },
+				prUrls: [],
+				slackSubscribers: [],
+				runnerType: "codex",
+				issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+				status: "starting",
+			},
+			{
+				...githubIssue,
+				body: "[model=normal-model]",
+				labels: [{ name: "codex" }],
+			},
+			"token",
+		);
+
+		const args = ordinaryWorker.buildAgentRunnerConfig.mock.calls[0];
+		expect(args[8]).toEqual(["codex"]);
+		expect(args[9]).toContain("[model=normal-model]");
+		expect(ordinaryWorker.createRunnerForType).toHaveBeenCalledWith(
+			"codex",
+			expect.any(Object),
+		);
+	});
+
+	it("delivers the authoritative transcript and ordered images in the initial child turn", async () => {
+		worker.runGitHubIssueWorkItem = EdgeWorker.prototype.runGitHubIssueWorkItem;
+		runner.startTurn = vi.fn().mockResolvedValue(undefined);
+		worker.findGitHubIssuePullRequests = vi
+			.fn()
+			.mockResolvedValue(["https://github.com/cyrusagents/cyrus/pull/18"]);
+		worker.gitHubCommentService = { postIssueComment: vi.fn() };
+		worker.finishSlackWorkItem = vi.fn().mockResolvedValue(undefined);
+		worker.slackEngineeringOrchestrator = { setStatus: vi.fn() };
+		const workItem = {
+			workItemId: "work-item-17",
+			sessionId: "github-issue-work-item-17",
+			repository,
+			repositoryFullName: "cyrusagents/cyrus",
+			issueNumber: 17,
+			prUrls: [],
+			runnerType: "claude",
+			issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+			status: "starting",
+		};
+		worker.gitHubIssueWorkItemSessions.set(workItem.workItemId, workItem);
+		const initialTurn = [
+			{ type: "text", text: "authoritative full Slack transcript" },
+			{
+				type: "local_image",
+				path: "/context/first.png",
+				mediaType: "image/png",
+			},
+			{
+				type: "local_image",
+				path: "/context/second.jpg",
+				mediaType: "image/jpeg",
+			},
+		];
+
+		await worker.runGitHubIssueWorkItem(
+			workItem,
+			runner,
+			"implement issue 17",
+			"token",
+			initialTurn,
+		);
+
+		expect(runner.startTurn).toHaveBeenCalledWith([
+			{ type: "text", text: "implement issue 17" },
+			{ type: "text", text: "authoritative full Slack transcript" },
+			{
+				type: "local_image",
+				path: "/context/first.png",
+				mediaType: "image/png",
+			},
+			{
+				type: "local_image",
+				path: "/context/second.jpg",
+				mediaType: "image/jpeg",
+			},
+		]);
 	});
 
 	it("rejects a second target set while a session for the same issue is live", async () => {

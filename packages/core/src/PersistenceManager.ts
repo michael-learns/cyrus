@@ -96,6 +96,8 @@ export interface SerializableEdgeWorkerState {
 		sessionId?: string;
 		prUrls?: string[];
 		error?: string;
+		deliveryStatus?: "pending" | "delivered";
+		deliveryMessage?: string;
 	}>;
 }
 

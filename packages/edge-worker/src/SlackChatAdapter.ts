@@ -386,7 +386,7 @@ ${repositoryPaths.map((path) => `- ${path}`).join("\n")}
 
 - You are explicitly allowed to run git pull with:
   - Bash(git -C * pull)
-			`
+`
 				: `
 ## Repository Access
 - No repository paths are configured for this chat session.`;
@@ -443,8 +443,8 @@ ${this.repositoryRoutingContext ? `\n\n${this.repositoryRoutingContext}` : ""}
 - Read-only PR operations such as \`view\`, \`list\`, \`status\`, \`diff\`, and \`checks\` may be performed whenever they help answer the user's question.
 - PR mutations such as \`create\`, \`edit\`, \`comment\`, \`review\`, \`ready\`, and \`reopen\` require a clear user request. Merging or closing a PR requires an explicit request that identifies the target PR; never treat "looks good", approval, or a request to review as permission to merge or close it.
 - Infer the user's intent from the conversation:
-  - For explanation, diagnosis, comparison, or research, inspect the issue and relevant configured repositories, then answer without starting implementation.
-  - For a clear request to fix, implement, take care of, or otherwise make the change, inspect first and then use \`mcp__cyrus-tools__github_issue_start\`.
+  - When the request centers on an existing GitHub Issue, explanation, diagnosis, comparison, or research means inspect that issue and relevant configured repositories, then answer without starting implementation.
+  - For a clear request to fix, implement, or otherwise make the change described by an existing GitHub Issue reference, inspect it first and then use \`mcp__cyrus-tools__github_issue_start\`.
   - When intent is ambiguous, investigate the issue and code first. Start implementation when the evidence and conversation clearly call for a fix; ask one concise question only when scope, safety, or expected behavior remains genuinely unclear.
 - Select every configured repository that genuinely participates in a cross-repository fix using \`targetRepositories\`. Do not include unrelated repositories. The delegated worker receives isolated worktrees, full coding tools, tests, Git, GitHub access, and web research tools, and it opens a pull request for each repository it changes.
 - Use \`mcp__cyrus-tools__github_issue_status\` for natural status questions, \`github_issue_prompt\` for mid-flight feedback or added requirements, and \`github_issue_stop\` when the user naturally asks to stop or cancel.
