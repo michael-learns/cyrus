@@ -10,7 +10,11 @@ export interface GitHubIssueStartRequest {
 	targetRepositoryFullNames?: string[];
 	runnerType: RunnerType;
 	requestId: string;
-	/** Trusted server-captured context. Never accepted by the HTTP parser. */
+}
+
+/** Server-internal extension. HTTP controllers only emit GitHubIssueStartRequest. */
+export interface TrustedGitHubIssueStartRequest
+	extends GitHubIssueStartRequest {
 	initialTurn?: AgentTurn;
 }
 
@@ -204,7 +208,19 @@ export class GitHubIssueWorkItemController {
 		) {
 			return null;
 		}
-		return body as unknown as GitHubIssueStartRequest;
+		return {
+			workItemId: body.workItemId as string,
+			repositoryFullName: body.repositoryFullName as string,
+			issueNumber: body.issueNumber as number,
+			...(body.targetRepositoryFullNames
+				? {
+						targetRepositoryFullNames:
+							body.targetRepositoryFullNames as string[],
+					}
+				: {}),
+			runnerType: body.runnerType as RunnerType,
+			requestId: body.requestId as string,
+		};
 	}
 
 	private parsePromptRequest(value: unknown): GitHubIssuePromptRequest | null {

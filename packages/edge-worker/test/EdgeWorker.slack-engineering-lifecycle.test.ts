@@ -251,6 +251,7 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 			worker.slackChatAdapter = { postDelegatedWorkMessage: vi.fn() };
 			worker.slackEngineeringOrchestrator = {
 				pendingDeliveries: vi.fn().mockReturnValue([receipt]),
+				persistPendingDelivery: vi.fn(),
 				markDeliveryDelivered: vi.fn(),
 				auditDecision: vi.fn(),
 			};
@@ -280,6 +281,99 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 			expect(
 				worker.slackEngineeringOrchestrator.auditDecision,
 			).toHaveBeenCalledWith("delivery_result", receipt);
+		} finally {
+			if (priorToken === undefined) delete process.env.SLACK_BOT_TOKEN;
+			else process.env.SLACK_BOT_TOKEN = priorToken;
+		}
+	});
+
+	it("replays a restored pending delivery when a verified proxy event supplies its runtime token", async () => {
+		const priorToken = process.env.SLACK_BOT_TOKEN;
+		delete process.env.SLACK_BOT_TOKEN;
+		try {
+			const receipt = {
+				sourceKey: "source",
+				workItemId: "work",
+				parentSessionId: "parent",
+				teamId: "T1",
+				userId: "U1",
+				channelId: "C1",
+				threadTs: "100.0",
+				kickoffTs: "101.0",
+				deliveryStatus: "pending",
+				deliveryMessage: "Finished through proxy",
+			};
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const postDelegatedWorkMessage = vi.fn(async () => gate);
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.slackChatAdapter = { postDelegatedWorkMessage };
+			worker.slackEngineeringOrchestrator = {
+				pendingDeliveries: vi.fn().mockReturnValue([receipt]),
+				persistPendingDelivery: vi.fn(),
+				markDeliveryDelivered: vi.fn(async () => {
+					receipt.deliveryStatus = "delivered";
+				}),
+				auditDecision: vi.fn(),
+			};
+			worker.logger = { warn: vi.fn() };
+
+			await worker.replayPendingSlackEngineeringDeliveries();
+			expect(postDelegatedWorkMessage).not.toHaveBeenCalled();
+			expect(
+				worker.slackEngineeringOrchestrator.auditDecision,
+			).toHaveBeenCalledWith("delivery_deferred", receipt);
+
+			const event = {
+				eventType: "message",
+				eventId: "proxy-event",
+				teamId: "T1",
+				slackBotToken: "xoxb-proxy-runtime-secret",
+				payload: {
+					type: "message",
+					user: "U2",
+					text: "hello",
+					ts: "200.0",
+					event_ts: "200.0",
+					channel: "C2",
+				},
+			};
+			const first =
+				worker.replayPendingSlackEngineeringDeliveriesForEvent(event);
+			const second =
+				worker.replayPendingSlackEngineeringDeliveriesForEvent(event);
+			expect(first).toBe(second);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(postDelegatedWorkMessage).toHaveBeenCalledOnce();
+			release();
+			await Promise.all([first, second]);
+
+			expect(postDelegatedWorkMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					teamId: "T1",
+					slackBotToken: "xoxb-proxy-runtime-secret",
+					payload: expect.objectContaining({
+						channel: "C1",
+						thread_ts: "100.0",
+					}),
+				}),
+				"Finished through proxy",
+			);
+			expect(receipt.deliveryStatus).toBe("delivered");
+			expect(JSON.stringify(receipt)).not.toContain(
+				"xoxb-proxy-runtime-secret",
+			);
+			expect(
+				worker.slackEngineeringOrchestrator.auditDecision,
+			).toHaveBeenCalledWith("delivery_proxy_retry", receipt);
+			expect(
+				JSON.stringify(
+					worker.slackEngineeringOrchestrator.auditDecision.mock.calls,
+				),
+			).not.toContain("xoxb-proxy-runtime-secret");
 		} finally {
 			if (priorToken === undefined) delete process.env.SLACK_BOT_TOKEN;
 			else process.env.SLACK_BOT_TOKEN = priorToken;

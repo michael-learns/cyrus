@@ -417,6 +417,12 @@ export class SlackEngineeringOrchestrator {
 			(receipt) => receipt.deliveryStatus === "pending",
 		);
 	}
+	async persistPendingDelivery(workItemId: string): Promise<void> {
+		const receipt = this.byWorkItem(workItemId);
+		if (!receipt || receipt.deliveryStatus !== "pending") return;
+		await this.persist();
+		this.audit("delivery_pending_retry", receipt);
+	}
 	auditDecision(decision: string, receipt?: SlackEngineeringReceipt): void {
 		this.audit(decision, receipt);
 	}

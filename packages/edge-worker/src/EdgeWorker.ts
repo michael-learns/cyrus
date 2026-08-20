@@ -154,10 +154,10 @@ import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
 import {
 	type GitHubIssuePromptRequest,
-	type GitHubIssueStartRequest,
 	type GitHubIssueStartResult,
 	type GitHubIssueStopRequest,
 	GitHubIssueWorkItemController,
+	type TrustedGitHubIssueStartRequest,
 } from "./GitHubIssueWorkItemController.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
@@ -268,6 +268,12 @@ export class EdgeWorker extends EventEmitter {
 	private slackWorkItemEvents = new Map<
 		string,
 		Map<string, SlackWebhookEvent>
+	>();
+	private slackRuntimeTokens = new Map<string, string>();
+	private slackDeliveryReplays = new Map<string, Promise<void>>();
+	private slackDeliveryRetryTimers = new Map<
+		string,
+		ReturnType<typeof setTimeout>
 	>();
 	private slackEngineeringOrchestrator: SlackEngineeringOrchestrator;
 	private gitHubCommentService: GitHubCommentService; // Service for posting comments back to GitHub PRs
@@ -1233,6 +1239,13 @@ export class EdgeWorker extends EventEmitter {
 		});
 
 		this.slackEventTransport.on("event", (event: SlackWebhookEvent) => {
+			void this.replayPendingSlackEngineeringDeliveriesForEvent(event).catch(
+				() =>
+					this.logger.warn("Slack engineering proxy replay failed", {
+						teamId: event.teamId,
+						decision: "delivery_proxy_replay_failed",
+					}),
+			);
 			this.chatSessionHandler!.handleEvent(event).catch((error) => {
 				this.logger.error(
 					"Failed to handle Slack webhook",
@@ -1549,31 +1562,62 @@ export class EdgeWorker extends EventEmitter {
 					: status === "stopped"
 						? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
 						: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
-			await this.slackEngineeringOrchestrator.markTerminalDeliveryPending(
-				workItem.workItemId,
-				status,
-				text,
-				{ prUrls: workItem.prUrls, error: workItem.error },
-			);
-			await this.cleanupSlackContextDirectories(receipt);
-			this.chatSessionHandler?.setDelegatedWorkActive(
-				receipt.parentSessionId,
-				false,
-				workItem.workItemId,
-			);
-			await this.deliverSlackEngineeringReceipt(
-				receipt,
-				events?.get(receipt.parentSessionId),
-				false,
-			);
-			const event = events?.get(receipt.parentSessionId);
-			if (
-				event &&
-				this.slackChatAdapter &&
-				!this.chatSessionHandler?.hasDelegatedWork(receipt.parentSessionId)
-			)
-				await this.slackChatAdapter.clearActivityStatus(event);
-			this.slackWorkItemEvents?.delete(workItem.workItemId);
+			try {
+				await this.slackEngineeringOrchestrator.markTerminalDeliveryPending(
+					workItem.workItemId,
+					status,
+					text,
+					{ prUrls: workItem.prUrls, error: workItem.error },
+				);
+			} catch {
+				const liveToken = events?.get(receipt.parentSessionId)?.slackBotToken;
+				if (liveToken) {
+					this.slackRuntimeTokens ??= new Map();
+					this.slackRuntimeTokens.set(receipt.teamId, liveToken);
+				}
+				this.slackEngineeringOrchestrator.auditDecision(
+					"delivery_persistence_deferred",
+					receipt,
+				);
+				this.logger.warn("Slack engineering delivery persistence deferred", {
+					sourceKey: receipt.sourceKey,
+					decision: "delivery_persistence_deferred",
+				});
+				this.scheduleSlackEngineeringDeliveryRetry(receipt.teamId);
+				return;
+			}
+			try {
+				await this.cleanupSlackContextDirectories(receipt);
+				this.chatSessionHandler?.setDelegatedWorkActive(
+					receipt.parentSessionId,
+					false,
+					workItem.workItemId,
+				);
+				await this.deliverSlackEngineeringReceipt(
+					receipt,
+					events?.get(receipt.parentSessionId),
+					false,
+				);
+				const event = events?.get(receipt.parentSessionId);
+				if (
+					event &&
+					this.slackChatAdapter &&
+					!this.chatSessionHandler?.hasDelegatedWork(receipt.parentSessionId)
+				)
+					await this.slackChatAdapter.clearActivityStatus(event);
+				this.slackWorkItemEvents?.delete(workItem.workItemId);
+			} catch {
+				this.slackEngineeringOrchestrator.auditDecision(
+					"delivery_infrastructure_deferred",
+					receipt,
+				);
+				this.logger.warn("Slack engineering delivery infrastructure deferred", {
+					sourceKey: receipt.sourceKey,
+					decision: "delivery_infrastructure_deferred",
+				});
+				if (receipt.deliveryStatus === "pending")
+					this.scheduleSlackEngineeringDeliveryRetry(receipt.teamId);
+			}
 			return;
 		}
 		if (events && this.slackChatAdapter) {
@@ -1613,9 +1657,14 @@ export class EdgeWorker extends EventEmitter {
 		receipt: SlackEngineeringReceipt,
 		liveEvent?: SlackWebhookEvent,
 		replay = true,
+		runtimeToken?: string,
 	): Promise<void> {
 		if (!this.slackChatAdapter || !receipt.deliveryMessage) return;
-		const token = liveEvent?.slackBotToken ?? process.env.SLACK_BOT_TOKEN;
+		const token =
+			liveEvent?.slackBotToken ??
+			runtimeToken ??
+			this.slackRuntimeTokens?.get(receipt.teamId) ??
+			process.env.SLACK_BOT_TOKEN;
 		if (!token) {
 			this.slackEngineeringOrchestrator.auditDecision(
 				"delivery_deferred",
@@ -1666,12 +1715,140 @@ export class EdgeWorker extends EventEmitter {
 				sourceKey: receipt.sourceKey,
 				decision: "delivery_failed",
 			});
+			this.scheduleSlackEngineeringDeliveryRetry(receipt.teamId);
 		}
 	}
 
-	private async replayPendingSlackEngineeringDeliveries(): Promise<void> {
-		for (const receipt of this.slackEngineeringOrchestrator.pendingDeliveries())
-			await this.deliverSlackEngineeringReceipt(receipt, undefined, true);
+	private async replayPendingSlackEngineeringDeliveries(
+		teamId?: string,
+		runtimeToken?: string,
+	): Promise<void> {
+		for (const receipt of this.slackEngineeringOrchestrator
+			.pendingDeliveries()
+			.filter((item) => !teamId || item.teamId === teamId)) {
+			if (runtimeToken)
+				this.slackEngineeringOrchestrator.auditDecision(
+					"delivery_proxy_retry",
+					receipt,
+				);
+			const token =
+				runtimeToken ??
+				this.slackRuntimeTokens?.get(receipt.teamId) ??
+				process.env.SLACK_BOT_TOKEN;
+			if (!token) {
+				this.slackEngineeringOrchestrator.auditDecision(
+					"delivery_deferred",
+					receipt,
+				);
+				continue;
+			}
+			try {
+				await this.slackEngineeringOrchestrator.persistPendingDelivery(
+					receipt.workItemId!,
+				);
+				if (
+					receipt.contextDirectory ||
+					(receipt.contextDirectories?.length ?? 0) > 0
+				)
+					await this.cleanupSlackContextDirectories(receipt);
+			} catch {
+				this.slackEngineeringOrchestrator.auditDecision(
+					"delivery_persistence_deferred",
+					receipt,
+				);
+				this.scheduleSlackEngineeringDeliveryRetry(receipt.teamId);
+				continue;
+			}
+			await this.deliverSlackEngineeringReceipt(
+				receipt,
+				undefined,
+				true,
+				token,
+			);
+			if (receipt.deliveryStatus === "delivered")
+				await this.releaseSlackEngineeringDelivery(receipt);
+		}
+	}
+
+	private replayPendingSlackEngineeringDeliveriesForEvent(
+		event: SlackWebhookEvent,
+	): Promise<void> {
+		const token = event.slackBotToken;
+		if (!token) return Promise.resolve();
+		this.slackRuntimeTokens ??= new Map();
+		this.slackRuntimeTokens.set(event.teamId, token);
+		return this.startSlackEngineeringDeliveryReplay(event.teamId, token);
+	}
+
+	private startSlackEngineeringDeliveryReplay(
+		teamId: string,
+		runtimeToken?: string,
+	): Promise<void> {
+		this.slackDeliveryReplays ??= new Map();
+		const existing = this.slackDeliveryReplays.get(teamId);
+		if (existing) return existing;
+		const replay = this.replayPendingSlackEngineeringDeliveries(
+			teamId,
+			runtimeToken,
+		);
+		this.slackDeliveryReplays.set(teamId, replay);
+		const release = () => {
+			if (this.slackDeliveryReplays.get(teamId) === replay)
+				this.slackDeliveryReplays.delete(teamId);
+		};
+		void replay.then(release, release);
+		return replay;
+	}
+
+	private scheduleSlackEngineeringDeliveryRetry(teamId: string): void {
+		this.slackDeliveryRetryTimers ??= new Map();
+		if (this.slackDeliveryRetryTimers.has(teamId)) return;
+		for (const receipt of this.slackEngineeringOrchestrator
+			.pendingDeliveries()
+			.filter((item) => item.teamId === teamId))
+			this.slackEngineeringOrchestrator.auditDecision(
+				"delivery_retry_scheduled",
+				receipt,
+			);
+		const timer = setTimeout(() => {
+			this.slackDeliveryRetryTimers.delete(teamId);
+			void this.startSlackEngineeringDeliveryReplay(
+				teamId,
+				this.slackRuntimeTokens?.get(teamId),
+			).catch(() =>
+				this.logger.warn("Slack engineering scheduled replay failed", {
+					teamId,
+					decision: "delivery_retry_failed",
+				}),
+			);
+		}, 1_000);
+		timer.unref?.();
+		this.slackDeliveryRetryTimers.set(teamId, timer);
+	}
+
+	private async releaseSlackEngineeringDelivery(
+		receipt: SlackEngineeringReceipt,
+	): Promise<void> {
+		const retryTimer = this.slackDeliveryRetryTimers?.get(receipt.teamId);
+		if (retryTimer) {
+			clearTimeout(retryTimer);
+			this.slackDeliveryRetryTimers.delete(receipt.teamId);
+		}
+		this.chatSessionHandler?.setDelegatedWorkActive(
+			receipt.parentSessionId,
+			false,
+			receipt.workItemId!,
+		);
+		const event = this.slackWorkItemEvents
+			?.get(receipt.workItemId!)
+			?.get(receipt.parentSessionId);
+		if (
+			event &&
+			this.slackChatAdapter &&
+			!this.chatSessionHandler?.hasDelegatedWork(receipt.parentSessionId)
+		)
+			await this.slackChatAdapter.clearActivityStatus(event);
+		this.slackWorkItemEvents?.delete(receipt.workItemId!);
 	}
 
 	private async cleanupSlackContextDirectories(
@@ -1729,7 +1906,7 @@ export class EdgeWorker extends EventEmitter {
 	}
 
 	private async startGitHubIssueWorkItem(
-		request: GitHubIssueStartRequest,
+		request: TrustedGitHubIssueStartRequest,
 		installationToken?: string,
 	): Promise<GitHubIssueStartResult> {
 		const existing = this.getGitHubIssueWorkItemSession(request.workItemId);

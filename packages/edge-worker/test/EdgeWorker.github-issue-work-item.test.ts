@@ -610,6 +610,120 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		expect(worker.slackWorkItemEvents.has("work-item-17")).toBe(false);
 	});
 
+	it("preserves a successful outcome when pending-delivery persistence fails once", async () => {
+		vi.useFakeTimers();
+		try {
+			worker.runGitHubIssueWorkItem =
+				EdgeWorker.prototype.runGitHubIssueWorkItem;
+			runner.start = vi.fn().mockResolvedValue(undefined);
+			worker.findGitHubIssuePullRequests = vi
+				.fn()
+				.mockResolvedValue(["https://github.com/cyrusagents/cyrus/pull/18"]);
+			worker.gitHubCommentService = { postIssueComment: vi.fn() };
+			const event = {
+				teamId: "T1",
+				slackBotToken: "xoxb-runtime",
+				payload: { channel: "C1", ts: "1", user: "U1" },
+			};
+			const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+			worker.slackChatAdapter = {
+				postDelegatedWorkMessage,
+				clearActivityStatus: vi.fn(),
+			};
+			worker.chatSessionHandler = {
+				setDelegatedWorkActive: vi.fn(),
+				hasDelegatedWork: vi.fn().mockReturnValue(false),
+			};
+			worker.cleanupSlackContextDirectories = vi.fn();
+			worker.logger = { error: vi.fn(), warn: vi.fn() };
+			const receipt: any = {
+				sourceKey: "source",
+				workItemId: "work-item-17",
+				parentSessionId: "slack-session-1",
+				teamId: "T1",
+				userId: "U1",
+				channelId: "C1",
+				threadTs: "1",
+				kickoffTs: "1",
+			};
+			let terminalWrites = 0;
+			const markTerminalDeliveryPending = vi.fn(
+				async (_workItemId, status, message) => {
+					receipt.status = status;
+					receipt.deliveryStatus = "pending";
+					receipt.deliveryMessage = message;
+					terminalWrites++;
+					if (terminalWrites === 1) throw new Error("disk unavailable");
+					return receipt;
+				},
+			);
+			worker.slackEngineeringOrchestrator = {
+				byWorkItem: vi.fn().mockReturnValue(receipt),
+				setStatus: vi.fn(),
+				markTerminalDeliveryPending,
+				pendingDeliveries: vi.fn(() =>
+					receipt.deliveryStatus === "pending" ? [receipt] : [],
+				),
+				persistPendingDelivery: vi.fn().mockResolvedValue(undefined),
+				markDeliveryDelivered: vi.fn(async () => {
+					receipt.deliveryStatus = "delivered";
+				}),
+				auditDecision: vi.fn(),
+			};
+			worker.slackWorkItemEvents = new Map([
+				["work-item-17", new Map([["slack-session-1", event]])],
+			]);
+			const workItem: any = {
+				workItemId: "work-item-17",
+				sessionId: "github-issue-work-item-17",
+				repository,
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 17,
+				prUrls: [],
+				runnerType: "claude",
+				issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+				status: "starting",
+			};
+			worker.gitHubIssueWorkItemSessions.set(workItem.workItemId, workItem);
+
+			await worker.runGitHubIssueWorkItem(
+				workItem,
+				runner,
+				"implement issue 17",
+				"token",
+			);
+
+			expect(workItem.status).toBe("awaiting_review");
+			expect(workItem.prUrls).toEqual([
+				"https://github.com/cyrusagents/cyrus/pull/18",
+			]);
+			expect(worker.reportGitHubWorkItemStatus).not.toHaveBeenCalledWith(
+				"work-item-17",
+				expect.objectContaining({ status: "failed" }),
+			);
+			expect(postDelegatedWorkMessage).not.toHaveBeenCalled();
+			expect(
+				worker.slackEngineeringOrchestrator.auditDecision,
+			).toHaveBeenCalledWith("delivery_persistence_deferred", receipt);
+			expect(
+				worker.slackEngineeringOrchestrator.auditDecision,
+			).toHaveBeenCalledWith("delivery_retry_scheduled", receipt);
+
+			await vi.runAllTimersAsync();
+
+			expect(postDelegatedWorkMessage).toHaveBeenCalledOnce();
+			expect(postDelegatedWorkMessage.mock.calls[0]?.[1]).toContain(
+				"Finished *Fix*",
+			);
+			expect(postDelegatedWorkMessage.mock.calls[0]?.[1]).not.toContain(
+				"couldn't finish",
+			);
+			expect(receipt.deliveryStatus).toBe("delivered");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps the thread status while a sibling delegated job is still running", async () => {
 		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
 		const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);

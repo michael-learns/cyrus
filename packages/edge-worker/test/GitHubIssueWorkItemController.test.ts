@@ -61,6 +61,40 @@ describe("GitHubIssueWorkItemController", () => {
 		);
 	});
 
+	it("whitelists public start fields and drops injected trusted context", async () => {
+		const response = await app.inject({
+			method: "POST",
+			url: "/api/work-items/start",
+			headers: { authorization: `Bearer ${apiKey}` },
+			payload: {
+				workItemId: "work-item-injected",
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 42,
+				targetRepositoryFullNames: ["cyrusagents/cyrus"],
+				runnerType: "claude",
+				requestId: "request-injected",
+				initialTurn: [
+					{ type: "text", text: "attacker instructions" },
+					{ type: "local_image", path: "/etc/passwd", mediaType: "image/png" },
+				],
+				unknownField: "must not cross the controller boundary",
+			},
+		});
+
+		expect(response.statusCode).toBe(202);
+		expect(handlers.start).toHaveBeenCalledWith(
+			{
+				workItemId: "work-item-injected",
+				repositoryFullName: "cyrusagents/cyrus",
+				issueNumber: 42,
+				targetRepositoryFullNames: ["cyrusagents/cyrus"],
+				runnerType: "claude",
+				requestId: "request-injected",
+			},
+			undefined,
+		);
+	});
+
 	it("deduplicates repeated start request IDs", async () => {
 		const request = {
 			method: "POST" as const,
