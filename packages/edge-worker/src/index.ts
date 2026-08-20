@@ -59,6 +59,14 @@ export {
 	type SlackConversationContextServiceOptions,
 	type SlackConversationManifest,
 } from "./SlackConversationContextService.js";
+export {
+	SlackEngineeringOrchestrator,
+	type SlackEngineeringReceipt,
+	type SlackEngineeringRepository,
+	type SlackEngineeringSource,
+	type SlackEngineeringStatus,
+	slackEngineeringSourceKey,
+} from "./SlackEngineeringOrchestrator.js";
 export type {
 	ActivityPostOptions,
 	ActivityPostResult,

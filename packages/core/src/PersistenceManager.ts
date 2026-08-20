@@ -64,6 +64,39 @@ export interface SerializableEdgeWorkerState {
 	// Issue to repository mapping (for caching user repository selections)
 	// v4.1: string[] (multi-repo). Migration: old Record<string, string> auto-converts.
 	issueRepositoryCache?: Record<string, string[]>;
+	/** Atomic Slack-to-GitHub engineering jobs. Optional for backward compatibility. */
+	slackEngineeringReceipts?: Array<{
+		sourceKey: string;
+		marker: string;
+		status:
+			| "creating"
+			| "starting"
+			| "in_progress"
+			| "awaiting_review"
+			| "failed"
+			| "stopped";
+		parentSessionId: string;
+		teamId: string;
+		userId: string;
+		channelId: string;
+		threadTs: string;
+		kickoffTs: string;
+		permalink: string;
+		contextDirectory?: string;
+		contextManifestPath?: string;
+		contextTranscriptPath?: string;
+		contextDirectories?: string[];
+		issueRepository: string;
+		title: string;
+		summary: string;
+		targetRepositories: string[];
+		issueNumber?: number;
+		issueUrl?: string;
+		workItemId?: string;
+		sessionId?: string;
+		prUrls?: string[];
+		error?: string;
+	}>;
 }
 
 /**

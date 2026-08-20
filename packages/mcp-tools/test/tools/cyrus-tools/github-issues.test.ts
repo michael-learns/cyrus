@@ -35,3 +35,42 @@ describe("GitHub Issue orchestration tools", () => {
 		expect(registeredTools).not.toContain("github_issue_start");
 	});
 });
+
+describe("Slack engineering orchestration tools", () => {
+	it("registers the six tools only when verified Slack engineering callbacks are supplied", () => {
+		const engineering = {
+			repositoriesList: vi.fn(),
+			createAndStart: vi.fn(),
+			current: vi.fn(),
+			status: vi.fn(),
+			prompt: vi.fn(),
+			stop: vi.fn(),
+		};
+		const server = createCyrusToolsServer(undefined, { engineering });
+		const registeredTools = Object.keys(
+			(server as unknown as { _registeredTools: Record<string, unknown> })
+				._registeredTools,
+		);
+
+		expect(registeredTools).toEqual([
+			"engineering_repositories_list",
+			"engineering_create_and_start",
+			"engineering_current",
+			"engineering_status",
+			"engineering_prompt",
+			"engineering_stop",
+		]);
+	});
+
+	it("does not expose engineering tools to sessions without verified Slack callbacks", () => {
+		const server = createCyrusToolsServer(undefined, {
+			parentSessionId: "linear-parent",
+		});
+		const registeredTools = Object.keys(
+			(server as unknown as { _registeredTools: Record<string, unknown> })
+				._registeredTools,
+		);
+
+		expect(registeredTools).not.toContain("engineering_create_and_start");
+	});
+});

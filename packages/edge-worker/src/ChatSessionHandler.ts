@@ -415,6 +415,9 @@ export class ChatSessionHandler<TEvent> {
 
 			// Build the system prompt
 			const systemPrompt = this.adapter.buildSystemPrompt(event);
+			// Make the verified platform event available while MCP callbacks are
+			// assembled; Slack-only tools must be gated before the runner connects.
+			this.enqueueReply(sessionId, event);
 
 			// Build runner config
 			const runnerConfig = await this.buildRunnerConfig(
@@ -451,7 +454,6 @@ export class ChatSessionHandler<TEvent> {
 			// completion here, because with warm sessions the streaming prompt
 			// stays open and the start() promise doesn't resolve until the
 			// whole session ends.
-			this.enqueueReply(sessionId, event);
 			const startPromise =
 				runner.supportsStreamingInput && runner.startStreaming
 					? runner.startStreaming(userPrompt)
@@ -648,6 +650,7 @@ export class ChatSessionHandler<TEvent> {
 		taskInstructions: string,
 	): Promise<void> {
 		const systemPrompt = this.adapter.buildSystemPrompt(event);
+		this.enqueueReply(sessionId, event);
 
 		const runnerConfig = await this.buildRunnerConfig(
 			existingSession.workspace.path,
@@ -670,7 +673,6 @@ export class ChatSessionHandler<TEvent> {
 		// (see handleAgentMessage). We must not await turn completion here —
 		// warm sessions hold the streaming prompt open across turns so the
 		// start() promise only resolves when the whole session ends.
-		this.enqueueReply(sessionId, event);
 		const startPromise =
 			runner.supportsStreamingInput && runner.startStreaming
 				? runner.startStreaming(resumePrompt)

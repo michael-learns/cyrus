@@ -161,6 +161,67 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		);
 	});
 
+	it("locks Slack-created work items to Claude and repository model without trusting issue selectors", async () => {
+		const lockedWorker: any = Object.create(EdgeWorker.prototype);
+		lockedWorker.agentSessionManager = {
+			getSession: vi
+				.fn()
+				.mockReturnValue({ workspace: { path: "/work", repoPaths: {} } }),
+		};
+		lockedWorker.toolPermissionResolver = {
+			buildGithubAllowedTools: vi.fn().mockReturnValue([]),
+		};
+		lockedWorker.buildDisallowedTools = vi.fn().mockReturnValue([]);
+		lockedWorker.gitService = {
+			getGitMetadataDirectoriesForWorkspace: vi.fn().mockReturnValue([]),
+		};
+		lockedWorker.buildGitHubIssueSystemPrompt = vi
+			.fn()
+			.mockReturnValue("system");
+		lockedWorker.buildSkillSessionContext = vi.fn().mockReturnValue({});
+		lockedWorker.buildAgentRunnerConfig = vi
+			.fn()
+			.mockResolvedValue({ config: {}, runnerType: "claude" });
+		lockedWorker.createRunnerForType = vi.fn().mockReturnValue(runner);
+		lockedWorker.updateSlackWorkItemActivity = vi.fn();
+		lockedWorker.config = { claudeDefaultModel: "default-claude" };
+		const modelRepository = { ...repository, model: "repo-claude" };
+
+		await lockedWorker.createGitHubIssueRunner(
+			{
+				workItemId: "slack-source-key",
+				sessionId: "github-issue-slack-source-key",
+				repository: modelRepository,
+				repositories: [modelRepository],
+				repositoryFullName: "cyrusagents/cyrus",
+				targetRepositoryFullNames: ["cyrusagents/cyrus"],
+				issueNumber: 17,
+				issueIdentifier: "GH-cyrus-17",
+				branchName: "cyrus/fix",
+				branchNames: { "repo-1": "cyrus/fix" },
+				prUrls: [],
+				slackSubscribers: [],
+				runnerType: "claude",
+				issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+				status: "starting",
+			},
+			{
+				...githubIssue,
+				body: "[agent=codex] [model=attacker-model]",
+				labels: [{ name: "codex" }],
+			},
+			"token",
+		);
+
+		const args = lockedWorker.buildAgentRunnerConfig.mock.calls[0];
+		expect(args[8]).toEqual([]);
+		expect(args[9]).toBe("[agent=claude]");
+		expect(lockedWorker.createRunnerForType).toHaveBeenCalledWith(
+			"claude",
+			expect.objectContaining({ model: "repo-claude" }),
+		);
+	});
+
 	it("rejects a second target set while a session for the same issue is live", async () => {
 		await worker.startGitHubIssueWorkItem(
 			{

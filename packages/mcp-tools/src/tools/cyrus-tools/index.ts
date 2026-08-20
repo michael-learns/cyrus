@@ -80,6 +80,21 @@ function getMimeType(filename: string): string {
  * Options for creating Cyrus tools with session management capabilities
  */
 export interface CyrusToolsOptions {
+	/** Atomic engineering operations available only to verified Slack parent sessions. */
+	engineering?: {
+		repositoriesList: () => Promise<unknown>;
+		createAndStart: (input: {
+			issueRepository: string;
+			title: string;
+			summary: string;
+			targetRepositories?: string[];
+		}) => Promise<unknown>;
+		current: () => Promise<unknown>;
+		status: () => Promise<unknown>;
+		prompt: (input: { message: string }) => Promise<unknown>;
+		stop: () => Promise<unknown>;
+	};
+
 	/** GitHub Issue operations exposed to conversational parent agents. */
 	githubIssues?: {
 		get: (input: { reference: string }) => Promise<unknown>;
@@ -133,6 +148,97 @@ export function createCyrusToolsServer(
 		name: "cyrus-tools",
 		version: "1.0.0",
 	});
+
+	if (options.engineering) {
+		const result = async (operation: () => Promise<unknown>) => {
+			try {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify(
+								{ success: true, result: await operation() },
+								null,
+								2,
+							),
+						},
+					],
+				};
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({
+								success: false,
+								error: error instanceof Error ? error.message : String(error),
+							}),
+						},
+					],
+				};
+			}
+		};
+		server.registerTool(
+			"engineering_repositories_list",
+			{
+				description:
+					"List active configured GitHub repositories available for Slack engineering work, with safe routing hints but never local paths.",
+				inputSchema: {},
+			},
+			async () => result(() => options.engineering!.repositoriesList()),
+		);
+		server.registerTool(
+			"engineering_create_and_start",
+			{
+				description:
+					"Atomically create a GitHub issue from the current verified Slack thread and immediately start a Claude engineering session. Slack identity, thread, permalink, and context are captured server-side.",
+				inputSchema: {
+					issueRepository: z.string().min(1),
+					title: z.string().min(1),
+					summary: z.string().min(1),
+					targetRepositories: z.array(z.string().min(1)).optional(),
+				},
+			},
+			async (input) => result(() => options.engineering!.createAndStart(input)),
+		);
+		server.registerTool(
+			"engineering_current",
+			{
+				description:
+					"Get the engineering job associated with this verified Slack thread.",
+				inputSchema: {},
+			},
+			async () => result(() => options.engineering!.current()),
+		);
+		server.registerTool(
+			"engineering_status",
+			{
+				description:
+					"Get current status and pull request links for this verified Slack thread's engineering job.",
+				inputSchema: {},
+			},
+			async () => result(() => options.engineering!.status()),
+		);
+		server.registerTool(
+			"engineering_prompt",
+			{
+				description:
+					"Forward the latest verified Slack follow-up to this thread's active engineering job. Server-captured Slack content is authoritative.",
+				inputSchema: { message: z.string().min(1) },
+			},
+			async ({ message }) =>
+				result(() => options.engineering!.prompt({ message })),
+		);
+		server.registerTool(
+			"engineering_stop",
+			{
+				description:
+					"Stop this verified Slack thread's active engineering job.",
+				inputSchema: {},
+			},
+			async () => result(() => options.engineering!.stop()),
+		);
+	}
 
 	if (options.githubIssues) {
 		const result = async (operation: () => Promise<unknown>) => {

@@ -3,7 +3,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
@@ -138,6 +138,7 @@ import {
 } from "cyrus-mcp-tools";
 import {
 	SlackEventTransport,
+	SlackMessageService,
 	type SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
 import { Sessions, streamableHttp } from "fastify-mcp";
@@ -183,6 +184,11 @@ import {
 	SkillsPluginResolver,
 } from "./SkillsPluginResolver.js";
 import { markdownToSlackMrkdwn, SlackChatAdapter } from "./SlackChatAdapter.js";
+import { SlackConversationContextService } from "./SlackConversationContextService.js";
+import {
+	SlackEngineeringOrchestrator,
+	type SlackEngineeringReceipt,
+} from "./SlackEngineeringOrchestrator.js";
 import type { IActivitySink } from "./sinks/IActivitySink.js";
 import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
@@ -262,6 +268,7 @@ export class EdgeWorker extends EventEmitter {
 		string,
 		Map<string, SlackWebhookEvent>
 	>();
+	private slackEngineeringOrchestrator: SlackEngineeringOrchestrator;
 	private gitHubCommentService: GitHubCommentService; // Service for posting comments back to GitHub PRs
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
@@ -654,6 +661,8 @@ export class EdgeWorker extends EventEmitter {
 			this.cyrusHome,
 			this.logger,
 		);
+		this.slackEngineeringOrchestrator =
+			this.createSlackEngineeringOrchestrator();
 
 		// Components will be initialized and registered in start() method before server starts
 	}
@@ -1492,7 +1501,7 @@ export class EdgeWorker extends EventEmitter {
 	private async createChatRunner(
 		config: AgentRunnerConfig,
 	): Promise<IAgentRunner> {
-		const runnerType = this.runnerSelectionService.getDefaultRunner();
+		const runnerType: RunnerType = "claude";
 		const runnerConfig: AgentRunnerConfig = {
 			...config,
 			model: this.getDefaultModelForRunner(runnerType),
@@ -1526,36 +1535,87 @@ export class EdgeWorker extends EventEmitter {
 		workItem: GitHubIssueWorkItemSession,
 		status: "awaiting_review" | "failed" | "stopped",
 	): Promise<void> {
-		const events = this.slackWorkItemEvents?.get(workItem.workItemId);
-		if (!events || !this.slackChatAdapter) return;
-		const finalSummary = this.githubWorkItemFinalSummary(workItem);
-		const text =
-			status === "awaiting_review"
-				? `Finished *${workItem.issue.title}*.${finalSummary ? `\n\n${finalSummary}` : ""}\n\nPull request${workItem.prUrls.length === 1 ? "" : "s"}:\n${workItem.prUrls.map((url) => `- <${url}|${url}>`).join("\n")}`
-				: status === "stopped"
-					? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
-					: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
-		await Promise.allSettled(
-			Array.from(events.entries()).flatMap(([parentSessionId, event]) => {
-				// Release this job's claim first, then hand the thread status back
-				// only once no sibling job of the same chat session is left —
-				// otherwise one child clears another child's status mid-run.
-				this.chatSessionHandler?.setDelegatedWorkActive(
-					parentSessionId,
-					false,
-					workItem.workItemId,
-				);
-				const siblingStillRunning =
-					this.chatSessionHandler?.hasDelegatedWork(parentSessionId) ?? false;
-				return [
-					this.slackChatAdapter!.postDelegatedWorkMessage(event, text),
-					...(siblingStillRunning
-						? []
-						: [this.slackChatAdapter!.clearActivityStatus(event)]),
-				];
-			}),
+		let events = this.slackWorkItemEvents?.get(workItem.workItemId);
+		const receipt = this.slackEngineeringOrchestrator?.byWorkItem(
+			workItem.workItemId,
 		);
-		this.slackWorkItemEvents.delete(workItem.workItemId);
+		if (
+			(!events || events.size === 0) &&
+			receipt &&
+			process.env.SLACK_BOT_TOKEN
+		) {
+			events = new Map([
+				[
+					receipt.parentSessionId,
+					{
+						eventType: "message",
+						eventId: `restored-${receipt.sourceKey}`,
+						teamId: receipt.teamId,
+						slackBotToken: process.env.SLACK_BOT_TOKEN,
+						payload: {
+							type: "message",
+							user: receipt.userId,
+							text: "",
+							ts: receipt.kickoffTs,
+							event_ts: receipt.kickoffTs,
+							channel: receipt.channelId,
+							thread_ts: receipt.threadTs,
+						},
+					} as SlackWebhookEvent,
+				],
+			]);
+		}
+		if (events && this.slackChatAdapter) {
+			const finalSummary = this.githubWorkItemFinalSummary(workItem);
+			const text =
+				status === "awaiting_review"
+					? `Finished *${workItem.issue.title}*.${finalSummary ? `\n\n${finalSummary}` : ""}\n\nPull request${workItem.prUrls.length === 1 ? "" : "s"}:\n${workItem.prUrls.map((url) => `- <${url}|${url}>`).join("\n")}`
+					: status === "stopped"
+						? `Stopped work on *${workItem.issue.title}* and cleaned up its worktrees.`
+						: `I couldn't finish *${workItem.issue.title}*: ${workItem.error ?? "the engineering session failed"}`;
+			await Promise.allSettled(
+				Array.from(events.entries()).flatMap(([parentSessionId, event]) => {
+					// Release this job's claim first, then hand the thread status back
+					// only once no sibling job of the same chat session is left —
+					// otherwise one child clears another child's status mid-run.
+					this.chatSessionHandler?.setDelegatedWorkActive(
+						parentSessionId,
+						false,
+						workItem.workItemId,
+					);
+					const siblingStillRunning =
+						this.chatSessionHandler?.hasDelegatedWork(parentSessionId) ?? false;
+					return [
+						this.slackChatAdapter!.postDelegatedWorkMessage(event, text),
+						...(siblingStillRunning
+							? []
+							: [this.slackChatAdapter!.clearActivityStatus(event)]),
+					];
+				}),
+			);
+		}
+		this.slackWorkItemEvents?.delete(workItem.workItemId);
+		await this.slackEngineeringOrchestrator?.setStatus(
+			workItem.workItemId,
+			status,
+			{ prUrls: workItem.prUrls, error: workItem.error },
+		);
+		if (receipt) {
+			const directories = new Set([
+				...(receipt.contextDirectories ?? []),
+				...(receipt.contextDirectory ? [receipt.contextDirectory] : []),
+			]);
+			await Promise.all(
+				Array.from(directories).map((directory) =>
+					rm(directory, { recursive: true, force: true }),
+				),
+			);
+			receipt.contextDirectory = undefined;
+			receipt.contextManifestPath = undefined;
+			receipt.contextTranscriptPath = undefined;
+			receipt.contextDirectories = [];
+		}
+		await this.savePersistedState();
 	}
 
 	private githubWorkItemFinalSummary(
@@ -1968,7 +2028,8 @@ export class EdgeWorker extends EventEmitter {
 	): Promise<IAgentRunner> {
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (!session) throw new Error(`Missing session ${workItem.sessionId}`);
-		const labels = (githubIssue.labels ?? [])
+		const slackEngineering = workItem.workItemId.startsWith("slack-");
+		const labels = (slackEngineering ? [] : (githubIssue.labels ?? []))
 			.map((label) => label.name)
 			.filter((name): name is string => Boolean(name));
 		const repositories = workItem.repositories ?? [workItem.repository];
@@ -1983,7 +2044,9 @@ export class EdgeWorker extends EventEmitter {
 			),
 		];
 		const systemPrompt = this.buildGitHubIssueSystemPrompt(workItem);
-		const selectorDescription = `${githubIssue.body ?? ""}\n\n[agent=${workItem.runnerType}]`;
+		const selectorDescription = slackEngineering
+			? "[agent=claude]"
+			: `${githubIssue.body ?? ""}\n\n[agent=${workItem.runnerType}]`;
 		const { config, runnerType } = await this.buildAgentRunnerConfig(
 			session,
 			workItem.repository,
@@ -2004,6 +2067,10 @@ export class EdgeWorker extends EventEmitter {
 			throw new Error(
 				`Runner selection mismatch: requested ${workItem.runnerType}, resolved ${runnerType}`,
 			);
+		}
+		if (slackEngineering) {
+			config.model =
+				workItem.repository.model || this.config.claudeDefaultModel || "opus";
 		}
 		const baseOnMessage = config.onMessage;
 		config.onMessage = async (message) => {
@@ -2453,6 +2520,14 @@ Investigate across every participating repository. Modify only repositories that
 		status: GitHubIssueWorkItemSession["status"],
 	): void {
 		workItem.status = status;
+		void this.slackEngineeringOrchestrator?.setStatus(
+			workItem.workItemId,
+			status,
+			{
+				prUrls: workItem.prUrls,
+				error: workItem.error,
+			},
+		);
 		const session = this.agentSessionManager.getSession(workItem.sessionId);
 		if (session?.metadata?.githubWorkItem) {
 			session.metadata.githubWorkItem.status = status;
@@ -7253,6 +7328,26 @@ ${taskSection}`;
 				);
 			},
 		};
+		const slackEvent = parentSessionId
+			? this.chatSessionHandler?.getLatestEventForSession(parentSessionId)
+			: undefined;
+		// Possession of a parent id is not proof of Slack origin. Only expose these
+		// tools when the server can resolve that id to a verified Slack event.
+		if (parentSessionId && slackEvent) {
+			options.engineering = {
+				repositoriesList: async () =>
+					this.slackEngineeringOrchestrator.listRepositories(),
+				createAndStart: (input) =>
+					this.createAndStartSlackEngineering(parentSessionId, input),
+				current: async () =>
+					this.slackEngineeringOrchestrator.current(parentSessionId) ?? null,
+				status: async () =>
+					this.slackEngineeringOrchestrator.current(parentSessionId) ?? null,
+				prompt: ({ message }) =>
+					this.promptSlackEngineering(parentSessionId, message),
+				stop: () => this.slackEngineeringOrchestrator.stop(parentSessionId),
+			};
+		}
 		if (failureModesClient) {
 			options.failureModes = {
 				resolveSessionFromCwd: (cwd: string) => this.resolveSessionFromCwd(cwd),
@@ -7260,6 +7355,245 @@ ${taskSection}`;
 			};
 		}
 		return options;
+	}
+
+	private createSlackEngineeringOrchestrator(): SlackEngineeringOrchestrator {
+		return new SlackEngineeringOrchestrator({
+			repositories: () =>
+				Array.from(this.repositories.values())
+					.filter(
+						(repository) =>
+							repository.isActive !== false && repository.githubUrl,
+					)
+					.map((repository) => ({
+						name: repository.name,
+						fullName: this.configuredRepositoryFullName(repository),
+						routingHints: [
+							...(repository.routingLabels ?? []),
+							...(repository.teamKeys ?? []),
+							...(repository.projectKeys ?? []),
+						],
+					})),
+			persist: async () => this.savePersistedState(),
+			createIssue: (input) =>
+				this.createSlackEngineeringIssue(
+					input.repository,
+					input.title,
+					input.body,
+				),
+			findIssueByMarker: (repository, marker) =>
+				this.findSlackEngineeringIssueByMarker(repository, marker),
+			startWorkItem: async (input) => {
+				const result = await this.startGitHubIssueWorkItem(input);
+				return { workItemId: input.workItemId, ...result };
+			},
+			promptWorkItem: async (workItemId, message) =>
+				this.promptGitHubIssueWorkItem(workItemId, {
+					requestId: randomUUID(),
+					commentId: Date.now(),
+					author: "Slack user",
+					body: message,
+				}),
+			stopWorkItem: async (workItemId) =>
+				this.stopGitHubIssueWorkItem(workItemId, {
+					requestId: randomUUID(),
+					reason: "user_requested",
+				}),
+		});
+	}
+
+	private async captureSlackEngineeringSource(
+		parentSessionId: string,
+	): Promise<{
+		source: Parameters<SlackEngineeringOrchestrator["createAndStart"]>[0];
+		manifest: Awaited<ReturnType<SlackConversationContextService["capture"]>>;
+	}> {
+		const event =
+			this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
+		if (!event)
+			throw new Error("Verified Slack parent session is no longer available");
+		const token = event.slackBotToken ?? process.env.SLACK_BOT_TOKEN;
+		if (!token) throw new Error("Slack authentication is unavailable");
+		const threadTs = event.payload.thread_ts || event.payload.ts;
+		const snapshot = await new SlackMessageService().fetchThreadThrough({
+			token,
+			channel: event.payload.channel,
+			thread_ts: threadTs,
+			trigger_ts: event.payload.ts,
+		});
+		const manifest = await new SlackConversationContextService({
+			cyrusHome: this.cyrusHome,
+			logger: this.logger,
+		}).capture({
+			teamId: event.teamId,
+			channelId: event.payload.channel,
+			threadTs,
+			kickoffTs: event.payload.ts,
+			threadPermalink: snapshot.permalink,
+			token,
+			messages: snapshot.messages,
+		});
+		return {
+			source: {
+				parentSessionId,
+				teamId: event.teamId,
+				userId: event.payload.user,
+				channelId: event.payload.channel,
+				threadTs,
+				kickoffTs: event.payload.ts,
+				permalink: snapshot.permalink,
+				contextDirectory: manifest.directory,
+				contextManifestPath: manifest.manifestPath,
+				contextTranscriptPath: manifest.transcriptPath,
+			},
+			manifest,
+		};
+	}
+
+	private async createAndStartSlackEngineering(
+		parentSessionId: string,
+		input: {
+			issueRepository: string;
+			title: string;
+			summary: string;
+			targetRepositories?: string[];
+		},
+	): Promise<SlackEngineeringReceipt> {
+		const { source } =
+			await this.captureSlackEngineeringSource(parentSessionId);
+		const receipt = await this.slackEngineeringOrchestrator.createAndStart(
+			source,
+			input,
+		);
+		await this.attachSlackSubscriber(receipt.workItemId!, parentSessionId);
+		this.logger.info("Slack engineering decision", {
+			sourceKey: receipt.sourceKey,
+			teamId: receipt.teamId,
+			userId: receipt.userId,
+			channelId: receipt.channelId,
+			threadTs: receipt.threadTs,
+			repositories: receipt.targetRepositories,
+			issueUrl: receipt.issueUrl,
+			workItemId: receipt.workItemId,
+			status: receipt.status,
+			decision: "create_and_start",
+		});
+		return receipt;
+	}
+
+	private async promptSlackEngineering(
+		parentSessionId: string,
+		modelSummary: string,
+	): Promise<SlackEngineeringReceipt> {
+		const { manifest } =
+			await this.captureSlackEngineeringSource(parentSessionId);
+		await this.slackEngineeringOrchestrator.addContextDirectory(
+			parentSessionId,
+			manifest.directory,
+		);
+		const latest = manifest.manifest.messages.at(-1);
+		const authoritativeText = latest?.text?.trim() || modelSummary;
+		const images =
+			latest?.files.filter(
+				(file) =>
+					file.status === "downloaded" &&
+					file.localPath &&
+					file.mimeType?.startsWith("image/"),
+			) ?? [];
+		const receipt = this.slackEngineeringOrchestrator.current(parentSessionId);
+		if (!receipt?.workItemId)
+			throw new Error("No active engineering job exists for this Slack thread");
+		const workItem = this.getGitHubIssueWorkItemSession(receipt.workItemId);
+		const runner =
+			workItem &&
+			this.agentSessionManager.getSession(workItem.sessionId)?.agentRunner;
+		if (runner?.isRunning() && runner.addStreamTurn && images.length) {
+			runner.addStreamTurn([
+				{ type: "text", text: authoritativeText },
+				...images.map((file) => ({
+					type: "local_image" as const,
+					path: file.localPath!,
+					mediaType: file.mimeType as
+						| "image/jpeg"
+						| "image/png"
+						| "image/gif"
+						| "image/webp",
+				})),
+			]);
+			return receipt;
+		}
+		return this.slackEngineeringOrchestrator.prompt(
+			parentSessionId,
+			authoritativeText,
+		);
+	}
+
+	private async createSlackEngineeringIssue(
+		repository: string,
+		title: string,
+		body: string,
+	): Promise<{ number: number; url: string }> {
+		const token = await this.resolveGitHubTokenValue();
+		if (!token) throw new Error("GitHub authentication is unavailable");
+		const response = await fetch(
+			`https://api.github.com/repos/${repository}/issues`,
+			{
+				method: "POST",
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+				body: JSON.stringify({ title, body }),
+			},
+		);
+		if (!response.ok)
+			throw new Error(`GitHub Issue creation failed (${response.status})`);
+		const issue = (await response.json()) as {
+			number: number;
+			html_url: string;
+		};
+		return { number: issue.number, url: issue.html_url };
+	}
+
+	private async findSlackEngineeringIssueByMarker(
+		repository: string,
+		marker: string,
+	): Promise<{ number: number; url: string } | undefined> {
+		const token = await this.resolveGitHubTokenValue();
+		if (!token) throw new Error("GitHub authentication is unavailable");
+		const markerKey = marker.replace(/^<!-- cyrus-slack-source:| -->$/g, "");
+		const query = encodeURIComponent(
+			`repo:${repository} is:issue in:body cyrus-slack-source:${markerKey}`,
+		);
+		const response = await fetch(
+			`https://api.github.com/search/issues?q=${query}&per_page=100`,
+			{
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			},
+		);
+		if (!response.ok)
+			throw new Error(`GitHub Issue recovery failed (${response.status})`);
+		const payload = (await response.json()) as {
+			items?: Array<{
+				number: number;
+				html_url: string;
+				body?: string | null;
+				pull_request?: unknown;
+			}>;
+		};
+		const issues = payload.items ?? [];
+		const found = issues.find(
+			(issue) => !issue.pull_request && issue.body?.includes(marker),
+		);
+		return found ? { number: found.number, url: found.html_url } : undefined;
 	}
 
 	private handleChildSessionMapping(
@@ -8236,6 +8570,8 @@ ${input.userComment}
 			agentSessionEntries: serializedState.entries,
 			childToParentAgentSession,
 			issueRepositoryCache,
+			slackEngineeringReceipts:
+				this.slackEngineeringOrchestrator?.allReceipts(),
 		};
 	}
 
@@ -8243,6 +8579,11 @@ ${input.userComment}
 	 * Restore EdgeWorker mappings from serialized state (v4.0 flat format)
 	 */
 	public restoreMappings(state: SerializableEdgeWorkerState): void {
+		if (state.slackEngineeringReceipts) {
+			this.slackEngineeringOrchestrator?.restore(
+				state.slackEngineeringReceipts as SlackEngineeringReceipt[],
+			);
+		}
 		// Restore Agent Session state from flat format
 		if (state.agentSessions && state.agentSessionEntries) {
 			this.agentSessionManager.restoreState(

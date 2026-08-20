@@ -11,7 +11,7 @@ describe("EdgeWorker chat runner credentials", () => {
 	function buildWorker(token: string | undefined) {
 		const worker: any = Object.create(EdgeWorker.prototype);
 		worker.runnerSelectionService = {
-			getDefaultRunner: vi.fn().mockReturnValue("claude"),
+			getDefaultRunner: vi.fn().mockReturnValue("codex"),
 		};
 		worker.getDefaultModelForRunner = vi.fn().mockReturnValue("model");
 		worker.getDefaultFallbackModelForRunner = vi
@@ -36,6 +36,20 @@ describe("EdgeWorker chat runner credentials", () => {
 					GITHUB_TOKEN: "ghs_installation_token",
 				},
 			}),
+		);
+	});
+
+	it("locks Slack parent sessions to Claude even when another runner is configured globally", async () => {
+		const worker = buildWorker(undefined);
+
+		await worker.createChatRunner({ workingDirectory: "/tmp/thread" });
+
+		expect(
+			worker.runnerSelectionService.getDefaultRunner,
+		).not.toHaveBeenCalled();
+		expect(worker.createRunnerForType).toHaveBeenCalledWith(
+			"claude",
+			expect.objectContaining({ model: "model", fallbackModel: "fallback" }),
 		);
 	});
 
