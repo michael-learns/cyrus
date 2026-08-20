@@ -112,10 +112,133 @@ function isPrivateSlackFileUrl(value: string): boolean {
 }
 
 function isSlackOwnedHost(url: URL): boolean {
+	return url.protocol === "https:" && url.host === "files.slack.com";
+}
+
+function messageTextFootprint(message: SlackConversationMessage): number {
 	return (
-		url.protocol === "https:" &&
-		(url.hostname === "slack.com" || url.hostname.endsWith(".slack.com"))
+		message.ts.length +
+		message.author.length +
+		message.text.length +
+		message.links.reduce(
+			(total, link) => total + link.label.length + link.url.length,
+			0,
+		) +
+		message.forwarded.reduce(
+			(total, item) =>
+				total +
+				item.author.length +
+				(item.source?.length ?? 0) +
+				item.text.length,
+			0,
+		) +
+		message.files.reduce(
+			(total, file) =>
+				total +
+				file.id.length +
+				file.name.length +
+				(file.mimeType?.length ?? 0) +
+				file.status.length +
+				(file.reason?.length ?? 0) +
+				(file.localPath?.length ?? 0),
+			0,
+		)
 	);
+}
+
+function fitMessageToTextBudget(
+	message: SlackConversationMessage,
+	budget: number,
+): SlackConversationMessage {
+	let remaining = budget;
+	const take = (value: string): string => {
+		const result = value.slice(0, remaining);
+		remaining -= result.length;
+		return result;
+	};
+	const fitted: SlackConversationMessage = {
+		ts: take(message.ts),
+		text: take(message.text),
+		author: take(message.author),
+		links: [],
+		forwarded: [],
+		files: [],
+	};
+	for (const link of message.links) {
+		if (remaining === 0) break;
+		fitted.links.push({ label: take(link.label), url: take(link.url) });
+	}
+	for (const item of message.forwarded) {
+		if (remaining === 0) break;
+		fitted.forwarded.push({
+			author: take(item.author),
+			...(item.source !== undefined && { source: take(item.source) }),
+			text: take(item.text),
+		});
+	}
+	for (const file of message.files) {
+		if (remaining < file.status.length) break;
+		remaining -= file.status.length;
+		fitted.files.push({
+			id: take(file.id),
+			name: take(file.name),
+			...(file.mimeType !== undefined && { mimeType: take(file.mimeType) }),
+			...(file.size !== undefined && { size: file.size }),
+			status: file.status,
+			...(file.reason !== undefined && { reason: take(file.reason) }),
+			...(file.localPath !== undefined && { localPath: take(file.localPath) }),
+		});
+	}
+	return fitted;
+}
+
+async function readBodyWithinLimit(
+	body: ReadableStream<Uint8Array> | null,
+	limit: number,
+): Promise<{
+	buffer: Buffer;
+	bytesReceived: number;
+	exceeded: boolean;
+	error?: unknown;
+}> {
+	if (!body)
+		return { buffer: Buffer.alloc(0), bytesReceived: 0, exceeded: false };
+	const reader = body.getReader();
+	const chunks: Buffer[] = [];
+	let bytesReceived = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const chunk = Buffer.from(value);
+			const available = limit - bytesReceived;
+			if (chunk.length > available) {
+				if (available > 0) chunks.push(chunk.subarray(0, available));
+				bytesReceived = limit;
+				await reader.cancel().catch(() => undefined);
+				return {
+					buffer: Buffer.concat(chunks, bytesReceived),
+					bytesReceived,
+					exceeded: true,
+				};
+			}
+			chunks.push(chunk);
+			bytesReceived += chunk.length;
+		}
+		return {
+			buffer: Buffer.concat(chunks, bytesReceived),
+			bytesReceived,
+			exceeded: false,
+		};
+	} catch (error) {
+		await reader.cancel().catch(() => undefined);
+		return {
+			buffer: Buffer.concat(chunks, bytesReceived),
+			bytesReceived,
+			exceeded: false,
+			error,
+		};
+	}
 }
 
 function redact(value: string, token: string): string {
@@ -270,7 +393,6 @@ export class SlackConversationContextService {
 		let normalized = selected.map((message) =>
 			this.normalizeMessage(message, input.token),
 		);
-		normalized = this.applyTextLimit(normalized, truncations);
 
 		const key = createHash("sha256")
 			.update(
@@ -283,7 +405,7 @@ export class SlackConversationContextService {
 		await mkdir(imagesDirectory, { recursive: true, mode: 0o700 });
 
 		let imageCount = 0;
-		let downloadedBytes = 0;
+		let receivedBytes = 0;
 		for (const message of normalized) {
 			for (let index = 0; index < message.files.length; index++) {
 				const original = selected.find((item) => item.ts === message.ts)
@@ -294,7 +416,7 @@ export class SlackConversationContextService {
 					input.token,
 					imagesDirectory,
 					imageCount,
-					downloadedBytes,
+					receivedBytes,
 				);
 				message.files[index] = result.file;
 				if (
@@ -306,9 +428,8 @@ export class SlackConversationContextService {
 				) {
 					imageCount++;
 				}
-				if (result.file.status === "downloaded") {
-					downloadedBytes += result.bytes;
-				} else if (result.file.reason === "image_limit") {
+				receivedBytes += result.bytesReceived;
+				if (result.file.reason === "image_limit") {
 					truncations.push({
 						kind: "images",
 						omitted: 1,
@@ -335,6 +456,7 @@ export class SlackConversationContextService {
 				}
 			}
 		}
+		normalized = this.applyTextLimit(normalized, truncations);
 
 		const manifest: SlackConversationManifest = {
 			version: 1,
@@ -406,46 +528,50 @@ export class SlackConversationContextService {
 		messages: SlackConversationMessage[],
 		truncations: SlackConversationTruncation[],
 	): SlackConversationMessage[] {
-		const length = (message: SlackConversationMessage) =>
-			message.text.length +
-			message.forwarded.reduce((sum, item) => sum + item.text.length, 0);
-		if (
-			messages.reduce((sum, message) => sum + length(message), 0) <=
-			MAX_TEXT_CHARS
-		)
-			return messages;
-		const root = structuredClone(messages[0]!);
-		let remaining = MAX_TEXT_CHARS;
-		if (length(root) > remaining) {
-			root.text = root.text.slice(0, remaining);
-			root.forwarded = [];
+		const total = messages.reduce(
+			(sum, message) => sum + messageTextFootprint(message),
+			0,
+		);
+		if (total <= MAX_TEXT_CHARS) return messages;
+		const root = messages[0]!;
+		const newest = messages.at(-1)!;
+		if (messages.length === 1) {
 			truncations.push({
 				kind: "text",
-				detail: "text truncated at 100,000 characters; root preserved",
+				detail:
+					"persisted message text fields truncated at 100,000 characters; root preserved",
 			});
-			return [root];
+			return [fitMessageToTextBudget(root, MAX_TEXT_CHARS)];
 		}
-		remaining -= length(root);
-		const newest: SlackConversationMessage[] = [];
-		for (let index = messages.length - 1; index > 0 && remaining > 0; index--) {
-			const message = structuredClone(messages[index]!);
-			const messageLength = length(message);
-			if (messageLength <= remaining) {
-				newest.unshift(message);
-				remaining -= messageLength;
-			} else {
-				message.text = message.text.slice(0, remaining);
-				message.forwarded = [];
-				newest.unshift(message);
-				remaining = 0;
-			}
+		const newestReservation = Math.min(
+			messageTextFootprint(newest),
+			Math.floor(MAX_TEXT_CHARS / 2),
+		);
+		const fittedRoot = fitMessageToTextBudget(
+			root,
+			MAX_TEXT_CHARS - newestReservation,
+		);
+		let remaining = MAX_TEXT_CHARS - messageTextFootprint(fittedRoot);
+		const fittedNewest = fitMessageToTextBudget(newest, remaining);
+		remaining -= messageTextFootprint(fittedNewest);
+		const middle: SlackConversationMessage[] = [];
+		for (let index = messages.length - 2; index > 0 && remaining > 0; index--) {
+			const message = messages[index]!;
+			const footprint = messageTextFootprint(message);
+			const fitted =
+				footprint <= remaining
+					? message
+					: fitMessageToTextBudget(message, remaining);
+			const fittedFootprint = messageTextFootprint(fitted);
+			if (fittedFootprint > 0) middle.unshift(fitted);
+			remaining -= fittedFootprint;
 		}
 		truncations.push({
 			kind: "text",
 			detail:
-				"text truncated at 100,000 characters; root and newest messages preserved",
+				"persisted message text fields truncated at 100,000 characters; root and newest messages preserved",
 		});
-		return [root, ...newest];
+		return [fittedRoot, ...middle, fittedNewest];
 	}
 
 	private async captureFile(
@@ -453,8 +579,8 @@ export class SlackConversationContextService {
 		token: string,
 		imagesDirectory: string,
 		imageCount: number,
-		downloadedBytes: number,
-	): Promise<{ file: SlackCapturedFile; bytes: number }> {
+		receivedBytes: number,
+	): Promise<{ file: SlackCapturedFile; bytesReceived: number }> {
 		const result: SlackCapturedFile = {
 			id: redact(file.id, token),
 			name: redact(file.name || file.id, token),
@@ -463,24 +589,48 @@ export class SlackConversationContextService {
 			status: "skipped",
 		};
 		if (!file.mimetype || !SUPPORTED_IMAGES.has(file.mimetype))
-			return { file: { ...result, reason: "unsupported_type" }, bytes: 0 };
+			return {
+				file: { ...result, reason: "unsupported_type" },
+				bytesReceived: 0,
+			};
 		if (imageCount >= MAX_IMAGES)
-			return { file: { ...result, reason: "image_limit" }, bytes: 0 };
+			return { file: { ...result, reason: "image_limit" }, bytesReceived: 0 };
 		if (file.size && file.size > MAX_IMAGE_BYTES)
-			return { file: { ...result, reason: "file_too_large" }, bytes: 0 };
-		if (file.size && downloadedBytes + file.size > MAX_DOWNLOAD_BYTES)
-			return { file: { ...result, reason: "total_download_limit" }, bytes: 0 };
+			return {
+				file: { ...result, reason: "file_too_large" },
+				bytesReceived: 0,
+			};
+		if (file.size && receivedBytes + file.size > MAX_DOWNLOAD_BYTES)
+			return {
+				file: { ...result, reason: "total_download_limit" },
+				bytesReceived: 0,
+			};
+		if (receivedBytes >= MAX_DOWNLOAD_BYTES)
+			return {
+				file: { ...result, reason: "total_download_limit" },
+				bytesReceived: 0,
+			};
 		const privateUrl = file.url_private_download || file.url_private;
 		if (!privateUrl)
-			return { file: { ...result, reason: "missing_private_url" }, bytes: 0 };
+			return {
+				file: { ...result, reason: "missing_private_url" },
+				bytesReceived: 0,
+			};
 		let url: URL;
+		let candidateBytesReceived = 0;
 		try {
 			url = new URL(privateUrl);
 		} catch {
-			return { file: { ...result, reason: "unsafe_host" }, bytes: 0 };
+			return {
+				file: { ...result, reason: "unsafe_host" },
+				bytesReceived: 0,
+			};
 		}
 		if (!isSlackOwnedHost(url))
-			return { file: { ...result, reason: "unsafe_host" }, bytes: 0 };
+			return {
+				file: { ...result, reason: "unsafe_host" },
+				bytesReceived: 0,
+			};
 
 		try {
 			let response: Response | undefined;
@@ -491,36 +641,72 @@ export class SlackConversationContextService {
 				});
 				if (![301, 302, 303, 307, 308].includes(response.status)) break;
 				if (redirects === 5)
-					return { file: { ...result, reason: "unsafe_redirect" }, bytes: 0 };
+					return {
+						file: { ...result, reason: "unsafe_redirect" },
+						bytesReceived: 0,
+					};
 				const location = response.headers.get("location");
 				if (!location)
-					return { file: { ...result, reason: "unsafe_redirect" }, bytes: 0 };
-				const next = new URL(location, url);
+					return {
+						file: { ...result, reason: "unsafe_redirect" },
+						bytesReceived: 0,
+					};
+				let next: URL;
+				try {
+					next = new URL(location, url);
+				} catch {
+					return {
+						file: { ...result, reason: "unsafe_redirect" },
+						bytesReceived: 0,
+					};
+				}
 				if (!isSlackOwnedHost(next))
-					return { file: { ...result, reason: "unsafe_redirect" }, bytes: 0 };
+					return {
+						file: { ...result, reason: "unsafe_redirect" },
+						bytesReceived: 0,
+					};
 				url = next;
 			}
 			if (!response?.ok)
 				return {
 					file: { ...result, status: "failed", reason: "download_failed" },
-					bytes: 0,
+					bytesReceived: 0,
 				};
 			const contentLength = Number(response.headers.get("content-length") || 0);
-			if (contentLength > MAX_IMAGE_BYTES)
-				return { file: { ...result, reason: "file_too_large" }, bytes: 0 };
-			if (downloadedBytes + contentLength > MAX_DOWNLOAD_BYTES)
+			if (contentLength > MAX_IMAGE_BYTES) {
+				await response.body?.cancel().catch(() => undefined);
+				return {
+					file: { ...result, reason: "file_too_large" },
+					bytesReceived: 0,
+				};
+			}
+			if (receivedBytes + contentLength > MAX_DOWNLOAD_BYTES) {
+				await response.body?.cancel().catch(() => undefined);
 				return {
 					file: { ...result, reason: "total_download_limit" },
-					bytes: 0,
+					bytesReceived: 0,
 				};
-			const bytes = Buffer.from(await response.arrayBuffer());
-			if (bytes.length > MAX_IMAGE_BYTES)
-				return { file: { ...result, reason: "file_too_large" }, bytes: 0 };
-			if (downloadedBytes + bytes.length > MAX_DOWNLOAD_BYTES)
+			}
+			const remainingTotal = MAX_DOWNLOAD_BYTES - receivedBytes;
+			const streamLimit = Math.min(MAX_IMAGE_BYTES, remainingTotal);
+			const body = await readBodyWithinLimit(response.body, streamLimit);
+			candidateBytesReceived = body.bytesReceived;
+			if (body.error)
 				return {
-					file: { ...result, reason: "total_download_limit" },
-					bytes: 0,
+					file: { ...result, status: "failed", reason: "download_failed" },
+					bytesReceived: body.bytesReceived,
 				};
+			if (body.exceeded) {
+				const reason =
+					remainingTotal < MAX_IMAGE_BYTES
+						? "total_download_limit"
+						: "file_too_large";
+				return {
+					file: { ...result, reason },
+					bytesReceived: body.bytesReceived,
+				};
+			}
+			const bytes = body.buffer;
 			const detected = await fileTypeFromBuffer(bytes);
 			const headerMime = response.headers
 				.get("content-type")
@@ -533,7 +719,10 @@ export class SlackConversationContextService {
 				headerMime !== detected.mime ||
 				!SUPPORTED_IMAGES.has(detected.mime)
 			) {
-				return { file: { ...result, reason: "mime_mismatch" }, bytes: 0 };
+				return {
+					file: { ...result, reason: "mime_mismatch" },
+					bytesReceived: body.bytesReceived,
+				};
 			}
 			const localName = `image-${String(imageCount + 1).padStart(3, "0")}.${SUPPORTED_IMAGES.get(detected.mime)}`;
 			await writeFile(join(imagesDirectory, localName), bytes, { mode: 0o600 });
@@ -544,7 +733,7 @@ export class SlackConversationContextService {
 					reason: undefined,
 					localPath: `images/${localName}`,
 				},
-				bytes: bytes.length,
+				bytesReceived: body.bytesReceived,
 			};
 		} catch (error) {
 			this.logger?.warn?.(
@@ -552,7 +741,7 @@ export class SlackConversationContextService {
 			);
 			return {
 				file: { ...result, status: "failed", reason: "download_failed" },
-				bytes: 0,
+				bytesReceived: candidateBytesReceived,
 			};
 		}
 	}

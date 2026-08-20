@@ -293,6 +293,28 @@ describe("SlackMessageService", () => {
 			expect(permalinkCall.searchParams.get("message_ts")).toBe("1.000");
 		});
 
+		it("rejects an incomplete paginated thread response", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({
+					ok: true,
+					messages: [{ user: "U1", text: "root", ts: "1.000" }],
+					has_more: true,
+					response_metadata: { next_cursor: "" },
+				}),
+			});
+
+			await expect(
+				service.fetchThreadThrough({
+					token: "xoxb-secret",
+					channel: "C1",
+					thread_ts: "1.000",
+					trigger_ts: "2.000",
+				}),
+			).rejects.toThrow("incomplete pagination");
+			expect(mockFetch).toHaveBeenCalledTimes(1);
+		});
+
 		it("fetches thread messages with correct GET params and Bearer auth", async () => {
 			mockFetch.mockResolvedValueOnce({
 				ok: true,

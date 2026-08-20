@@ -338,9 +338,17 @@ export class SlackMessageService {
 				);
 			}
 			messages.push(...(body.messages ?? []));
-			cursor = body.has_more
-				? body.response_metadata?.next_cursor || undefined
-				: undefined;
+			if (body.has_more) {
+				const nextCursor = body.response_metadata?.next_cursor?.trim();
+				if (!nextCursor) {
+					throw new Error(
+						"[SlackMessageService] Slack API returned incomplete pagination: has_more without next_cursor",
+					);
+				}
+				cursor = nextCursor;
+			} else {
+				cursor = undefined;
+			}
 		} while (cursor);
 
 		const permalinkQuery = new URLSearchParams({
