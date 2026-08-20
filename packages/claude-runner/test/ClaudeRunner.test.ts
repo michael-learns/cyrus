@@ -14,6 +14,7 @@ vi.mock("fs", () => ({
 		encoding ? "" : Buffer.from("image bytes"),
 	),
 	realpathSync: vi.fn((path) => path),
+	statSync: vi.fn(() => ({ isDirectory: () => true })),
 	createWriteStream: vi.fn(() => ({
 		write: vi.fn(),
 		end: vi.fn(),
@@ -26,7 +27,7 @@ vi.mock("os", () => ({
 	homedir: vi.fn(() => "/mock/home"),
 }));
 
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { AbortError, ClaudeRunner } from "../src/ClaudeRunner";
 import type { ClaudeRunnerConfig, SDKMessage } from "../src/types";
@@ -419,6 +420,94 @@ describe("ClaudeRunner", () => {
 					session_id: "pending",
 				},
 			]);
+		});
+
+		it("leases an exact existing image directory for one structured turn", () => {
+			const addMessage = vi.fn();
+			const structuredRunner = new ClaudeRunner(defaultConfig);
+			(structuredRunner as any).sessionInfo = {
+				sessionId: "test-session",
+				startedAt: new Date(),
+				isRunning: true,
+			};
+			(structuredRunner as any).streamingPrompt = {
+				completed: false,
+				addMessage,
+			};
+
+			const lease = structuredRunner.allowLocalImageDirectory("/tmp/capture");
+			structuredRunner.addStreamTurn([
+				{ type: "text", text: "before" },
+				{
+					type: "local_image",
+					path: "/tmp/capture/one.png",
+					mediaType: "image/png",
+				},
+				{
+					type: "local_image",
+					path: "/tmp/capture/two.jpg",
+					mediaType: "image/jpeg",
+				},
+			]);
+			lease.release();
+
+			expect(addMessage.mock.calls[0]?.[0]).toEqual([
+				{ type: "text", text: "before" },
+				expect.objectContaining({ type: "image" }),
+				expect.objectContaining({ type: "image" }),
+			]);
+			expect(() =>
+				structuredRunner.addStreamTurn([
+					{
+						type: "local_image",
+						path: "/tmp/capture/one.png",
+						mediaType: "image/png",
+					},
+				]),
+			).toThrow("Local image path is not allowed");
+		});
+
+		it("keeps concurrent directory leases isolated and rejects invalid directories generically", () => {
+			const structuredRunner = new ClaudeRunner(defaultConfig);
+			const first = structuredRunner.allowLocalImageDirectory("/tmp/capture");
+			const second = structuredRunner.allowLocalImageDirectory("/tmp/capture");
+			first.release();
+			expect(() =>
+				(structuredRunner as any).loadLocalImage({
+					type: "local_image",
+					path: "/tmp/capture/one.png",
+					mediaType: "image/png",
+				}),
+			).not.toThrow();
+			second.release();
+			expect(() =>
+				(structuredRunner as any).loadLocalImage({
+					type: "local_image",
+					path: "/tmp/capture/one.png",
+					mediaType: "image/png",
+				}),
+			).toThrow("Local image path is not allowed");
+
+			vi.mocked(statSync).mockReturnValueOnce({
+				isDirectory: () => false,
+			} as any);
+			let authorizationError: Error | undefined;
+			try {
+				structuredRunner.allowLocalImageDirectory("/secret/not-a-directory");
+			} catch (error) {
+				authorizationError = error as Error;
+			}
+			expect(authorizationError?.message).toBe(
+				"Unable to authorize local image directory",
+			);
+			expect(authorizationError?.message).not.toContain("/secret");
+
+			vi.mocked(realpathSync).mockImplementationOnce(() => {
+				throw new Error("ENOENT: /secret/missing-directory");
+			});
+			expect(() =>
+				structuredRunner.allowLocalImageDirectory("/secret/missing-directory"),
+			).toThrow("Unable to authorize local image directory");
 		});
 
 		it("rejects disallowed and unreadable local images without exposing paths", async () => {

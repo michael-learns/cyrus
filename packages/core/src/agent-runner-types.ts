@@ -42,6 +42,11 @@ export type AgentTurnPart = AgentTextPart | AgentLocalImagePart;
 /** Ordered text and local-image input supplied as one user turn. */
 export type AgentTurn = AgentTurnPart[];
 
+/** Revocable grant for server-side local-image encoding. */
+export interface AgentLocalImageDirectoryLease {
+	release(): void;
+}
+
 // ============================================================================
 // ASK USER QUESTION TYPES
 // ============================================================================
@@ -340,6 +345,12 @@ export interface IAgentRunner {
 
 	/** Add one ordered structured user turn to an active input stream. */
 	addStreamTurn?(turn: AgentTurn): void;
+
+	/**
+	 * Temporarily permit server-side image encoding from one exact directory.
+	 * This trusted-host capability is intentionally not exposed as an agent tool.
+	 */
+	allowLocalImageDirectory?(directory: string): AgentLocalImageDirectoryLease;
 
 	/**
 	 * Complete the streaming prompt (no more messages will be added)

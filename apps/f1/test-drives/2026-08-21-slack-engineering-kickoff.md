@@ -82,7 +82,7 @@ restart-status fixture.
 | Ordered text/image/link context | PASS | Structured turn contained issue text, then normalized transcript with the labeled acceptance-criteria link, then a canonical absolute PNG path under the private capture directory. |
 | Exactly one issue and retry | PASS | First kickoff created issue 1; identical retry retained the same source key/issue and issue count stayed 1. |
 | Claude lock/model precedence | PASS | Global default runner was deliberately `codex`; both Slack runners were recorded as Claude. Chat used `claude-f1-default`; delegated work used repository model `claude-f1-repo-model`. Slack/issue `[agent=codex]` and `[model=untrusted-model]` selectors did not change them. Focused unit coverage separately proves repository model → `claudeDefaultModel` → `opus` fallback. |
-| Active follow-up guidance | PASS | Latest authoritative Slack text, “Also keep the legend visible below 480px,” and its image reached the child in order. The image was validated and exclusively created as a collision-resistant hidden file directly under the canonical initial context, such as `initial-context/.followup-ec96e730-566a-415d-8df3-4f4f420305df-image-001.png`; the separate source capture was cleaned. |
+| Active follow-up guidance | PASS | Latest authoritative Slack text, “Also keep the legend visible below 480px,” and its image reached the child in order from the canonical capture path. Production wrote no staging artifact: it leased that exact capture directory only while the runner synchronously read the image, revoked the lease, and deleted the capture immediately. The receipt retained only its initial context. |
 | PR/final delivery | PASS (synthetic boundary) | Production commit detection found the local synthetic commit, GitHub boundary returned PR 101, and the persisted Slack message contained the final summary and PR link. No live push/PR occurred. |
 | Failed delivery and restart | PASS | First Slack post was recorded `ok: false`; receipt restored after restart. A later verified Slack event triggered production replay and the identical post was recorded `ok: true`. |
 | Restored MCP status | PASS | After restart, `engineering_status` resolved the persisted receipt by verified Slack team/channel/thread identity and returned `awaiting_review`, issue 1, delivered status, and PR 101. |
@@ -175,6 +175,33 @@ and retry remained issue 1, the follow-up turn recorded
 `.followup-ec96e730-566a-415d-8df3-4f4f420305df-image-001.png` directly below
 the initial context, all snapshots retained `externalRequests: []`, and MCP stop
 removed the full context and worktree.
+
+Fix Round 4 supersedes every follow-up staging design above. Production now
+canonical-validates the freshly created capture directory beneath
+`<cyrusHome>/slack-context`, resolves every manifest image canonically beneath
+that exact directory, and obtains a trusted-host image-read lease from the live
+runner. ClaudeRunner reads and base64-encodes every ordered image synchronously
+inside `addStreamTurn`; a `finally` block then revokes the token-scoped lease and
+deletes the capture. It creates no destination file or directory and never adds
+the capture to the persisted receipt. Independent tokens prevent concurrent
+turns from revoking one another.
+
+The fresh Fix Round 4 drive used
+`/tmp/cyrus-f1-slack-fix4.KrwBpq/cyrus-home`. Health/status passed; the question
+created zero issues; kickoff created issue 1 through the registered MCP path;
+retry remained issue 1; and the follow-up turn recorded text followed by the
+canonical capture image
+`/private/tmp/cyrus-f1-slack-fix4.KrwBpq/cyrus-home/slack-context/91c8d855f8035d4d70a928c6/images/image-001.png`.
+Its receipt still listed only the initial
+`.../slack-context/bb131b7d6591694f00b565dc` directory. The F1 synthetic
+runner synchronously checked/read the authorized image before recording the
+turn; real base64 payload ordering is covered by the ClaudeRunner-boundary
+test. All backend snapshots reported `externalRequests: []`; stop reached
+`stopped`, delivered the terminal message, and removed the worktree and initial
+context. The standard F1 activity rerun again returned four coherent payloads,
+`--limit 1 --offset 1` returned the prompt with `Showing 1 of 4`, and search for
+`repository` returned three matching activities. Slack/GitHub network edges and
+Claude inference remained synthetic.
 
 ## Limitations
 

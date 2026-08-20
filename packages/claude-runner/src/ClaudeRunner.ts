@@ -5,6 +5,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	realpathSync,
+	statSync,
 	type WriteStream,
 	writeFileSync,
 } from "node:fs";
@@ -23,6 +24,7 @@ import {
 	type StopHookInput,
 } from "@anthropic-ai/claude-agent-sdk";
 import type {
+	AgentLocalImageDirectoryLease,
 	AgentLocalImagePart,
 	AgentPendingWork,
 	AgentTurn,
@@ -291,6 +293,7 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	private keepSessionWarm: boolean;
 	private pendingSessionCrons: SessionCronSummary[] = [];
 	private pendingBackgroundTasks: BackgroundTaskSummary[] = [];
+	private temporaryImageDirectoryLeases = new Map<string, Set<symbol>>();
 
 	constructor(config: ClaudeRunnerConfig, keepSessionWarm = false) {
 		super();
@@ -454,25 +457,26 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			throw new Error("Unable to load local image");
 		}
 
-		const isAllowed = (this.config.allowedDirectories ?? []).some(
-			(allowedDirectory) => {
-				let resolvedAllowedDirectory: string;
-				try {
-					resolvedAllowedDirectory = realpathSync(allowedDirectory);
-				} catch {
-					return false;
-				}
-				const pathFromAllowedDirectory = relative(
-					resolvedAllowedDirectory,
-					resolvedImagePath,
-				);
-				return (
-					pathFromAllowedDirectory !== ".." &&
-					!pathFromAllowedDirectory.startsWith(`..${sep}`) &&
-					!isAbsolute(pathFromAllowedDirectory)
-				);
-			},
-		);
+		const isAllowed = [
+			...(this.config.allowedDirectories ?? []),
+			...this.temporaryImageDirectoryLeases.keys(),
+		].some((allowedDirectory) => {
+			let resolvedAllowedDirectory: string;
+			try {
+				resolvedAllowedDirectory = realpathSync(allowedDirectory);
+			} catch {
+				return false;
+			}
+			const pathFromAllowedDirectory = relative(
+				resolvedAllowedDirectory,
+				resolvedImagePath,
+			);
+			return (
+				pathFromAllowedDirectory !== ".." &&
+				!pathFromAllowedDirectory.startsWith(`..${sep}`) &&
+				!isAbsolute(pathFromAllowedDirectory)
+			);
+		});
 		if (!isAllowed) {
 			throw new Error("Local image path is not allowed");
 		}
@@ -543,6 +547,35 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 			throw new Error("Cannot add stream turn when not in streaming mode");
 		}
 		this.streamingPrompt.addMessage(this.toClaudeContent(turn));
+	}
+
+	allowLocalImageDirectory(directory: string): AgentLocalImageDirectoryLease {
+		let canonicalDirectory: string;
+		try {
+			canonicalDirectory = realpathSync(directory);
+			if (!statSync(canonicalDirectory).isDirectory()) throw new Error();
+		} catch {
+			throw new Error("Unable to authorize local image directory");
+		}
+
+		const token = Symbol("local-image-directory-lease");
+		const leases =
+			this.temporaryImageDirectoryLeases.get(canonicalDirectory) ?? new Set();
+		leases.add(token);
+		this.temporaryImageDirectoryLeases.set(canonicalDirectory, leases);
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				const activeLeases =
+					this.temporaryImageDirectoryLeases.get(canonicalDirectory);
+				activeLeases?.delete(token);
+				if (activeLeases?.size === 0) {
+					this.temporaryImageDirectoryLeases.delete(canonicalDirectory);
+				}
+			},
+		};
 	}
 
 	/**

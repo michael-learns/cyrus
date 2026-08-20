@@ -19,9 +19,16 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getAllTools } from "cyrus-claude-runner";
@@ -88,6 +95,7 @@ class SyntheticAgentRunner implements IAgentRunner {
 	private resolveEngineering?: () => void;
 	private policyTail = Promise.resolve();
 	private readonly messages: ReturnType<IAgentRunner["getMessages"]> = [];
+	private readonly temporaryImageDirectories = new Map<string, Set<symbol>>();
 
 	constructor(
 		readonly config: AgentRunnerConfig,
@@ -129,7 +137,50 @@ class SyntheticAgentRunner implements IAgentRunner {
 	}
 
 	addStreamTurn(turn: AgentTurn): void {
+		for (const part of turn) {
+			if (part.type !== "local_image") continue;
+			const canonicalImage = realpathSync(part.path);
+			const allowed = [
+				...(this.config.allowedDirectories ?? []),
+				...this.temporaryImageDirectories.keys(),
+			].some((directory) => {
+				const fromDirectory = relative(realpathSync(directory), canonicalImage);
+				return (
+					fromDirectory !== ".." &&
+					!fromDirectory.startsWith(`..${sep}`) &&
+					!isAbsolute(fromDirectory)
+				);
+			});
+			if (!allowed) throw new Error("Local image path is not allowed");
+			readFileSync(canonicalImage);
+		}
 		this.turns.push(structuredClone(turn));
+	}
+
+	allowLocalImageDirectory(directory: string): { release(): void } {
+		let canonicalDirectory: string;
+		try {
+			canonicalDirectory = realpathSync(directory);
+			if (!statSync(canonicalDirectory).isDirectory()) throw new Error();
+		} catch {
+			throw new Error("Unable to authorize local image directory");
+		}
+		const token = Symbol("f1-local-image-directory-lease");
+		const leases =
+			this.temporaryImageDirectories.get(canonicalDirectory) ?? new Set();
+		leases.add(token);
+		this.temporaryImageDirectories.set(canonicalDirectory, leases);
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				const active = this.temporaryImageDirectories.get(canonicalDirectory);
+				active?.delete(token);
+				if (active?.size === 0)
+					this.temporaryImageDirectories.delete(canonicalDirectory);
+			},
+		};
 	}
 
 	completeEngineering(): void {

@@ -1,14 +1,4 @@
-import { watch } from "node:fs";
-import {
-	lstat,
-	mkdir,
-	mkdtemp,
-	readdir,
-	readFile,
-	rename,
-	symlink,
-	writeFile,
-} from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeRunner } from "cyrus-claude-runner";
@@ -132,71 +122,16 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		expect(worker.captureSlackEngineeringSource).not.toHaveBeenCalled();
 	});
 
-	it("cleans a newly captured follow-up directory when no contained initial context root remains", async () => {
-		const cyrusHome = await mkdtemp(
-			join(tmpdir(), "cyrus-slack-followup-root-"),
-		);
-		const followup = join(cyrusHome, "slack-context", "followup");
-		await mkdir(join(followup, "images"), { recursive: true });
-		await writeFile(join(followup, "images", "one.png"), "one");
-		const worker: any = Object.create(EdgeWorker.prototype);
-		worker.cyrusHome = cyrusHome;
-		worker.slackEngineeringOrchestrator = {
-			isActive: vi.fn().mockReturnValue(true),
-			current: vi.fn().mockReturnValue({
-				workItemId: "work",
-				contextDirectory: join(cyrusHome, "outside"),
-			}),
-		};
-		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
-			manifest: {
-				directory: followup,
-				manifest: {
-					messages: [
-						{
-							text: "change it",
-							files: [
-								{
-									status: "downloaded",
-									localPath: "images/one.png",
-									mimeType: "image/png",
-								},
-							],
-						},
-					],
-				},
-			},
-		});
-		worker.cleanupSlackContextDirectories = vi.fn();
-		worker.getGitHubIssueWorkItemSession = vi
-			.fn()
-			.mockReturnValue({ sessionId: "child" });
-		worker.agentSessionManager = {
-			getSession: vi.fn().mockReturnValue({
-				agentRunner: {
-					isRunning: vi.fn().mockReturnValue(true),
-					addStreamTurn: vi.fn(),
-				},
-			}),
-		};
-
-		await expect(
-			worker.promptSlackEngineering("parent", "change it"),
-		).rejects.toThrow("contained initial Slack context");
-		expect(worker.cleanupSlackContextDirectories).toHaveBeenCalledWith(
-			undefined,
-			[followup],
-		);
-	});
-
-	it("stages ordered follow-up images under the initial context root accepted by ClaudeRunner", async () => {
+	it("authorizes the capture only long enough for ClaudeRunner to read ordered follow-up images", async () => {
 		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-followup-"));
 		const initialContext = join(cyrusHome, "slack-context", "initial");
 		const followupContext = join(cyrusHome, "slack-context", "followup");
-		await mkdir(join(initialContext, "images"), { recursive: true });
+		await mkdir(initialContext, { recursive: true });
 		await mkdir(join(followupContext, "images"), { recursive: true });
+		await writeFile(join(initialContext, "sentinel"), "unchanged");
 		await writeFile(join(followupContext, "images", "one.png"), "one");
 		await writeFile(join(followupContext, "images", "two.jpg"), "two");
+		const initialEntries = await readdir(initialContext);
 		const addMessage = vi.fn();
 		const runner = new ClaudeRunner({
 			cyrusHome,
@@ -214,13 +149,14 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		};
 		const worker: any = Object.create(EdgeWorker.prototype);
 		worker.cyrusHome = cyrusHome;
+		const receipt = {
+			workItemId: "work",
+			contextDirectory: initialContext,
+			contextDirectories: [initialContext],
+		};
 		worker.slackEngineeringOrchestrator = {
 			isActive: vi.fn().mockReturnValue(true),
-			current: vi.fn().mockReturnValue({
-				workItemId: "work",
-				contextDirectory: initialContext,
-				contextDirectories: [initialContext],
-			}),
+			current: vi.fn().mockReturnValue(receipt),
 		};
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
 			manifest: {
@@ -272,98 +208,56 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 			Buffer.from("two").toString("base64"),
 		);
 		await expect(readFile(followupContext, "utf8")).rejects.toThrow();
-		const stagedFiles = (await readdir(initialContext)).filter((entry) =>
-			/^\.followup-[A-Za-z0-9-]+-(?:one\.png|two\.jpg)$/.test(entry),
-		);
-		expect(stagedFiles).toHaveLength(2);
-		await expect(
-			Promise.all(
-				stagedFiles.map((entry) => lstat(join(initialContext, entry))),
-			),
-		).resolves.toSatisfy((stats) => stats.every((stat) => stat.isFile()));
-		await expect(
-			readFile(
-				join(
-					initialContext,
-					stagedFiles.find((entry) => entry.endsWith("one.png"))!,
-				),
-				"utf8",
-			),
-		).resolves.toBe("one");
-		await expect(
-			readFile(
-				join(
-					initialContext,
-					stagedFiles.find((entry) => entry.endsWith("two.jpg"))!,
-				),
-				"utf8",
-			),
-		).resolves.toBe("two");
+		expect(await readdir(initialContext)).toEqual(initialEntries);
+		expect(receipt.contextDirectories).toEqual([initialContext]);
+		expect(receipt).not.toHaveProperty("contextDirectories.1", followupContext);
+		expect(() =>
+			runner.addStreamTurn([
+				{
+					type: "local_image",
+					path: join(followupContext, "images", "one.png"),
+					mediaType: "image/png",
+				},
+			]),
+		).toThrow("Unable to load local image");
 	});
 
-	it("has no swappable intermediate parent when predictable staging names are symlinks", async () => {
-		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-symlink-"));
-		const initialContext = join(cyrusHome, "slack-context", "initial");
-		const followupContext = join(cyrusHome, "slack-context", "capture");
-		const outside = join(cyrusHome, "outside");
-		await mkdir(initialContext, { recursive: true });
-		await mkdir(join(followupContext, "images"), { recursive: true });
-		await mkdir(outside);
-		await symlink(outside, join(initialContext, "followups"));
-		await symlink(outside, join(initialContext, ".followup-attacker"));
-		await writeFile(join(followupContext, "images", "escape.png"), "safe");
-		let substitutedIntermediateParent = false;
-		let markFollowupEntryObserved!: () => void;
-		const followupEntryObserved = new Promise<void>((resolve) => {
-			markFollowupEntryObserved = resolve;
-		});
-		const substitutionAttempts: Promise<void>[] = [];
-		const watcher = watch(initialContext, (_event, filename) => {
-			if (
-				!filename?.startsWith(".followup-") ||
-				filename === ".followup-attacker"
-			)
-				return;
-			markFollowupEntryObserved();
-			substitutionAttempts.push(
-				(async () => {
-					const candidate = join(initialContext, filename);
-					const stat = await lstat(candidate).catch(() => undefined);
-					if (!stat?.isDirectory()) return;
-					await rename(candidate, `${candidate}.owned`);
-					await symlink(outside, candidate);
-					substitutedIntermediateParent = true;
-				})(),
-			);
-		});
-		const addMessage = vi.fn();
-		const runner = new ClaudeRunner({
-			cyrusHome,
-			workingDirectory: cyrusHome,
-			allowedDirectories: [initialContext],
-		});
+	it("never authorizes a capture that canonicalizes outside Slack context", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-outside-"));
+		await mkdir(join(cyrusHome, "slack-context"));
+		const outside = await mkdtemp(
+			join(tmpdir(), "cyrus-slack-outside-capture-"),
+		);
+		await mkdir(join(outside, "images"));
+		await writeFile(join(outside, "images", "escape.png"), "safe");
+		const runner = new ClaudeRunner({ cyrusHome, workingDirectory: cyrusHome });
 		(runner as any).sessionInfo = {
 			sessionId: "claude-child",
 			startedAt: new Date(),
 			isRunning: true,
 		};
-		(runner as any).streamingPrompt = { completed: false, addMessage };
+		(runner as any).streamingPrompt = {
+			completed: false,
+			addMessage: vi.fn(),
+		};
+		const authorize = vi.spyOn(runner, "allowLocalImageDirectory");
 		const worker: any = Object.create(EdgeWorker.prototype);
 		worker.cyrusHome = cyrusHome;
+		worker.logger = { warn: vi.fn() };
 		worker.slackEngineeringOrchestrator = {
 			isActive: vi.fn().mockReturnValue(true),
+			auditDecision: vi.fn(),
 			current: vi.fn().mockReturnValue({
 				workItemId: "work",
-				contextDirectory: initialContext,
 			}),
 		};
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
 			manifest: {
-				directory: followupContext,
+				directory: outside,
 				manifest: {
 					messages: [
 						{
-							text: "safe follow-up",
+							text: "unsafe follow-up",
 							files: [
 								{
 									status: "downloaded",
@@ -383,45 +277,27 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 			getSession: vi.fn().mockReturnValue({ agentRunner: runner }),
 		};
 
-		try {
-			await worker.promptSlackEngineering("parent", "untrusted");
-			await followupEntryObserved;
-			await Promise.all(substitutionAttempts);
-		} finally {
-			watcher.close();
-		}
-
-		expect(substitutedIntermediateParent).toBe(false);
 		await expect(
-			readFile(join(outside, "escape.png"), "utf8"),
-		).rejects.toThrow();
-		const entries = await readdir(initialContext, { withFileTypes: true });
-		const stagedFile = entries.find(
-			(entry) =>
-				entry.isFile() &&
-				/^\.followup-[A-Za-z0-9-]+-escape\.png$/.test(entry.name),
-		);
-		expect(stagedFile).toBeDefined();
-		expect(entries.filter((entry) => entry.isDirectory())).toEqual([]);
+			worker.promptSlackEngineering("parent", "untrusted"),
+		).rejects.toThrow("Slack context");
+		expect(authorize).not.toHaveBeenCalled();
 		await expect(
-			readFile(join(initialContext, stagedFile!.name), "utf8"),
+			readFile(join(outside, "images", "escape.png"), "utf8"),
 		).resolves.toBe("safe");
-		expect(addMessage).toHaveBeenCalledOnce();
 	});
 
-	it("removes partial direct follow-up files and source capture when ClaudeRunner rejects the turn", async () => {
+	it("revokes access and removes the capture when ClaudeRunner rejects the turn", async () => {
 		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-partial-"));
 		const initialContext = join(cyrusHome, "slack-context", "initial");
 		const followupContext = join(cyrusHome, "slack-context", "capture");
-		const unrelatedAllowed = join(cyrusHome, "slack-context", "other");
 		await mkdir(initialContext, { recursive: true });
 		await mkdir(join(followupContext, "images"), { recursive: true });
-		await mkdir(unrelatedAllowed);
+		await writeFile(join(initialContext, "sentinel"), "unchanged");
 		await writeFile(join(followupContext, "images", "partial.png"), "partial");
 		const runner = new ClaudeRunner({
 			cyrusHome,
 			workingDirectory: cyrusHome,
-			allowedDirectories: [unrelatedAllowed],
+			allowedDirectories: [initialContext],
 		});
 		(runner as any).sessionInfo = {
 			sessionId: "claude-child",
@@ -430,7 +306,9 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		};
 		(runner as any).streamingPrompt = {
 			completed: false,
-			addMessage: vi.fn(),
+			addMessage: vi.fn(() => {
+				throw new Error("stream rejected");
+			}),
 		};
 		const worker: any = Object.create(EdgeWorker.prototype);
 		worker.cyrusHome = cyrusHome;
@@ -470,14 +348,17 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 
 		await expect(
 			worker.promptSlackEngineering("parent", "untrusted"),
-		).rejects.toThrow("Local image path is not allowed");
+		).rejects.toThrow("stream rejected");
 
 		await expect(readFile(followupContext, "utf8")).rejects.toThrow();
-		expect(
-			(await readdir(initialContext)).filter((entry) =>
-				entry.startsWith(".followup-"),
-			),
-		).toEqual([]);
+		expect(await readdir(initialContext)).toEqual(["sentinel"]);
+		expect(() =>
+			(runner as any).loadLocalImage({
+				type: "local_image",
+				path: join(followupContext, "images", "partial.png"),
+				mediaType: "image/png",
+			}),
+		).toThrow("Unable to load local image");
 	});
 
 	it("keeps tampered restored paths outside the Slack context root", async () => {

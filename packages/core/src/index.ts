@@ -30,6 +30,7 @@ export { createLogger, LogLevel } from "./logging/index.js";
 // Agent Runner types
 export type {
 	AgentImageMediaType,
+	AgentLocalImageDirectoryLease,
 	AgentLocalImagePart,
 	AgentMessage,
 	AgentPendingWork,

@@ -2,26 +2,16 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, constants as fsConstants, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
-	lstat,
 	mkdir,
-	open,
 	readdir,
 	readFile,
 	realpath,
 	rm,
-	unlink,
 	writeFile,
 } from "node:fs/promises";
-import {
-	basename,
-	dirname,
-	isAbsolute,
-	join,
-	relative,
-	resolve,
-} from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
 	McpServerConfig,
@@ -7913,7 +7903,7 @@ ${taskSection}`;
 			throw new Error("No active engineering job exists for this Slack thread");
 		const { manifest } =
 			await this.captureSlackEngineeringSource(parentSessionId);
-		const createdFollowupPaths: string[] = [];
+		let imageDirectoryLease: { release(): void } | undefined;
 		try {
 			const latest = manifest.manifest.messages.at(-1);
 			const authoritativeText = latest?.text?.trim() || modelSummary;
@@ -7935,88 +7925,32 @@ ${taskSection}`;
 				workItem &&
 				this.agentSessionManager.getSession(workItem.sessionId)?.agentRunner;
 			if (runner?.isRunning() && runner.addStreamTurn && images.length) {
-				const initialContext = (
-					await Promise.all(
-						[receipt.contextDirectory, ...(receipt.contextDirectories ?? [])]
-							.filter((directory): directory is string => Boolean(directory))
-							.map((directory) =>
-								this.containedSlackContextDirectory(directory),
-							),
-					)
-				).find((directory): directory is string => Boolean(directory));
-				if (!initialContext)
+				if (!runner.allowLocalImageDirectory)
 					throw new Error(
-						"No contained initial Slack context is available for follow-up images",
+						"Agent runner cannot authorize follow-up Slack images",
 					);
-				const slackContextRoot = await realpath(
-					join(this.cyrusHome, "slack-context"),
+				const canonicalCapture = await this.containedSlackContextDirectory(
+					manifest.directory,
 				);
-				const stagedImages: AgentTurn = [];
+				if (!canonicalCapture)
+					throw new Error("Follow-up capture escaped Slack context");
+				const capturedImages: AgentTurn = [];
 				for (const file of images) {
-					const sourcePath = resolve(manifest.directory, file.localPath!);
-					const canonicalSourceRoot = await realpath(manifest.directory);
-					const canonicalSource = await realpath(sourcePath);
-					const sourceRelative = relative(canonicalSourceRoot, canonicalSource);
+					const canonicalImage = await realpath(
+						resolve(canonicalCapture, file.localPath!),
+					);
+					const sourceRelative = relative(canonicalCapture, canonicalImage);
 					if (
 						!sourceRelative ||
-						sourceRelative.startsWith("..") ||
+						sourceRelative.startsWith(`..${sep}`) ||
 						isAbsolute(sourceRelative)
 					)
 						throw new Error(
 							"Follow-up image escaped its captured Slack context",
 						);
-					const trustRootStat = await lstat(initialContext);
-					const canonicalTrustRoot: string = await realpath(initialContext);
-					if (
-						!trustRootStat.isDirectory() ||
-						trustRootStat.isSymbolicLink() ||
-						canonicalTrustRoot !== initialContext
-					)
-						throw new Error("Initial Slack context trust root changed");
-					const trustRootWithinSlack = relative(
-						slackContextRoot,
-						canonicalTrustRoot,
-					);
-					if (
-						!trustRootWithinSlack ||
-						trustRootWithinSlack.startsWith("..") ||
-						isAbsolute(trustRootWithinSlack)
-					)
-						throw new Error("Initial Slack context escaped its trust root");
-					const stagedPath = join(
-						canonicalTrustRoot,
-						`.followup-${randomUUID()}-${basename(canonicalSource)}`,
-					);
-					const stagedFile = await open(
-						stagedPath,
-						fsConstants.O_WRONLY |
-							fsConstants.O_CREAT |
-							fsConstants.O_EXCL |
-							fsConstants.O_NOFOLLOW,
-						0o600,
-					);
-					createdFollowupPaths.push(stagedPath);
-					try {
-						await stagedFile.writeFile(await readFile(canonicalSource));
-						await stagedFile.sync();
-					} finally {
-						await stagedFile.close();
-					}
-					const canonicalStagedPath = await realpath(stagedPath);
-					const stagedWithinRoot = relative(
-						slackContextRoot,
-						canonicalStagedPath,
-					);
-					if (
-						dirname(canonicalStagedPath) !== canonicalTrustRoot ||
-						!stagedWithinRoot ||
-						stagedWithinRoot.startsWith("..") ||
-						isAbsolute(stagedWithinRoot)
-					)
-						throw new Error("Follow-up image escaped Slack staging context");
-					stagedImages.push({
+					capturedImages.push({
 						type: "local_image",
-						path: canonicalStagedPath,
+						path: canonicalImage,
 						mediaType: file.mimeType as
 							| "image/jpeg"
 							| "image/png"
@@ -8024,31 +7958,22 @@ ${taskSection}`;
 							| "image/webp",
 					});
 				}
+				imageDirectoryLease = runner.allowLocalImageDirectory(canonicalCapture);
 				runner.addStreamTurn([
 					{ type: "text", text: authoritativeText },
-					...stagedImages,
-				]);
-				await this.cleanupSlackContextDirectories(undefined, [
-					manifest.directory,
+					...capturedImages,
 				]);
 				return receipt;
 			}
-			const prompted = await this.slackEngineeringOrchestrator.prompt(
+			return await this.slackEngineeringOrchestrator.prompt(
 				parentSessionId,
 				authoritativeText,
 			);
+		} finally {
+			imageDirectoryLease?.release();
 			await this.cleanupSlackContextDirectories(undefined, [
 				manifest.directory,
 			]);
-			return prompted;
-		} catch (error) {
-			await Promise.allSettled(
-				createdFollowupPaths.map((path) => unlink(path)),
-			);
-			await this.cleanupSlackContextDirectories(undefined, [
-				manifest.directory,
-			]);
-			throw error;
 		}
 	}
 
