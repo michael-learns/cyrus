@@ -1,5 +1,4 @@
 {
-	"action": "stop",
 	"fixture": {
 		"channel": "C_ENGINEERING",
 		"user": "U_REQUESTER",

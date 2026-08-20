@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 
@@ -185,7 +188,14 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		defaultModel,
 		expectedModel,
 	}) => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-runner-"));
+		const safeContext = join(cyrusHome, "slack-context", "source-key");
+		const outsideContext = join(cyrusHome, "restored-outside");
+		await mkdir(safeContext, { recursive: true });
+		await mkdir(outsideContext);
+		const canonicalSafeContext = await realpath(safeContext);
 		const lockedWorker: any = Object.create(EdgeWorker.prototype);
+		lockedWorker.cyrusHome = cyrusHome;
 		lockedWorker.agentSessionManager = {
 			getSession: vi
 				.fn()
@@ -210,7 +220,7 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		lockedWorker.slackEngineeringOrchestrator = {
 			byWorkItem: vi.fn().mockReturnValue({
 				sourceKey: "source-key",
-				contextDirectories: ["/cyrus/slack-context/source-key"],
+				contextDirectories: [safeContext, outsideContext],
 			}),
 		};
 		lockedWorker.config = { claudeDefaultModel: defaultModel };
@@ -245,7 +255,8 @@ describe("EdgeWorker GitHub Issue work items", () => {
 		const args = lockedWorker.buildAgentRunnerConfig.mock.calls[0];
 		expect(args[8]).toEqual([]);
 		expect(args[9]).toBe("[agent=claude]");
-		expect(args[5]).toContain("/cyrus/slack-context/source-key");
+		expect(args[5]).toContain(canonicalSafeContext);
+		expect(args[5]).not.toContain(outsideContext);
 		expect(lockedWorker.createRunnerForType).toHaveBeenCalledWith(
 			"claude",
 			expect.objectContaining({ model: expectedModel }),

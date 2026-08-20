@@ -1,5 +1,4 @@
 {
-	"action": "status",
 	"failSlackDelivery": false,
 	"fixture": {
 		"channel": "C_ENGINEERING",

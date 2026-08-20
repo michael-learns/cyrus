@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ClaudeRunner } from "cyrus-claude-runner";
 import { describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 
@@ -121,39 +122,99 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		expect(worker.captureSlackEngineeringSource).not.toHaveBeenCalled();
 	});
 
-	it("cleans a newly captured follow-up directory if the receipt turns terminal", async () => {
-		const worker: any = Object.create(EdgeWorker.prototype);
-		worker.slackEngineeringOrchestrator = {
-			isActive: vi.fn().mockReturnValue(true),
-			addContextDirectory: vi
-				.fn()
-				.mockRejectedValue(new Error("receipt is terminal")),
-		};
-		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
-			manifest: { directory: "/context/new", manifest: { messages: [] } },
-		});
-		worker.cleanupSlackContextDirectories = vi.fn();
-
-		await expect(
-			worker.promptSlackEngineering("parent", "change it"),
-		).rejects.toThrow("receipt is terminal");
-		expect(worker.cleanupSlackContextDirectories).toHaveBeenCalledWith(
-			undefined,
-			["/context/new"],
+	it("cleans a newly captured follow-up directory when no contained initial context root remains", async () => {
+		const cyrusHome = await mkdtemp(
+			join(tmpdir(), "cyrus-slack-followup-root-"),
 		);
-	});
-
-	it("delivers ordered follow-up image parts to the active child runner", async () => {
-		const addStreamTurn = vi.fn();
+		const followup = join(cyrusHome, "slack-context", "followup");
+		await mkdir(join(followup, "images"), { recursive: true });
+		await writeFile(join(followup, "images", "one.png"), "one");
 		const worker: any = Object.create(EdgeWorker.prototype);
+		worker.cyrusHome = cyrusHome;
 		worker.slackEngineeringOrchestrator = {
 			isActive: vi.fn().mockReturnValue(true),
-			addContextDirectory: vi.fn(),
-			current: vi.fn().mockReturnValue({ workItemId: "work" }),
+			current: vi.fn().mockReturnValue({
+				workItemId: "work",
+				contextDirectory: join(cyrusHome, "outside"),
+			}),
 		};
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
 			manifest: {
-				directory: "/context/new",
+				directory: followup,
+				manifest: {
+					messages: [
+						{
+							text: "change it",
+							files: [
+								{
+									status: "downloaded",
+									localPath: "images/one.png",
+									mimeType: "image/png",
+								},
+							],
+						},
+					],
+				},
+			},
+		});
+		worker.cleanupSlackContextDirectories = vi.fn();
+		worker.getGitHubIssueWorkItemSession = vi
+			.fn()
+			.mockReturnValue({ sessionId: "child" });
+		worker.agentSessionManager = {
+			getSession: vi.fn().mockReturnValue({
+				agentRunner: {
+					isRunning: vi.fn().mockReturnValue(true),
+					addStreamTurn: vi.fn(),
+				},
+			}),
+		};
+
+		await expect(
+			worker.promptSlackEngineering("parent", "change it"),
+		).rejects.toThrow("contained initial Slack context");
+		expect(worker.cleanupSlackContextDirectories).toHaveBeenCalledWith(
+			undefined,
+			[followup],
+		);
+	});
+
+	it("stages ordered follow-up images under the initial context root accepted by ClaudeRunner", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-followup-"));
+		const initialContext = join(cyrusHome, "slack-context", "initial");
+		const followupContext = join(cyrusHome, "slack-context", "followup");
+		await mkdir(join(initialContext, "images"), { recursive: true });
+		await mkdir(join(followupContext, "images"), { recursive: true });
+		await writeFile(join(followupContext, "images", "one.png"), "one");
+		await writeFile(join(followupContext, "images", "two.jpg"), "two");
+		const addMessage = vi.fn();
+		const runner = new ClaudeRunner({
+			cyrusHome,
+			workingDirectory: cyrusHome,
+			allowedDirectories: [initialContext],
+		});
+		(runner as any).sessionInfo = {
+			sessionId: "claude-child",
+			startedAt: new Date(),
+			isRunning: true,
+		};
+		(runner as any).streamingPrompt = {
+			completed: false,
+			addMessage,
+		};
+		const worker: any = Object.create(EdgeWorker.prototype);
+		worker.cyrusHome = cyrusHome;
+		worker.slackEngineeringOrchestrator = {
+			isActive: vi.fn().mockReturnValue(true),
+			current: vi.fn().mockReturnValue({
+				workItemId: "work",
+				contextDirectory: initialContext,
+				contextDirectories: [initialContext],
+			}),
+		};
+		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+			manifest: {
+				directory: followupContext,
 				manifest: {
 					messages: [
 						{
@@ -161,12 +222,12 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 							files: [
 								{
 									status: "downloaded",
-									localPath: "/context/one.png",
+									localPath: "images/one.png",
 									mimeType: "image/png",
 								},
 								{
 									status: "downloaded",
-									localPath: "/context/two.jpg",
+									localPath: "images/two.jpg",
 									mimeType: "image/jpeg",
 								},
 							],
@@ -179,25 +240,34 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 			.fn()
 			.mockReturnValue({ sessionId: "child" });
 		worker.agentSessionManager = {
-			getSession: vi.fn().mockReturnValue({
-				agentRunner: {
-					isRunning: vi.fn().mockReturnValue(true),
-					addStreamTurn,
-				},
-			}),
+			getSession: vi.fn().mockReturnValue({ agentRunner: runner }),
 		};
 
 		await worker.promptSlackEngineering("parent", "untrusted model summary");
 
-		expect(addStreamTurn).toHaveBeenCalledWith([
-			{ type: "text", text: "authoritative follow-up" },
-			{ type: "local_image", path: "/context/one.png", mediaType: "image/png" },
-			{
-				type: "local_image",
-				path: "/context/two.jpg",
-				mediaType: "image/jpeg",
-			},
+		const content = addMessage.mock.calls[0]?.[0];
+		expect(content?.map((part: { type: string }) => part.type)).toEqual([
+			"text",
+			"image",
+			"image",
 		]);
+		expect(content?.[0]).toEqual({
+			type: "text",
+			text: "authoritative follow-up",
+		});
+		expect(content?.[1].source.data).toBe(
+			Buffer.from("one").toString("base64"),
+		);
+		expect(content?.[2].source.data).toBe(
+			Buffer.from("two").toString("base64"),
+		);
+		await expect(readFile(followupContext, "utf8")).rejects.toThrow();
+		await expect(
+			readFile(join(initialContext, "followups", "one.png"), "utf8"),
+		).resolves.toBe("one");
+		await expect(
+			readFile(join(initialContext, "followups", "two.jpg"), "utf8"),
+		).resolves.toBe("two");
 	});
 
 	it("keeps tampered restored paths outside the Slack context root", async () => {
@@ -585,5 +655,39 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		expect(restored.slackEngineeringOrchestrator.restore).toHaveBeenCalledWith([
 			receipt,
 		]);
+	});
+
+	it("resolves restored engineering tools by the verified Slack thread when the parent session id changes", async () => {
+		const restoredReceipt = {
+			parentSessionId: "parent-before-restart",
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "100.0",
+			kickoffTs: "101.0",
+			status: "awaiting_review",
+		};
+		const status = vi.fn((parentSessionId: string) =>
+			parentSessionId === restoredReceipt.parentSessionId
+				? restoredReceipt
+				: undefined,
+		);
+		const worker: any = Object.create(EdgeWorker.prototype);
+		worker.chatSessionHandler = {
+			getLatestEventForSession: vi.fn().mockReturnValue({
+				teamId: "T1",
+				payload: { channel: "C1", thread_ts: "100.0", ts: "102.0" },
+			}),
+		};
+		worker.slackEngineeringOrchestrator = {
+			current: vi.fn().mockReturnValue(undefined),
+			allReceipts: vi.fn().mockReturnValue([restoredReceipt]),
+			status,
+		};
+		worker.getFailureModesClient = vi.fn().mockReturnValue(null);
+
+		const options = worker.createCyrusToolsOptions("parent-after-restart");
+
+		await expect(options.engineering.status()).resolves.toBe(restoredReceipt);
+		expect(status).toHaveBeenCalledWith("parent-before-restart");
 	});
 });

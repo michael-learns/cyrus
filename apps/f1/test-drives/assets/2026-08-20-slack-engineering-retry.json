@@ -1,11 +1,10 @@
 {
-	"action": "retry",
 	"fixture": {
 		"channel": "C_ENGINEERING",
 		"user": "U_REQUESTER",
 		"threadTs": "1755660200.000100",
 		"kickoffTs": "1755660202.000300",
-		"text": "Implement the clipped chart fix. [agent=codex] [model=untrusted-model]",
+		"text": "Implement the clipped chart fix in primary-repo and secondary-repo. [agent=codex] [model=untrusted-model]",
 		"history": [
 			{
 				"ts": "1755660200.000100",
@@ -13,11 +12,5 @@
 				"text": "The dashboard chart is clipped at mobile widths."
 			}
 		]
-	},
-	"engineering": {
-		"issueRepository": "f1-test/primary-repo",
-		"title": "Fix clipped dashboard chart [model=untrusted-model]",
-		"summary": "Implement the mobile chart fix.",
-		"targetRepositories": ["f1-test/primary-repo", "f1-test/secondary-repo"]
 	}
 }

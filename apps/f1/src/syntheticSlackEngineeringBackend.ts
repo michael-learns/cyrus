@@ -178,11 +178,12 @@ export class SyntheticSlackEngineeringBackend {
 
 			if (url.pathname === "/search/issues") {
 				const query = url.searchParams.get("q") ?? "";
+				const repository = query.match(/(?:^|\s)repo:([^\s]+)/)?.[1];
 				const match = this.issues.find((issue) => {
 					const sourceKey = issue.body.match(
 						/cyrus-slack-source:([A-Za-z0-9_-]+)/,
 					)?.[1];
-					return sourceKey
+					return sourceKey && (!repository || issue.repository === repository)
 						? query.includes(`cyrus-slack-source:${sourceKey}`)
 						: false;
 				});

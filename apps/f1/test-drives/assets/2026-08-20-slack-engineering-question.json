@@ -1,5 +1,4 @@
 {
-	"action": "chat",
 	"fixture": {
 		"channel": "C_QUESTIONS",
 		"user": "U_REQUESTER",

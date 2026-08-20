@@ -119,6 +119,9 @@ importers:
 
   apps/f1:
     dependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.30.0
+        version: 1.30.0(zod@4.3.6)
       commander:
         specifier: ^14.0.2
         version: 14.0.3
@@ -131,6 +134,9 @@ importers:
       cyrus-edge-worker:
         specifier: workspace:*
         version: link:../../packages/edge-worker
+      cyrus-mcp-tools:
+        specifier: workspace:*
+        version: link:../../packages/mcp-tools
       cyrus-slack-event-transport:
         specifier: workspace:*
         version: link:../../packages/slack-event-transport

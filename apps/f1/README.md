@@ -151,12 +151,17 @@ stop actions:
   --fixture test-drives/assets/2026-08-20-slack-engineering-kickoff.json
 ```
 
-The harness replaces only external Slack, GitHub, and Claude execution edges.
-It still runs production Slack thread fetching, context normalization and secure
-image capture, Slack engineering orchestration and persistence, GitHub work-item
-startup, model resolution, follow-up routing, terminal cleanup, and delivery
-replay. It creates local disposable git worktrees and synthetic in-memory/on-disk
-GitHub issues; it never creates an external issue or pull request.
+The harness replaces only external Slack and GitHub network edges and Claude
+inference. A deterministic synthetic model reads the raw production Slack chat
+prompt, lists and invokes the registered `engineering_*` tools through the MCP
+SDK, and lets the tools' production schemas and callbacks perform repository
+selection, kickoff, follow-up, status, and stop operations. Fixtures contain
+conversation data, not prebuilt tool arguments. The drive still runs production
+Slack thread fetching, context normalization and secure image capture, Slack
+engineering orchestration and persistence, GitHub work-item startup, model
+resolution, follow-up routing, terminal cleanup, and delivery replay. It creates
+local disposable git worktrees and synthetic in-memory/on-disk GitHub issues;
+it never creates an external issue or pull request.
 
 ## Server Architecture
 

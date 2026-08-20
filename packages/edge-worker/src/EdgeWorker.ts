@@ -3,7 +3,15 @@ import { execFileSync, execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+	copyFile,
+	mkdir,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { LinearClient } from "@linear/sdk";
 import type {
@@ -1862,16 +1870,14 @@ export class EdgeWorker extends EventEmitter {
 		receipt?: SlackEngineeringReceipt,
 		extraDirectories: string[] = [],
 	): Promise<void> {
-		const root = resolve(join(this.cyrusHome, "slack-context"));
 		const directories = new Set([
 			...(receipt?.contextDirectories ?? []),
 			...(receipt?.contextDirectory ? [receipt.contextDirectory] : []),
 			...extraDirectories,
 		]);
 		for (const directory of directories) {
-			const candidate = resolve(directory);
-			const rel = relative(root, candidate);
-			if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+			const candidate = await this.containedSlackContextDirectory(directory);
+			if (!candidate) {
 				this.logger.warn("Ignored unsafe Slack context cleanup target", {
 					sourceKey: receipt?.sourceKey,
 					decision: "cleanup_rejected",
@@ -1888,6 +1894,36 @@ export class EdgeWorker extends EventEmitter {
 			await this.slackEngineeringOrchestrator.clearContextDirectories(
 				receipt.workItemId,
 			);
+	}
+
+	private async containedSlackContextDirectory(
+		directory: string,
+	): Promise<string | undefined> {
+		const root = resolve(join(this.cyrusHome, "slack-context"));
+		const candidate = resolve(directory);
+		const lexicalRelative = relative(root, candidate);
+		if (
+			!lexicalRelative ||
+			lexicalRelative.startsWith("..") ||
+			isAbsolute(lexicalRelative)
+		)
+			return undefined;
+		try {
+			const [canonicalRoot, canonicalCandidate] = await Promise.all([
+				realpath(root),
+				realpath(candidate),
+			]);
+			const canonicalRelative = relative(canonicalRoot, canonicalCandidate);
+			if (
+				!canonicalRelative ||
+				canonicalRelative.startsWith("..") ||
+				isAbsolute(canonicalRelative)
+			)
+				return undefined;
+			return canonicalCandidate;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private githubWorkItemFinalSummary(
@@ -2305,6 +2341,15 @@ export class EdgeWorker extends EventEmitter {
 		const slackEngineeringReceipt =
 			this.slackEngineeringOrchestrator?.byWorkItem(workItem.workItemId);
 		const slackEngineering = Boolean(slackEngineeringReceipt);
+		const slackContextDirectories = slackEngineeringReceipt
+			? (
+					await Promise.all(
+						(slackEngineeringReceipt.contextDirectories ?? []).map(
+							(directory) => this.containedSlackContextDirectory(directory),
+						),
+					)
+				).filter((directory): directory is string => Boolean(directory))
+			: [];
 		const labels = (slackEngineering ? [] : (githubIssue.labels ?? []))
 			.map((label) => label.name)
 			.filter((name): name is string => Boolean(name));
@@ -2318,7 +2363,7 @@ export class EdgeWorker extends EventEmitter {
 			...this.gitService.getGitMetadataDirectoriesForWorkspace(
 				session.workspace,
 			),
-			...(slackEngineeringReceipt?.contextDirectories ?? []),
+			...slackContextDirectories,
 		];
 		const systemPrompt = this.buildGitHubIssueSystemPrompt(workItem);
 		const selectorDescription = slackEngineering
@@ -7530,6 +7575,27 @@ ${taskSection}`;
 		};
 	}
 
+	private resolveSlackEngineeringParentSessionId(
+		parentSessionId: string,
+		event: SlackWebhookEvent,
+	): string {
+		if (this.slackEngineeringOrchestrator.current(parentSessionId))
+			return parentSessionId;
+		const threadTs = event.payload.thread_ts || event.payload.ts;
+		return (
+			this.slackEngineeringOrchestrator
+				.allReceipts()
+				.filter(
+					(receipt) =>
+						receipt.teamId === event.teamId &&
+						receipt.channelId === event.payload.channel &&
+						receipt.threadTs === threadTs,
+				)
+				.sort((left, right) => right.kickoffTs.localeCompare(left.kickoffTs))[0]
+				?.parentSessionId ?? parentSessionId
+		);
+	}
+
 	private createCyrusToolsOptions(parentSessionId?: string): CyrusToolsOptions {
 		const failureModesClient = this.getFailureModesClient();
 		const options: CyrusToolsOptions = {
@@ -7633,18 +7699,28 @@ ${taskSection}`;
 		// Possession of a parent id is not proof of Slack origin. Only expose these
 		// tools when the server can resolve that id to a verified Slack event.
 		if (parentSessionId && slackEvent) {
+			const engineeringParentSessionId = () =>
+				this.resolveSlackEngineeringParentSessionId(
+					parentSessionId,
+					slackEvent,
+				);
 			options.engineering = {
 				repositoriesList: async () =>
 					this.slackEngineeringOrchestrator.listRepositories(),
 				createAndStart: (input) =>
 					this.createAndStartSlackEngineering(parentSessionId, input),
 				current: async () =>
-					this.slackEngineeringOrchestrator.current(parentSessionId) ?? null,
+					this.slackEngineeringOrchestrator.current(
+						engineeringParentSessionId(),
+					) ?? null,
 				status: async () =>
-					this.slackEngineeringOrchestrator.status(parentSessionId) ?? null,
+					this.slackEngineeringOrchestrator.status(
+						engineeringParentSessionId(),
+					) ?? null,
 				prompt: ({ message }) =>
-					this.promptSlackEngineering(parentSessionId, message),
-				stop: () => this.slackEngineeringOrchestrator.stop(parentSessionId),
+					this.promptSlackEngineering(engineeringParentSessionId(), message),
+				stop: () =>
+					this.slackEngineeringOrchestrator.stop(engineeringParentSessionId()),
 			};
 		}
 		if (failureModesClient) {
@@ -7829,10 +7905,6 @@ ${taskSection}`;
 		const { manifest } =
 			await this.captureSlackEngineeringSource(parentSessionId);
 		try {
-			await this.slackEngineeringOrchestrator.addContextDirectory(
-				parentSessionId,
-				manifest.directory,
-			);
 			const latest = manifest.manifest.messages.at(-1);
 			const authoritativeText = latest?.text?.trim() || modelSummary;
 			const images =
@@ -7853,24 +7925,64 @@ ${taskSection}`;
 				workItem &&
 				this.agentSessionManager.getSession(workItem.sessionId)?.agentRunner;
 			if (runner?.isRunning() && runner.addStreamTurn && images.length) {
-				runner.addStreamTurn([
-					{ type: "text", text: authoritativeText },
-					...images.map((file) => ({
-						type: "local_image" as const,
-						path: file.localPath!,
+				const initialContext = (
+					await Promise.all(
+						[receipt.contextDirectory, ...(receipt.contextDirectories ?? [])]
+							.filter((directory): directory is string => Boolean(directory))
+							.map((directory) =>
+								this.containedSlackContextDirectory(directory),
+							),
+					)
+				).find((directory): directory is string => Boolean(directory));
+				if (!initialContext)
+					throw new Error(
+						"No contained initial Slack context is available for follow-up images",
+					);
+				const followupDirectory = join(initialContext, "followups");
+				await mkdir(followupDirectory, { recursive: true });
+				const stagedImages: AgentTurn = [];
+				for (const file of images) {
+					const sourcePath = resolve(manifest.directory, file.localPath!);
+					const canonicalSourceRoot = await realpath(manifest.directory);
+					const canonicalSource = await realpath(sourcePath);
+					const sourceRelative = relative(canonicalSourceRoot, canonicalSource);
+					if (
+						!sourceRelative ||
+						sourceRelative.startsWith("..") ||
+						isAbsolute(sourceRelative)
+					)
+						throw new Error(
+							"Follow-up image escaped its captured Slack context",
+						);
+					const stagedPath = join(followupDirectory, basename(canonicalSource));
+					await copyFile(canonicalSource, stagedPath);
+					stagedImages.push({
+						type: "local_image",
+						path: stagedPath,
 						mediaType: file.mimeType as
 							| "image/jpeg"
 							| "image/png"
 							| "image/gif"
 							| "image/webp",
-					})),
+					});
+				}
+				runner.addStreamTurn([
+					{ type: "text", text: authoritativeText },
+					...stagedImages,
+				]);
+				await this.cleanupSlackContextDirectories(undefined, [
+					manifest.directory,
 				]);
 				return receipt;
 			}
-			return this.slackEngineeringOrchestrator.prompt(
+			const prompted = await this.slackEngineeringOrchestrator.prompt(
 				parentSessionId,
 				authoritativeText,
 			);
+			await this.cleanupSlackContextDirectories(undefined, [
+				manifest.directory,
+			]);
+			return prompted;
 		} catch (error) {
 			await this.cleanupSlackContextDirectories(undefined, [
 				manifest.directory,

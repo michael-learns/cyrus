@@ -1,5 +1,4 @@
 {
-	"action": "followup",
 	"fixture": {
 		"channel": "C_ENGINEERING",
 		"user": "U_REQUESTER",
@@ -16,8 +15,20 @@
 				"ts": "1755660202.000300",
 				"user": "U_REQUESTER",
 				"text": "Implement the clipped chart fix."
+			},
+			{
+				"ts": "1755660203.000400",
+				"user": "U_REQUESTER",
+				"text": "Also keep the legend visible below 480px.",
+				"images": [
+					{
+						"id": "F_LEGEND",
+						"name": "legend.png",
+						"mimeType": "image/png",
+						"base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL1WQAAAABJRU5ErkJggg=="
+					}
+				]
 			}
 		]
-	},
-	"message": "untrusted summary that must not replace the latest Slack message"
+	}
 }

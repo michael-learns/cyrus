@@ -22,6 +22,8 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { getAllTools } from "cyrus-claude-runner";
 import {
 	type AgentRunnerConfig,
@@ -41,6 +43,10 @@ import {
 	type SlackEngineeringFixture,
 } from "./src/slackEngineeringFixture.js";
 import { SyntheticSlackEngineeringBackend } from "./src/syntheticSlackEngineeringBackend.js";
+import {
+	type SyntheticModelDecision,
+	SyntheticSlackEngineeringModel,
+} from "./src/syntheticSlackEngineeringModel.js";
 import { bold, cyan, dim, gray, green, success } from "./src/utils/colors.js";
 
 // ============================================================================
@@ -63,6 +69,7 @@ const CYRUS_REPO_GITHUB_URL_2 =
 	"https://github.com/f1-test/secondary-repo";
 const MULTI_REPO_MODE = Boolean(CYRUS_REPO_PATH_2);
 const SLACK_ENGINEERING_MODE = process.env.CYRUS_F1_SLACK_ENGINEERING === "1";
+const nativeFetch = globalThis.fetch.bind(globalThis);
 
 const formatter: IMessageFormatter = {
 	formatTodoWriteParameter: (value) => value,
@@ -76,13 +83,18 @@ class SyntheticAgentRunner implements IAgentRunner {
 	readonly supportsStreamingInput = true;
 	readonly turns: AgentTurn[] = [];
 	readonly streamMessages: string[] = [];
+	readonly decisions: SyntheticModelDecision[] = [];
 	private running = false;
 	private resolveEngineering?: () => void;
+	private policyTail = Promise.resolve();
 	private readonly messages: ReturnType<IAgentRunner["getMessages"]> = [];
 
 	constructor(
 		readonly config: AgentRunnerConfig,
-		readonly kind: "chat" | "engineering",
+		readonly kind: "chat" | "engineering" | "standard",
+		private readonly runPolicy?: (
+			prompt: string,
+		) => Promise<SyntheticModelDecision>,
 	) {}
 
 	async start(prompt: string): Promise<AgentSessionInfo> {
@@ -91,7 +103,10 @@ class SyntheticAgentRunner implements IAgentRunner {
 	}
 
 	async startStreaming(prompt?: string): Promise<AgentSessionInfo> {
-		if (prompt) this.streamMessages.push(prompt);
+		if (prompt) {
+			this.streamMessages.push(prompt);
+			this.schedulePolicy(prompt);
+		}
 		this.running = true;
 		return this.info();
 	}
@@ -110,6 +125,7 @@ class SyntheticAgentRunner implements IAgentRunner {
 
 	addStreamMessage(message: string): void {
 		this.streamMessages.push(message);
+		this.schedulePolicy(message);
 	}
 
 	addStreamTurn(turn: AgentTurn): void {
@@ -139,6 +155,10 @@ class SyntheticAgentRunner implements IAgentRunner {
 		this.resolveEngineering = undefined;
 	}
 
+	waitForPolicy(): Promise<void> {
+		return this.policyTail;
+	}
+
 	completeStream(): void {}
 	isStreaming(): boolean {
 		return this.running;
@@ -159,7 +179,7 @@ class SyntheticAgentRunner implements IAgentRunner {
 
 	private async startCommon(): Promise<AgentSessionInfo> {
 		this.running = true;
-		return this.kind === "engineering" ? this.finish() : this.info();
+		return this.kind === "chat" ? this.info() : this.finish();
 	}
 
 	private finish(): AgentSessionInfo {
@@ -173,6 +193,13 @@ class SyntheticAgentRunner implements IAgentRunner {
 			startedAt: new Date(),
 			isRunning: this.running,
 		};
+	}
+
+	private schedulePolicy(prompt: string): void {
+		if (!this.runPolicy) return;
+		this.policyTail = this.policyTail.then(async () => {
+			this.decisions.push(await this.runPolicy!(prompt));
+		});
 	}
 
 	private commitSyntheticChange(): void {
@@ -484,15 +511,41 @@ async function startServer(): Promise<void> {
 				runnerType,
 				runnerConfig,
 			) => {
-				if (runnerType !== "claude") {
-					throw new Error(
-						`F1 Slack engineering expected Claude, received ${runnerType}`,
-					);
-				}
 				const kind = runnerConfig.workingDirectory?.includes("slack-workspaces")
 					? "chat"
-					: "engineering";
-				const runner = new SyntheticAgentRunner(runnerConfig, kind);
+					: runnerType === "claude"
+						? "engineering"
+						: "standard";
+				const runPolicy =
+					kind === "chat"
+						? async (prompt: string) => {
+								const mcp = runnerConfig.mcpConfig?.["cyrus-tools"];
+								if (!mcp || mcp.type !== "http" || !mcp.url)
+									throw new Error(
+										"F1 chat runner did not receive the cyrus-tools MCP server",
+									);
+								const client = new Client({
+									name: "cyrus-f1-synthetic-model",
+									version: "1.0.0",
+								});
+								const transport = new StreamableHTTPClientTransport(
+									new URL(mcp.url),
+									{
+										requestInit: { headers: mcp.headers },
+										fetch: nativeFetch,
+									},
+								);
+								try {
+									await client.connect(transport);
+									return await new SyntheticSlackEngineeringModel(
+										client,
+									).respond(prompt);
+								} finally {
+									await client.close();
+								}
+							}
+						: undefined;
+				const runner = new SyntheticAgentRunner(runnerConfig, kind, runPolicy);
 				syntheticRunners.push(runner);
 				return runner;
 			};
@@ -559,23 +612,8 @@ async function startServer(): Promise<void> {
 		if (syntheticBackend) {
 			fastify.post("/cli/slack-engineering", async (request, reply) => {
 				const body = request.body as {
-					action:
-						| "chat"
-						| "repositories"
-						| "kickoff"
-						| "retry"
-						| "followup"
-						| "status"
-						| "complete"
-						| "stop";
 					fixture?: SlackEngineeringFixture;
-					engineering?: {
-						issueRepository: string;
-						title: string;
-						summary: string;
-						targetRepositories?: string[];
-					};
-					message?: string;
+					control?: "complete";
 					failSlackDelivery?: boolean;
 				};
 				try {
@@ -601,78 +639,35 @@ async function startServer(): Promise<void> {
 						await replayHarness.replayPendingSlackEngineeringDeliveriesForEvent(
 							normalized.event,
 						);
-						await edgeWorker.dispatchChatTestEvent(normalized.event);
+						if (body.control !== "complete")
+							await edgeWorker.dispatchChatTestEvent(normalized.event);
 						threadKey = `${body.fixture.channel}:${body.fixture.threadTs}`;
 						parentSessionId = edgeWorker
 							.listChatThreads()
 							.find((thread) => thread.threadKey === threadKey)?.sessionId;
 					}
 
-					const workerHarness = edgeWorker as unknown as {
-						createAndStartSlackEngineering: (
-							parentSessionId: string,
-							input: NonNullable<typeof body.engineering>,
-						) => Promise<unknown>;
-						promptSlackEngineering: (
-							parentSessionId: string,
-							message: string,
-						) => Promise<unknown>;
-						slackEngineeringOrchestrator: {
-							listRepositories: () => unknown;
-							current: (parentSessionId: string) => unknown;
-							stop: (parentSessionId: string) => Promise<unknown>;
-						};
-					};
-
-					if (!parentSessionId && body.action !== "complete") {
+					if (!parentSessionId && body.control !== "complete") {
 						throw new Error(
 							"fixture must resolve an active Slack parent session",
 						);
 					}
 					let result: unknown;
-					switch (body.action) {
-						case "chat":
-							result = { accepted: true, engineeringStarted: false };
-							break;
-						case "repositories":
-							result =
-								workerHarness.slackEngineeringOrchestrator.listRepositories();
-							break;
-						case "kickoff":
-						case "retry":
-							if (!body.engineering)
-								throw new Error("engineering input required");
-							result = await workerHarness.createAndStartSlackEngineering(
-								parentSessionId!,
-								body.engineering,
-							);
-							break;
-						case "followup":
-							result = await workerHarness.promptSlackEngineering(
-								parentSessionId!,
-								body.message ?? body.fixture?.text ?? "follow-up",
-							);
-							break;
-						case "status":
-							result = workerHarness.slackEngineeringOrchestrator.current(
-								parentSessionId!,
-							);
-							break;
-						case "stop":
-							result = await workerHarness.slackEngineeringOrchestrator.stop(
-								parentSessionId!,
-							);
-							break;
-						case "complete": {
-							const runner = [...syntheticRunners]
-								.reverse()
-								.find((candidate) => candidate.kind === "engineering");
-							if (!runner) throw new Error("no synthetic engineering runner");
-							runner.completeEngineering();
-							await new Promise((resolve) => setTimeout(resolve, 300));
-							result = { completed: true };
-							break;
-						}
+					if (body.control === "complete") {
+						const runner = [...syntheticRunners]
+							.reverse()
+							.find((candidate) => candidate.kind === "engineering");
+						if (!runner) throw new Error("no synthetic engineering runner");
+						runner.completeEngineering();
+						await new Promise((resolve) => setTimeout(resolve, 300));
+						result = { completed: true };
+					} else {
+						const runner = [...syntheticRunners]
+							.reverse()
+							.find((candidate) => candidate.kind === "chat");
+						if (!runner) throw new Error("no synthetic chat runner");
+						await runner.waitForPolicy();
+						result = runner.decisions.at(-1);
 					}
 
 					reply.send({
@@ -688,6 +683,7 @@ async function startServer(): Promise<void> {
 							workingDirectory: runner.config.workingDirectory,
 							turns: runner.turns,
 							streamMessages: runner.streamMessages,
+							decisions: runner.decisions,
 						})),
 					});
 				} catch (error) {
