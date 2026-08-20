@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -811,6 +812,84 @@ describe("EdgeWorker GitHub Issue work items", () => {
 				repository,
 			}),
 		);
+	});
+
+	it("recovers the exact head pull request when the agent targets a different base", async () => {
+		const repositoryPath = await mkdtemp(join(tmpdir(), "cyrus-pr-base-"));
+		try {
+			execFileSync("git", ["init", "-b", "main", repositoryPath]);
+			execFileSync("git", [
+				"-C",
+				repositoryPath,
+				"config",
+				"user.name",
+				"Test",
+			]);
+			execFileSync("git", [
+				"-C",
+				repositoryPath,
+				"config",
+				"user.email",
+				"test@example.com",
+			]);
+			await writeFile(join(repositoryPath, "README.md"), "base\n");
+			execFileSync("git", ["-C", repositoryPath, "add", "README.md"]);
+			execFileSync("git", ["-C", repositoryPath, "commit", "-m", "base"]);
+			execFileSync("git", [
+				"-C",
+				repositoryPath,
+				"update-ref",
+				"refs/remotes/origin/main",
+				"HEAD",
+			]);
+			await writeFile(join(repositoryPath, "README.md"), "base\nfix\n");
+			execFileSync("git", ["-C", repositoryPath, "add", "README.md"]);
+			execFileSync("git", ["-C", repositoryPath, "commit", "-m", "fix"]);
+
+			const discoveryWorker: any = Object.create(EdgeWorker.prototype);
+			discoveryWorker.agentSessionManager = {
+				getSession: vi.fn().mockReturnValue({
+					workspace: { path: repositoryPath, repoPaths: {} },
+				}),
+			};
+			discoveryWorker.configuredRepositoryFullName = vi
+				.fn()
+				.mockReturnValue("cyrusagents/cyrus");
+			discoveryWorker.logger = { warn: vi.fn() };
+			const fetchMock = vi
+				.fn()
+				.mockResolvedValueOnce({ ok: true, json: async () => [] })
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => [
+						{
+							html_url: "https://github.com/cyrusagents/cyrus/pull/18",
+							base: { ref: "staging" },
+						},
+					],
+				});
+			vi.stubGlobal("fetch", fetchMock);
+
+			const urls = await discoveryWorker.findGitHubIssuePullRequests(
+				{
+					sessionId: "session-17",
+					repositories: [repository],
+					branchNames: { "repo-1": "cyrus/gh-17-fix" },
+				},
+				"token",
+			);
+
+			expect(urls).toEqual(["https://github.com/cyrusagents/cyrus/pull/18"]);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(String(fetchMock.mock.calls[0]?.[0])).toContain("base=main");
+			expect(String(fetchMock.mock.calls[1]?.[0])).not.toContain("base=");
+			expect(discoveryWorker.logger.warn).toHaveBeenCalledWith(
+				expect.stringContaining("staging"),
+			);
+		} finally {
+			vi.unstubAllGlobals();
+			await rm(repositoryPath, { recursive: true, force: true });
+		}
 	});
 
 	it("posts pull requests to Slack and releases delegated status ownership", async () => {

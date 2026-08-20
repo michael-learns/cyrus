@@ -133,6 +133,7 @@ export interface IssueRunnerConfigInput {
 	 * (see `buildIssueConfig`).
 	 */
 	platformMcpConfigOverrides?: readonly string[];
+	sessionPlatform?: "linear" | "github" | "gitlab";
 	linearWorkspaceId?: string;
 	cyrusHome: string;
 	logger: ILogger;
@@ -365,7 +366,10 @@ export class RunnerConfigBuilder {
 
 		const resolvedWorkspaceId =
 			input.linearWorkspaceId ??
-			input.requireLinearWorkspaceId(input.repository);
+			input.repository.linearWorkspaceId ??
+			(input.sessionPlatform && input.sessionPlatform !== "linear"
+				? ""
+				: input.requireLinearWorkspaceId(input.repository));
 		const mcpConfig = this.mcpConfigProvider.buildMcpConfig(
 			input.repository.id,
 			resolvedWorkspaceId,

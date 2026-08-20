@@ -2777,28 +2777,45 @@ Investigate across every participating repository. Modify only repositories that
 
 			const fullName = this.configuredRepositoryFullName(repository);
 			const [owner] = fullName.split("/");
-			const params = new URLSearchParams({
-				state: "open",
-				head: `${owner}:${workItem.branchNames[repository.id]}`,
-				base: repository.baseBranch,
-				per_page: "1",
-			});
-			const response = await fetch(
-				`https://api.github.com/repos/${fullName}/pulls?${params}`,
-				{
-					headers: {
-						Accept: "application/vnd.github+json",
-						Authorization: `Bearer ${token}`,
-						"User-Agent": "cyrus-ai",
-						"X-GitHub-Api-Version": "2022-11-28",
+			const head = `${owner}:${workItem.branchNames[repository.id]}`;
+			const fetchPulls = async (base?: string) => {
+				const params = new URLSearchParams({
+					state: "open",
+					head,
+					per_page: "100",
+				});
+				if (base) params.set("base", base);
+				const response = await fetch(
+					`https://api.github.com/repos/${fullName}/pulls?${params}`,
+					{
+						headers: {
+							Accept: "application/vnd.github+json",
+							Authorization: `Bearer ${token}`,
+							"User-Agent": "cyrus-ai",
+							"X-GitHub-Api-Version": "2022-11-28",
+						},
 					},
-				},
-			);
-			if (!response.ok) {
-				throw new Error(`Could not verify a pull request for ${fullName}`);
+				);
+				if (!response.ok) {
+					throw new Error(`Could not verify a pull request for ${fullName}`);
+				}
+				return (await response.json()) as Array<{
+					html_url?: string;
+					base?: { ref?: string };
+				}>;
+			};
+
+			let pulls = await fetchPulls(repository.baseBranch);
+			if (pulls.length === 0) {
+				const headPulls = await fetchPulls();
+				if (headPulls.length === 1) {
+					pulls = headPulls;
+					this.logger.warn(
+						`Repository ${fullName} opened its Cyrus branch against ${headPulls[0]?.base?.ref ?? "an unknown base"} instead of configured base ${repository.baseBranch}; accepting the unique open pull request for the exact head branch`,
+					);
+				}
 			}
-			const pulls = (await response.json()) as Array<{ html_url?: string }>;
-			const prUrl = pulls[0]?.html_url;
+			const prUrl = pulls.length === 1 ? pulls[0]?.html_url : undefined;
 			if (!prUrl) {
 				throw new Error(
 					`Repository ${fullName} has commits but no open pull request`,
@@ -8714,6 +8731,7 @@ ${input.userComment}
 				sessionPlatform === "linear"
 					? this.config.linearMcpConfigs
 					: this.config.githubMcpConfigs,
+			sessionPlatform,
 			linearWorkspaceId,
 			cyrusHome: this.cyrusHome,
 			logger: log,
