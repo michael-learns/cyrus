@@ -77,7 +77,31 @@ describe("SyntheticSlackEngineeringBackend", () => {
 		]);
 	});
 
-	it("finds an existing issue by the production source marker query", async () => {
+	it.each([
+		{
+			name: "marker only",
+			query: "is:issue in:body cyrus-slack-source:abc123",
+			expectedNumbers: [],
+		},
+		{
+			name: "repository only",
+			query: "repo:acme/app is:issue in:body",
+			expectedNumbers: [],
+		},
+		{
+			name: "wrong repository and exact marker",
+			query: "repo:other/app is:issue in:body cyrus-slack-source:abc123",
+			expectedNumbers: [],
+		},
+		{
+			name: "exact repository and marker pair",
+			query: "repo:acme/app is:issue in:body cyrus-slack-source:abc123",
+			expectedNumbers: [1],
+		},
+	])("requires $name for source recovery", async ({
+		query,
+		expectedNumbers,
+	}) => {
 		const backend = new SyntheticSlackEngineeringBackend();
 		await backend.fetch("https://api.github.com/repos/acme/app/issues", {
 			method: "POST",
@@ -88,12 +112,13 @@ describe("SyntheticSlackEngineeringBackend", () => {
 		});
 
 		const response = await backend.fetch(
-			"https://api.github.com/search/issues?q=repo%3Aacme%2Fapp%20is%3Aissue%20in%3Abody%20cyrus-slack-source%3Aabc123",
+			`https://api.github.com/search/issues?q=${encodeURIComponent(query)}`,
 		);
 
-		expect(await response.json()).toMatchObject({
-			items: [{ number: 1, body: expect.stringContaining("abc123") }],
-		});
+		const payload = (await response.json()) as {
+			items: Array<{ number: number }>;
+		};
+		expect(payload.items.map((item) => item.number)).toEqual(expectedNumbers);
 	});
 
 	it("constrains production marker recovery to the queried repository", async () => {

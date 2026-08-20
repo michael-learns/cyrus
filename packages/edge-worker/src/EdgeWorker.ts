@@ -2,10 +2,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, constants as fsConstants, readFileSync } from "node:fs";
 import {
-	copyFile,
+	lstat,
 	mkdir,
+	mkdtemp,
+	open,
 	readdir,
 	readFile,
 	realpath,
@@ -7904,6 +7906,7 @@ ${taskSection}`;
 			throw new Error("No active engineering job exists for this Slack thread");
 		const { manifest } =
 			await this.captureSlackEngineeringSource(parentSessionId);
+		let followupStagingDirectory: string | undefined;
 		try {
 			const latest = manifest.manifest.messages.at(-1);
 			const authoritativeText = latest?.text?.trim() || modelSummary;
@@ -7938,8 +7941,33 @@ ${taskSection}`;
 					throw new Error(
 						"No contained initial Slack context is available for follow-up images",
 					);
-				const followupDirectory = join(initialContext, "followups");
-				await mkdir(followupDirectory, { recursive: true });
+				const slackContextRoot = await realpath(
+					join(this.cyrusHome, "slack-context"),
+				);
+				followupStagingDirectory = await mkdtemp(
+					join(initialContext, ".followup-"),
+				);
+				const stagingStat = await lstat(followupStagingDirectory);
+				if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink())
+					throw new Error("Follow-up staging path is not an owned directory");
+				followupStagingDirectory = await realpath(followupStagingDirectory);
+				const stagingWithinInitial = relative(
+					initialContext,
+					followupStagingDirectory,
+				);
+				const stagingWithinRoot = relative(
+					slackContextRoot,
+					followupStagingDirectory,
+				);
+				if (
+					!stagingWithinInitial ||
+					stagingWithinInitial.startsWith("..") ||
+					isAbsolute(stagingWithinInitial) ||
+					!stagingWithinRoot ||
+					stagingWithinRoot.startsWith("..") ||
+					isAbsolute(stagingWithinRoot)
+				)
+					throw new Error("Follow-up staging path escaped Slack context");
 				const stagedImages: AgentTurn = [];
 				for (const file of images) {
 					const sourcePath = resolve(manifest.directory, file.localPath!);
@@ -7954,11 +7982,44 @@ ${taskSection}`;
 						throw new Error(
 							"Follow-up image escaped its captured Slack context",
 						);
-					const stagedPath = join(followupDirectory, basename(canonicalSource));
-					await copyFile(canonicalSource, stagedPath);
+					const stagedPath = join(
+						followupStagingDirectory,
+						basename(canonicalSource),
+					);
+					const stagedFile = await open(
+						stagedPath,
+						fsConstants.O_WRONLY |
+							fsConstants.O_CREAT |
+							fsConstants.O_EXCL |
+							fsConstants.O_NOFOLLOW,
+						0o600,
+					);
+					try {
+						await stagedFile.writeFile(await readFile(canonicalSource));
+					} finally {
+						await stagedFile.close();
+					}
+					const canonicalStagedPath = await realpath(stagedPath);
+					const stagedWithinDirectory = relative(
+						followupStagingDirectory,
+						canonicalStagedPath,
+					);
+					const stagedWithinRoot = relative(
+						slackContextRoot,
+						canonicalStagedPath,
+					);
+					if (
+						!stagedWithinDirectory ||
+						stagedWithinDirectory.startsWith("..") ||
+						isAbsolute(stagedWithinDirectory) ||
+						!stagedWithinRoot ||
+						stagedWithinRoot.startsWith("..") ||
+						isAbsolute(stagedWithinRoot)
+					)
+						throw new Error("Follow-up image escaped Slack staging context");
 					stagedImages.push({
 						type: "local_image",
-						path: stagedPath,
+						path: canonicalStagedPath,
 						mediaType: file.mimeType as
 							| "image/jpeg"
 							| "image/png"
@@ -7984,6 +8045,8 @@ ${taskSection}`;
 			]);
 			return prompted;
 		} catch (error) {
+			if (followupStagingDirectory)
+				await rm(followupStagingDirectory, { recursive: true, force: true });
 			await this.cleanupSlackContextDirectories(undefined, [
 				manifest.directory,
 			]);

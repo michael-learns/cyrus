@@ -82,7 +82,7 @@ restart-status fixture.
 | Ordered text/image/link context | PASS | Structured turn contained issue text, then normalized transcript with the labeled acceptance-criteria link, then a canonical absolute PNG path under the private capture directory. |
 | Exactly one issue and retry | PASS | First kickoff created issue 1; identical retry retained the same source key/issue and issue count stayed 1. |
 | Claude lock/model precedence | PASS | Global default runner was deliberately `codex`; both Slack runners were recorded as Claude. Chat used `claude-f1-default`; delegated work used repository model `claude-f1-repo-model`. Slack/issue `[agent=codex]` and `[model=untrusted-model]` selectors did not change them. Focused unit coverage separately proves repository model → `claudeDefaultModel` → `opus` fallback. |
-| Active follow-up guidance | PASS | Latest authoritative Slack text, “Also keep the legend visible below 480px,” and its image reached the child in order. The image was validated and staged beneath the initial allowed context root at `initial-context/followups/image-001.png`; the separate source capture was cleaned. |
+| Active follow-up guidance | PASS | Latest authoritative Slack text, “Also keep the legend visible below 480px,” and its image reached the child in order. The image was validated and exclusively staged beneath a fresh random directory such as `initial-context/.followup-wpUUJT/image-001.png`; the separate source capture was cleaned. |
 | PR/final delivery | PASS (synthetic boundary) | Production commit detection found the local synthetic commit, GitHub boundary returned PR 101, and the persisted Slack message contained the final summary and PR link. No live push/PR occurred. |
 | Failed delivery and restart | PASS | First Slack post was recorded `ok: false`; receipt restored after restart. A later verified Slack event triggered production replay and the identical post was recorded `ok: true`. |
 | Restored MCP status | PASS | After restart, `engineering_status` resolved the persisted receipt by verified Slack team/channel/thread identity and returned `awaiting_review`, issue 1, delivered status, and PR 101. |
@@ -138,6 +138,23 @@ parent session ID changed; resolving by verified Slack thread identity made the
 probe GREEN. A repository-collision test initially recovered an issue with the
 same marker from the wrong repository; applying both marker and repository query
 constraints made it GREEN.
+
+Fix Round 2 required synthetic marker recovery to parse both an exact `repo:`
+constraint and an exact source marker. Marker-only, repository-only, and wrong
+repository probes return no match; only the exact pair recovers the issue. Its
+RED returned issue 1 for a marker-only query, and the tightened parser made all
+four cases GREEN.
+
+The follow-up staging regression created `initial-context/followups` as a symlink
+to an outside directory. Its RED either targeted that predictable path or failed
+the real ClaudeRunner permission boundary. GREEN uses `mkdtemp` for a fresh
+non-symlink `.followup-*` directory beneath the canonical initial context,
+creates each file exclusively, validates each canonical destination beneath both
+the staging directory and Slack context root, and never writes through the
+attacker symlink. The fresh Fix Round 2 F1 drive at
+`/tmp/cyrus-f1-slack-fixround2-q7Uvl0` recorded the follow-up image at
+`.followup-wpUUJT/image-001.png`, kept issue count at one across retry, reported
+`externalRequests: []`, and removed the complete initial context on MCP stop.
 
 ## Limitations
 
