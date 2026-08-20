@@ -380,6 +380,132 @@ describe("EdgeWorker Slack engineering lifecycle", () => {
 		}
 	});
 
+	it("keeps a team retry scheduled when one pending receipt fails and a sibling succeeds", async () => {
+		vi.useFakeTimers();
+		try {
+			const receiptA: any = {
+				sourceKey: "source-a",
+				workItemId: "work-a",
+				parentSessionId: "parent-a",
+				teamId: "T1",
+				userId: "U1",
+				channelId: "C1",
+				threadTs: "100.0",
+				kickoffTs: "101.0",
+				deliveryStatus: "pending",
+				deliveryMessage: "Finished A",
+			};
+			const receiptB: any = {
+				...receiptA,
+				sourceKey: "source-b",
+				workItemId: "work-b",
+				parentSessionId: "parent-b",
+				threadTs: "200.0",
+				kickoffTs: "201.0",
+				deliveryMessage: "Finished B",
+			};
+			let aPersistenceAttempts = 0;
+			const persistPendingDelivery = vi.fn(async (workItemId: string) => {
+				if (workItemId === "work-a" && ++aPersistenceAttempts === 1)
+					throw new Error("transient persistence failure");
+			});
+			const postDelegatedWorkMessage = vi.fn().mockResolvedValue(undefined);
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.slackChatAdapter = { postDelegatedWorkMessage };
+			worker.slackEngineeringOrchestrator = {
+				pendingDeliveries: vi.fn(() =>
+					[receiptA, receiptB].filter(
+						(receipt) => receipt.deliveryStatus === "pending",
+					),
+				),
+				persistPendingDelivery,
+				markDeliveryDelivered: vi.fn(async (workItemId: string) => {
+					const receipt = workItemId === "work-a" ? receiptA : receiptB;
+					receipt.deliveryStatus = "delivered";
+				}),
+				auditDecision: vi.fn(),
+			};
+			worker.logger = { warn: vi.fn() };
+			worker.slackRuntimeTokens = new Map([["T1", "xoxb-runtime"]]);
+
+			await worker.startSlackEngineeringDeliveryReplay("T1", "xoxb-runtime");
+
+			expect(receiptA.deliveryStatus).toBe("pending");
+			expect(receiptB.deliveryStatus).toBe("delivered");
+			expect(postDelegatedWorkMessage).toHaveBeenCalledTimes(1);
+			expect(postDelegatedWorkMessage.mock.calls[0]?.[1]).toBe("Finished B");
+			expect(vi.getTimerCount()).toBe(1);
+
+			await vi.runAllTimersAsync();
+
+			expect(receiptA.deliveryStatus).toBe("delivered");
+			expect(postDelegatedWorkMessage).toHaveBeenCalledTimes(2);
+			expect(postDelegatedWorkMessage.mock.calls[1]?.[1]).toBe("Finished A");
+			expect(
+				postDelegatedWorkMessage.mock.calls.filter(
+					([, message]) => message === "Finished B",
+				),
+			).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("persists pending delivery strictly before posting on retry", async () => {
+		vi.useFakeTimers();
+		try {
+			const receipt: any = {
+				sourceKey: "source",
+				workItemId: "work",
+				parentSessionId: "parent",
+				teamId: "T1",
+				userId: "U1",
+				channelId: "C1",
+				threadTs: "100.0",
+				kickoffTs: "101.0",
+				deliveryStatus: "pending",
+				deliveryMessage: "Finished safely",
+			};
+			const order: string[] = [];
+			let persistenceAttempts = 0;
+			const persistPendingDelivery = vi.fn(async () => {
+				persistenceAttempts++;
+				order.push(`persist:${persistenceAttempts}`);
+				if (persistenceAttempts === 1) throw new Error("disk unavailable");
+			});
+			const postDelegatedWorkMessage = vi.fn(async () => {
+				order.push("post");
+			});
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.slackChatAdapter = { postDelegatedWorkMessage };
+			worker.slackEngineeringOrchestrator = {
+				pendingDeliveries: vi.fn(() =>
+					receipt.deliveryStatus === "pending" ? [receipt] : [],
+				),
+				persistPendingDelivery,
+				markDeliveryDelivered: vi.fn(async () => {
+					receipt.deliveryStatus = "delivered";
+				}),
+				auditDecision: vi.fn(),
+			};
+			worker.logger = { warn: vi.fn() };
+			worker.slackRuntimeTokens = new Map([["T1", "xoxb-runtime"]]);
+
+			await worker.startSlackEngineeringDeliveryReplay("T1", "xoxb-runtime");
+
+			expect(order).toEqual(["persist:1"]);
+			expect(postDelegatedWorkMessage).not.toHaveBeenCalled();
+			expect(receipt.deliveryStatus).toBe("pending");
+
+			await vi.runAllTimersAsync();
+
+			expect(order).toEqual(["persist:1", "persist:2", "post"]);
+			expect(receipt.deliveryStatus).toBe("delivered");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("uses strict persistence so a failed receipt write blocks external work", async () => {
 		const worker: any = Object.create(EdgeWorker.prototype);
 		worker.repositories = new Map([

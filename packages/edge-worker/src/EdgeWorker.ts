@@ -1791,13 +1791,13 @@ export class EdgeWorker extends EventEmitter {
 			teamId,
 			runtimeToken,
 		);
-		this.slackDeliveryReplays.set(teamId, replay);
-		const release = () => {
-			if (this.slackDeliveryReplays.get(teamId) === replay)
+		let trackedReplay: Promise<void>;
+		trackedReplay = replay.finally(() => {
+			if (this.slackDeliveryReplays.get(teamId) === trackedReplay)
 				this.slackDeliveryReplays.delete(teamId);
-		};
-		void replay.then(release, release);
-		return replay;
+		});
+		this.slackDeliveryReplays.set(teamId, trackedReplay);
+		return trackedReplay;
 	}
 
 	private scheduleSlackEngineeringDeliveryRetry(teamId: string): void {
@@ -1810,17 +1810,19 @@ export class EdgeWorker extends EventEmitter {
 				"delivery_retry_scheduled",
 				receipt,
 			);
-		const timer = setTimeout(() => {
+		const timer = setTimeout(async () => {
 			this.slackDeliveryRetryTimers.delete(teamId);
-			void this.startSlackEngineeringDeliveryReplay(
-				teamId,
-				this.slackRuntimeTokens?.get(teamId),
-			).catch(() =>
+			try {
+				await this.startSlackEngineeringDeliveryReplay(
+					teamId,
+					this.slackRuntimeTokens?.get(teamId),
+				);
+			} catch {
 				this.logger.warn("Slack engineering scheduled replay failed", {
 					teamId,
 					decision: "delivery_retry_failed",
-				}),
-			);
+				});
+			}
 		}, 1_000);
 		timer.unref?.();
 		this.slackDeliveryRetryTimers.set(teamId, timer);
@@ -1829,10 +1831,15 @@ export class EdgeWorker extends EventEmitter {
 	private async releaseSlackEngineeringDelivery(
 		receipt: SlackEngineeringReceipt,
 	): Promise<void> {
-		const retryTimer = this.slackDeliveryRetryTimers?.get(receipt.teamId);
-		if (retryTimer) {
-			clearTimeout(retryTimer);
-			this.slackDeliveryRetryTimers.delete(receipt.teamId);
+		const teamStillHasPending = this.slackEngineeringOrchestrator
+			.pendingDeliveries()
+			.some((item) => item.teamId === receipt.teamId);
+		if (!teamStillHasPending) {
+			const retryTimer = this.slackDeliveryRetryTimers?.get(receipt.teamId);
+			if (retryTimer) {
+				clearTimeout(retryTimer);
+				this.slackDeliveryRetryTimers.delete(receipt.teamId);
+			}
 		}
 		this.chatSessionHandler?.setDelegatedWorkActive(
 			receipt.parentSessionId,
