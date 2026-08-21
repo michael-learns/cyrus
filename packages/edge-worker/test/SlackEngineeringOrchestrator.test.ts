@@ -98,6 +98,25 @@ describe("SlackEngineeringOrchestrator", () => {
 		);
 	});
 
+	it("durably marks a database-sensitive child exactly once", async () => {
+		const { service, saves } = setup();
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Inspect checkout",
+			summary: "Use authorized database evidence.",
+		});
+		const savesBeforeMark = saves.length;
+
+		await service.markDatabaseSensitive(receipt.workItemId!);
+		await service.markDatabaseSensitive(receipt.workItemId!);
+
+		expect(service.byWorkItem(receipt.workItemId!)?.databaseSensitive).toBe(
+			true,
+		);
+		expect(saves).toHaveLength(savesBeforeMark + 1);
+		expect(saves.at(-1)?.[0]?.databaseSensitive).toBe(true);
+	});
+
 	it("recovers an uncertain create by hidden marker without posting a duplicate", async () => {
 		const first = setup();
 		first.createIssue.mockRejectedValueOnce(new Error("connection reset"));

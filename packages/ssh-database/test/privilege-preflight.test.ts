@@ -72,8 +72,26 @@ describe("database privilege preflight", () => {
 					],
 				},
 				"cyrus_payroll_ro@localhost",
+				"payroll",
 			),
 		).not.toThrow();
+	});
+
+	it("rejects MySQL SELECT grants outside the configured database", () => {
+		expect(() =>
+			assertMysqlPrivilegePreflight(
+				{
+					currentAccount: "cyrus_payroll_ro@localhost",
+					deadlineSupported: true,
+					grants: [
+						"GRANT SELECT ON `payroll`.* TO `cyrus_payroll_ro`@`localhost`",
+						"GRANT SELECT ON `other_database`.`employees` TO `cyrus_payroll_ro`@`localhost`",
+					],
+				},
+				"cyrus_payroll_ro@localhost",
+				"payroll",
+			),
+		).toThrowError(expect.objectContaining({ code: "PRIVILEGE_CHECK_FAILED" }));
 	});
 
 	it.each([
@@ -91,6 +109,7 @@ describe("database privilege preflight", () => {
 					grants: [grant],
 				},
 				"cyrus_payroll_ro@localhost",
+				"payroll",
 			),
 		).toThrowError(expect.objectContaining({ code: "PRIVILEGE_CHECK_FAILED" }));
 	});
@@ -104,6 +123,7 @@ describe("database privilege preflight", () => {
 					grants: [],
 				},
 				"cyrus_payroll_ro@localhost",
+				"payroll",
 			),
 		).toThrow();
 		expect(() =>
@@ -114,6 +134,7 @@ describe("database privilege preflight", () => {
 					grants: [],
 				},
 				"cyrus_payroll_ro@localhost",
+				"payroll",
 			),
 		).toThrow();
 	});

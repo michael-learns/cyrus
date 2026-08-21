@@ -245,4 +245,31 @@ describe("EdgeWorker database authorization wiring", () => {
 			}),
 		).rejects.toMatchObject({ statusCode: 403 });
 	});
+
+	it("keeps Slack ownership locked after database access is revoked", async () => {
+		const worker = new EdgeWorker(config);
+		const persisted = receipt();
+		(worker as any).slackEngineeringOrchestrator.restore([persisted]);
+		(worker as any).gitHubIssueWorkItemSessions.set(persisted.workItemId, {
+			workItemId: persisted.workItemId,
+			sessionId: persisted.sessionId,
+			status: "in_progress",
+			repositoryFullName: "y1/payroll",
+			issueNumber: 12,
+			targetRepositoryFullNames: ["y1/payroll", "y1/shared"],
+		});
+		(worker as any).config = { ...config, databaseConnections: [] };
+
+		await expect(
+			(worker as any).promptGitHubIssueWorkItem(persisted.workItemId, {
+				requestId: "generic-after-revocation",
+				commentId: 2,
+				author: "GitHub user",
+				body: "continue outside the verified Slack thread",
+			}),
+		).rejects.toMatchObject({
+			statusCode: 403,
+			message: "Slack engineering work item control is not authorized",
+		});
+	});
 });

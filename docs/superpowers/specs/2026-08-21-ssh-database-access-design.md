@@ -203,7 +203,10 @@ Before use, the query service canonicalizes configured files and verifies:
 - every supplied path exists and resolves to a regular file;
 - the identity file is owned by the Cyrus process user on POSIX systems;
 - the identity file has no group or other permission bits;
-- known-hosts files are not group/other writable; and
+- known-hosts files are owned by the Cyrus process user or root and are not
+  group/other writable;
+- identity/known-host parent directories are trusted and cannot be replaced by
+  another local user; and
 - duplicate connection IDs are rejected by schema validation.
 
 An explicit identity and known-hosts file are mandatory in version 1. Cyrus
@@ -324,7 +327,8 @@ MySQL provisioning requires a dedicated account with database/table-level
 `SELECT` and, when needed, `SHOW VIEW` only. It must have no global privileges,
 role inheritance beyond the reviewed read-only role, `EXECUTE`, `FILE`,
 `PROCESS`, `CREATE TEMPORARY TABLES`, locking, replication, administrative,
-schema mutation, or data mutation privileges.
+schema mutation, or data mutation privileges. The preflight rejects readable
+grants whose target is outside the profile's configured database.
 
 The gateway preflight checks the current identity, dangerous role/account
 attributes, direct and transitive memberships including `SET ROLE`
@@ -499,7 +503,10 @@ at the normalized runner-message boundary. Cyrus-owned transports suppress
 connection metadata, SQL input, and row output from activities, generic tool
 formatters, telemetry, errors, Slack activity/status updates, summaries,
 receipts, automatically assembled GitHub issue bodies, and remote Cyrus session
-mirroring. Suppression is tested for Claude, Gemini, Codex, and Cursor message
+mirroring. After a database tool is used, later model-generated content in the
+same turn is also replaced before durable consumers, while the raw direct Slack
+reply remains available for an explicit row request. Suppression is tested for
+Claude, Gemini, Codex, and Cursor message
 shapes even though Slack-originated engineering remains Claude-locked. The only
 logging exception is the fixed metadata-only audit record enumerated under
 Errors and Auditing; no tool response or connection-list payload is logged.

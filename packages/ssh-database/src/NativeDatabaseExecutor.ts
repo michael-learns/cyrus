@@ -90,6 +90,7 @@ export class NativeDatabaseExecutor implements DatabaseGatewayExecutor {
 				grants: grantRows.slice(1),
 			},
 			secured.expectedRole,
+			secured.database,
 		);
 	}
 

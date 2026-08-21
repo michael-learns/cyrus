@@ -248,8 +248,9 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.linearMcpConfigs || this.config.linearMcpConfigs,
 				githubMcpConfigs:
 					parsedConfig.githubMcpConfigs || this.config.githubMcpConfigs,
-				databaseConnections:
-					parsedConfig.databaseConnections ?? this.config.databaseConnections,
+				// This is an authorization allowlist. Omitting it from the complete
+				// on-disk config must revoke prior entries instead of retaining them.
+				databaseConnections: parsedConfig.databaseConnections ?? [],
 				defaultDisallowedTools:
 					parsedConfig.defaultDisallowedTools ||
 					this.config.defaultDisallowedTools,

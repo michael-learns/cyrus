@@ -83,17 +83,18 @@ export interface MysqlPrivilegePreflight {
 export function assertMysqlPrivilegePreflight(
 	result: MysqlPrivilegePreflight,
 	expectedAccount: string,
+	expectedDatabase: string,
 ): void {
 	if (
 		result.currentAccount !== expectedAccount ||
 		result.deadlineSupported !== true ||
-		!result.grants.every(isSafeMysqlGrant)
+		!result.grants.every((grant) => isSafeMysqlGrant(grant, expectedDatabase))
 	) {
 		privilegeCheckFailed();
 	}
 }
 
-function isSafeMysqlGrant(grant: string): boolean {
+function isSafeMysqlGrant(grant: string, expectedDatabase: string): boolean {
 	const normalized = grant.trim().replace(/\s+/g, " ").toUpperCase();
 	if (/^GRANT USAGE ON \*\.\* TO /.test(normalized)) {
 		return !normalized.includes(" WITH GRANT OPTION");
@@ -108,6 +109,8 @@ function isSafeMysqlGrant(grant: string): boolean {
 	}
 	const privilegesText = match[1];
 	if (!privilegesText) return false;
+	const targetDatabase = mysqlGrantDatabase(match[2]!);
+	if (targetDatabase !== expectedDatabase.toUpperCase()) return false;
 	const privileges = privilegesText
 		.split(",")
 		.map((value) => value.trim())
@@ -118,6 +121,13 @@ function isSafeMysqlGrant(grant: string): boolean {
 			(privilege) => privilege === "SELECT" || privilege === "SHOW VIEW",
 		)
 	);
+}
+
+function mysqlGrantDatabase(target: string): string | undefined {
+	const quoted = target.match(/^`([^`]+)`\.(?:\*|`[^`]+`)$/);
+	if (quoted?.[1]) return quoted[1];
+	const plain = target.match(/^([A-Z0-9_$.-]+)\.(?:\*|[A-Z0-9_$.-]+)$/);
+	return plain?.[1];
 }
 
 function privilegeCheckFailed(): never {

@@ -64,6 +64,7 @@ import {
 	CLIIssueTrackerService,
 	CLIRPCServer,
 	createLogger,
+	DATABASE_TOOL_PAYLOAD_REDACTION,
 	DEFAULT_PROXY_URL,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
@@ -1536,42 +1537,10 @@ export class EdgeWorker extends EventEmitter {
 			.allReceipts()
 			.filter((receipt) => receipt.workItemId === workItemId);
 		if (receipts.length === 0) return;
-		const receipt = receipts.length === 1 ? receipts[0]! : undefined;
-		const activeRepositories = new Map(
-			Array.from(this.repositories.values())
-				.filter((repository) => repository.isActive !== false)
-				.map((repository) => [repository.id, repository]),
-		);
-		const receiptRepositoryNames = new Set(
-			receipt
-				? [receipt.issueRepository, ...receipt.targetRepositories].map((name) =>
-						name.toLowerCase(),
-					)
-				: [],
-		);
-		const databaseCapable =
-			!receipt ||
-			(this.config.databaseConnections ?? []).some(
-				(connection) =>
-					connection.slackDestinations.some(
-						(destination) =>
-							destination.teamId === receipt.teamId &&
-							destination.channelId === receipt.channelId,
-					) &&
-					connection.repositoryIds.some((repositoryId) => {
-						const repository = activeRepositories.get(repositoryId);
-						return Boolean(
-							repository &&
-								receiptRepositoryNames.has(
-									this.configuredRepositoryFullName(repository).toLowerCase(),
-								),
-						);
-					}),
-			);
-		if (
-			databaseCapable &&
-			controlCapability !== this.slackEngineeringControlCapability
-		) {
+		// A receipt-backed job is owned by its verified Slack thread for its full
+		// lifetime. Keep that provenance lock even if database authorization is
+		// later removed; the existing child transcript may already contain data.
+		if (controlCapability !== this.slackEngineeringControlCapability) {
 			throw this.gitHubWorkItemError(
 				"Slack engineering work item control is not authorized",
 				403,
@@ -2062,6 +2031,12 @@ export class EdgeWorker extends EventEmitter {
 	private githubWorkItemFinalSummary(
 		workItem: GitHubIssueWorkItemSession,
 	): string | undefined {
+		if (
+			this.slackEngineeringOrchestrator?.byWorkItem?.(workItem.workItemId)
+				?.databaseSensitive
+		) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		const messages =
 			this.agentSessionManager
 				.getSession(workItem.sessionId)
@@ -2557,6 +2532,13 @@ export class EdgeWorker extends EventEmitter {
 				workItem.sessionId,
 				message,
 			);
+			if (
+				this.sensitiveToolMessageFilter.hasSeenSensitiveData(workItem.sessionId)
+			) {
+				await this.slackEngineeringOrchestrator?.markDatabaseSensitive?.(
+					workItem.workItemId,
+				);
+			}
 			await baseOnMessage?.(filtered);
 			await this.updateSlackWorkItemActivity(workItem, filtered);
 		};
@@ -2652,7 +2634,15 @@ export class EdgeWorker extends EventEmitter {
 				!this.gitHubIssueWorkItemSessions.has(workItem.workItemId)
 			)
 				return;
-			const err = error instanceof Error ? error : new Error(String(error));
+			const rawError =
+				error instanceof Error ? error : new Error(String(error));
+			const databaseSensitive = Boolean(
+				this.slackEngineeringOrchestrator?.byWorkItem?.(workItem.workItemId)
+					?.databaseSensitive,
+			);
+			const err = databaseSensitive
+				? new Error("The database-influenced engineering session failed")
+				: rawError;
 			workItem.error = err.message;
 			this.logger.error(
 				`GitHub Issue session failed for ${workItem.repositoryFullName}#${workItem.issueNumber}`,

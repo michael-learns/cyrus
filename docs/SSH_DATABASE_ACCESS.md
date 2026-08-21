@@ -289,7 +289,10 @@ protocol frame on stdin; the forced command is selected by `authorized_keys`.
 Add `databaseConnections` to `~/.cyrus/config.json` using the example in
 [CONFIG_FILE.md](./CONFIG_FILE.md). `identityFile` must be a regular file owned
 by the Cyrus process user with mode `0600` or stricter. `knownHostsFile` must be
-a regular file and cannot be group/other writable. `~/` paths are supported.
+a regular file owned by the Cyrus process user or root and cannot be
+group/other writable. Parent directories must be owned by the Cyrus user or
+root and non-writable by other users; a root-owned sticky temporary directory
+is the only writable exception. `~/` paths are supported.
 
 The configured repository IDs must exist and be active. Each destination is an
 exact Slack workspace/team ID plus channel ID pair. Database tools are absent
@@ -331,11 +334,13 @@ Some persistence is unavoidable:
 - raw rows included in a Slack reply are retained by Slack; and
 - the model can reproduce values in generated text.
 
-Cyrus redacts database tool payloads from activities, generic formatter output,
-Slack status updates, telemetry, errors, receipts, automatic issue assembly,
-durable summaries, and hosted session mirroring. Prompts additionally tell the
-model not to copy production data into issues, PRs, commits, or repository
-files, but prompts are not a data-loss-prevention boundary.
+Cyrus redacts database tool payloads and later model-generated content in the
+same database turn from activities, generic formatter output, Slack status
+updates, telemetry, errors, receipts, automatic issue assembly, durable
+summaries, and hosted session mirroring. The direct final Slack reply remains
+available so Cyrus can show rows when the user explicitly asks. Prompts also
+tell the model not to copy production data into issues, PRs, commits, or
+repository files, but prompts are not a complete data-loss-prevention boundary.
 
 ## Troubleshooting
 

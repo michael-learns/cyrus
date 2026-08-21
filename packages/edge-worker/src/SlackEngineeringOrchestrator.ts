@@ -43,6 +43,7 @@ export interface SlackEngineeringReceipt extends SlackEngineeringSource {
 	error?: string;
 	deliveryStatus?: "pending" | "delivered";
 	deliveryMessage?: string;
+	databaseSensitive?: boolean;
 }
 export interface SlackEngineeringCreateInput {
 	issueRepository: string;
@@ -442,6 +443,13 @@ export class SlackEngineeringOrchestrator {
 		if (!receipt || receipt.deliveryStatus !== "pending") return;
 		await this.persist();
 		this.audit("delivery_pending_retry", receipt);
+	}
+	async markDatabaseSensitive(workItemId: string): Promise<void> {
+		const receipt = this.byWorkItem(workItemId);
+		if (!receipt || receipt.databaseSensitive) return;
+		receipt.databaseSensitive = true;
+		await this.persist();
+		this.audit("database_sensitive", receipt);
 	}
 	auditDecision(decision: string, receipt?: SlackEngineeringReceipt): void {
 		this.audit(decision, receipt);

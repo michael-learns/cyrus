@@ -88,19 +88,13 @@ describe("ConfigManager databaseConnections hot reload", () => {
 		expect(loaded.databaseConnections).toEqual([]);
 	});
 
-	it("preserves the current list when the field is omitted", async () => {
+	it("treats an omitted field as immediate revocation", async () => {
 		vi.mocked(readFile).mockResolvedValue(
 			JSON.stringify({ repositories: [repository] }) as never,
 		);
 
 		const loaded = await (manager() as any).loadConfigSafely();
-		expect(loaded.databaseConnections).toEqual([
-			expect.objectContaining({
-				...connection,
-				ssh: expect.objectContaining(connection.ssh),
-				limits: expect.objectContaining({ maxRows: 100 }),
-			}),
-		]);
+		expect(loaded.databaseConnections).toEqual([]);
 	});
 
 	it("rejects an invalid candidate without partially replacing state", async () => {

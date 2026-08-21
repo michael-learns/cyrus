@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DATABASE_TOOL_PAYLOAD_REDACTION } from "cyrus-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 
@@ -953,6 +954,38 @@ Never copy connection IDs, SQL text, raw rows, or sensitive database values into
 			"work-item-17",
 		);
 		expect(worker.slackWorkItemEvents.has("work-item-17")).toBe(false);
+	});
+
+	it("never persists a raw provider summary after database access", () => {
+		runner.getMessages.mockReturnValue([
+			{
+				type: "result",
+				result: "Employee Ada earns 999999",
+			},
+		]);
+		worker.slackEngineeringOrchestrator = {
+			byWorkItem: vi.fn().mockReturnValue({ databaseSensitive: true }),
+		};
+		worker.githubWorkItemFinalSummary = (
+			EdgeWorker.prototype as any
+		).githubWorkItemFinalSummary;
+		worker.slackWorkItemTerminalMessage = (
+			EdgeWorker.prototype as any
+		).slackWorkItemTerminalMessage;
+
+		const message = worker.slackWorkItemTerminalMessage(
+			{
+				workItemId: "work-item-17",
+				sessionId: "github-issue-work-item-17",
+				issue: { title: "Fix webhook retries" },
+				prUrls: ["https://github.com/cyrusagents/cyrus/pull/18"],
+			},
+			"awaiting_review",
+		);
+
+		expect(message).not.toContain("Ada");
+		expect(message).not.toContain("999999");
+		expect(message).toContain(DATABASE_TOOL_PAYLOAD_REDACTION);
 	});
 
 	it("preserves a successful outcome when pending-delivery persistence fails once", async () => {

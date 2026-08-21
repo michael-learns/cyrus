@@ -1,4 +1,5 @@
 import { realpathSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import type { SshDatabaseConnection } from "cyrus-core";
 import {
 	GATEWAY_PROTOCOL_VERSION,
@@ -14,6 +15,7 @@ export interface InspectedFile {
 	isFile: boolean;
 	uid: number;
 	mode: number;
+	parentsSafe: boolean;
 }
 
 export interface SshDatabaseQueryServiceDependencies {
@@ -134,6 +136,7 @@ export class SshDatabaseQueryService {
 		const currentUid = process.getuid?.();
 		if (
 			!file.isFile ||
+			!file.parentsSafe ||
 			(currentUid !== undefined && file.uid !== currentUid) ||
 			(file.mode & 0o077) !== 0
 		) {
@@ -144,7 +147,15 @@ export class SshDatabaseQueryService {
 
 	private requireKnownHostsFile(path: string): string {
 		const file = this.inspectFile(path);
-		if (!file.isFile || (file.mode & 0o022) !== 0) throw invalidFile();
+		const currentUid = process.getuid?.();
+		if (
+			!file.isFile ||
+			!file.parentsSafe ||
+			(currentUid !== undefined && file.uid !== currentUid && file.uid !== 0) ||
+			(file.mode & 0o022) !== 0
+		) {
+			throw invalidFile();
+		}
 		return file.canonicalPath;
 	}
 }
@@ -158,9 +169,33 @@ function defaultInspectFile(path: string): InspectedFile {
 			isFile: stat.isFile(),
 			uid: stat.uid,
 			mode: stat.mode,
+			parentsSafe: inspectParentDirectories(canonicalPath),
 		};
 	} catch {
 		throw invalidFile();
+	}
+}
+
+function inspectParentDirectories(path: string): boolean {
+	const currentUid = process.getuid?.();
+	if (currentUid === undefined) return true;
+	let directory = dirname(path);
+	while (true) {
+		const stat = statSync(directory);
+		const trustedOwner = stat.uid === 0 || stat.uid === currentUid;
+		const groupOrOtherWritable = (stat.mode & 0o022) !== 0;
+		const rootOwnedStickyDirectory =
+			stat.uid === 0 && (stat.mode & 0o1000) !== 0;
+		if (
+			!stat.isDirectory() ||
+			!trustedOwner ||
+			(groupOrOtherWritable && !rootOwnedStickyDirectory)
+		) {
+			return false;
+		}
+		const parent = dirname(directory);
+		if (parent === directory) return true;
+		directory = parent;
 	}
 }
 

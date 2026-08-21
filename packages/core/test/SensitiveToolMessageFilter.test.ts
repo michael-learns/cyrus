@@ -33,6 +33,31 @@ function result(id: string, content: string): SDKMessage {
 	} as SDKMessage;
 }
 
+function assistantText(text: string): SDKMessage {
+	return {
+		type: "assistant",
+		message: { role: "assistant", content: [{ type: "text", text }] },
+		parent_tool_use_id: null,
+		session_id: "provider-session",
+		uuid: "assistant-text",
+	} as SDKMessage;
+}
+
+function turnResult(text: string): SDKMessage {
+	return {
+		type: "result",
+		subtype: "success",
+		is_error: false,
+		result: text,
+		session_id: "provider-session",
+		duration_ms: 1,
+		duration_api_ms: 1,
+		num_turns: 1,
+		total_cost_usd: 0,
+		usage: {},
+	} as SDKMessage;
+}
+
 describe("SensitiveToolMessageFilter", () => {
 	it("recognizes direct and provider-normalized database MCP names", () => {
 		expect(isSensitiveDatabaseToolName("database_query")).toBe(true);
@@ -84,10 +109,14 @@ describe("SensitiveToolMessageFilter", () => {
 		const filtered = filter.filter("session-1", original);
 
 		expect(JSON.stringify(filtered)).not.toContain("SELECT secret");
-		expect(JSON.stringify(filtered)).toContain(
+		expect(JSON.stringify(filtered)).not.toContain(
 			"Checking the configured database",
 		);
+		expect(JSON.stringify(filtered)).toContain(DATABASE_TOOL_PAYLOAD_REDACTION);
 		expect(JSON.stringify(original)).toContain("SELECT secret");
+		expect(JSON.stringify(original)).toContain(
+			"Checking the configured database",
+		);
 	});
 
 	it("keeps correlation isolated by Cyrus session and leaves normal tools alone", () => {
@@ -105,5 +134,38 @@ describe("SensitiveToolMessageFilter", () => {
 		expect(filter.filter("session-1", result("db-1", "after clear"))).toEqual(
 			result("db-1", "after clear"),
 		);
+	});
+
+	it("redacts generated prose and final summaries for the rest of a database turn", () => {
+		const filter = new SensitiveToolMessageFilter();
+		filter.filter(
+			"session-1",
+			assistant("database_query", "db-1", { sql: "SELECT salary" }),
+		);
+		expect(filter.hasSeenSensitiveData("session-1")).toBe(true);
+		filter.filter("session-1", result("db-1", "salary\n999999\n"));
+
+		const prose = filter.filter(
+			"session-1",
+			assistantText("Ada earns 999999; copy this into the issue"),
+		);
+		const completed = filter.filter(
+			"session-1",
+			turnResult("Ada earns 999999; durable summary"),
+		);
+		const nextTurn = filter.filter(
+			"session-1",
+			assistantText("ordinary next-turn response"),
+		);
+
+		expect(JSON.stringify(prose)).not.toContain("999999");
+		expect(JSON.stringify(completed)).not.toContain("999999");
+		expect(JSON.stringify(prose)).toContain(DATABASE_TOOL_PAYLOAD_REDACTION);
+		expect(JSON.stringify(completed)).toContain(
+			DATABASE_TOOL_PAYLOAD_REDACTION,
+		);
+		expect(JSON.stringify(nextTurn)).toContain("ordinary next-turn response");
+		filter.clearSession("session-1");
+		expect(filter.hasSeenSensitiveData("session-1")).toBe(false);
 	});
 });

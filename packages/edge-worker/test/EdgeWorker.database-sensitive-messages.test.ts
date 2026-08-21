@@ -80,6 +80,43 @@ describe("EdgeWorker database-sensitive messages", () => {
 		expect(serialized).toContain(DATABASE_TOOL_PAYLOAD_REDACTION);
 	});
 
+	it("redacts model-reproduced rows and the final durable summary", async () => {
+		const worker = new EdgeWorker(config);
+		const handleClaudeMessage = vi.fn().mockResolvedValue(undefined);
+		(worker as any).agentSessionManager = { handleClaudeMessage };
+
+		await (worker as any).handleClaudeMessage(
+			"session-1",
+			databaseUse(),
+			"repo",
+		);
+		await (worker as any).handleClaudeMessage(
+			"session-1",
+			{
+				type: "assistant",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "salary is 999999" }],
+				},
+			},
+			"repo",
+		);
+		await (worker as any).handleClaudeMessage(
+			"session-1",
+			{
+				type: "result",
+				subtype: "success",
+				is_error: false,
+				result: "durable salary summary: 999999",
+			},
+			"repo",
+		);
+
+		const serialized = JSON.stringify(handleClaudeMessage.mock.calls);
+		expect(serialized).not.toContain("999999");
+		expect(serialized).toContain(DATABASE_TOOL_PAYLOAD_REDACTION);
+	});
+
 	it("never attaches the remote SessionStore to database-capable runners", () => {
 		const worker = new EdgeWorker(config);
 		const sessionStore = { append: vi.fn(), load: vi.fn() };

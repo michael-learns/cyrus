@@ -52,6 +52,7 @@ describe("SshDatabaseQueryService", () => {
 				isFile: true,
 				uid: process.getuid?.() ?? 0,
 				mode: path.includes("known_hosts") ? 0o100644 : 0o100600,
+				parentsSafe: true,
 			}),
 		});
 
@@ -140,6 +141,7 @@ describe("SshDatabaseQueryService", () => {
 					isFile: true,
 					uid: process.getuid?.() ?? 0,
 					mode,
+					parentsSafe: true,
 				}),
 			});
 			await expect(service.query(connection, "SELECT 1")).rejects.toMatchObject(
@@ -148,6 +150,32 @@ describe("SshDatabaseQueryService", () => {
 				},
 			);
 		}
+		expect(run).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["an attacker-owned known-hosts file", false, true],
+		["an unsafe parent directory", true, false],
+	] as const)("rejects %s before SSH", async (_caseName, safeOwner, parentsSafe) => {
+		const run = vi.fn();
+		const currentUid = process.getuid?.() ?? 501;
+		const service = new SshDatabaseQueryService({
+			run,
+			inspectFile: (path) => ({
+				canonicalPath: path,
+				isFile: true,
+				uid:
+					path.includes("known_hosts") && !safeOwner
+						? currentUid + 1
+						: currentUid,
+				mode: path.includes("known_hosts") ? 0o100644 : 0o100600,
+				parentsSafe,
+			}),
+		});
+
+		await expect(service.query(connection, "SELECT 1")).rejects.toMatchObject({
+			code: "GATEWAY_UNAVAILABLE",
+		});
 		expect(run).not.toHaveBeenCalled();
 	});
 
@@ -167,6 +195,7 @@ describe("SshDatabaseQueryService", () => {
 				isFile: true,
 				uid: process.getuid?.() ?? 0,
 				mode: path.includes("known_hosts") ? 0o100644 : 0o100600,
+				parentsSafe: true,
 			}),
 		});
 		await expect(service.query(connection, "SELECT 1")).rejects.toMatchObject({
@@ -199,6 +228,7 @@ describe("SshDatabaseQueryService", () => {
 				isFile: true,
 				uid: process.getuid?.() ?? 0,
 				mode: path.includes("known_hosts") ? 0o100644 : 0o100600,
+				parentsSafe: true,
 			}),
 		});
 		const first = new AbortController();
