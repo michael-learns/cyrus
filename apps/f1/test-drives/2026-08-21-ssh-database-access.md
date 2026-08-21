@@ -1,15 +1,14 @@
 # Test Drive: SSH Database Access
 
 **Date:** 2026-08-21
-**Objective:** Validate credential-free Slack-to-MCP database access, hardened SSH framing, authorization, audit metadata, and a hermetic OpenSSH/PostgreSQL gateway.
+**Objective:** Validate credential-free Slack-to-MCP database access, hardened SSH framing, authorization, audit metadata, and hermetic OpenSSH/PostgreSQL/MySQL gateways.
 **Test repository:** `/tmp/cyrus-f1-ssh-db.26HS5b/repo` (removed after the drive)
 
 ## Environment
 
 - macOS, Node `v22.23.2`, pnpm `10.33.1`
 - Docker client/server `29.4.0`
-- `/usr/sbin/sshd` and cached `postgres:16-alpine`
-- No cached MySQL/MariaDB image and no host MySQL client
+- `/usr/sbin/sshd`, cached `postgres:16-alpine`, and cached `mysql:8.4`
 - No real Slack, GitHub, SSH, or database credentials
 
 ## Verification Results
@@ -52,7 +51,7 @@ Command:
 node apps/f1/test-drives/assets/2026-08-21-ssh-database-hermetic.mjs
 ```
 
-The drive started a disposable `postgres:16-alpine` container, seeded two non-secret rows, created a narrowly granted login, revoked public TEMP/schema-create/routine execution and the PostgreSQL 16 `pg_settings` write grant, launched a loopback OpenSSH daemon with a generated forced-command key, and invoked `SshDatabaseQueryService` through that forced command. It returned:
+The drive started disposable `postgres:16-alpine` and `mysql:8.4` containers, seeded two non-secret rows in each, created narrowly granted logins, ran both privilege preflights, launched a loopback OpenSSH daemon with a separate generated forced-command key per connection, and invoked `SshDatabaseQueryService` through both forced commands. It returned:
 
 ```json
 {
@@ -69,16 +68,26 @@ The drive started a disposable `postgres:16-alpine` container, seeded two non-se
     "writeRejected": true
   },
   "mysql": {
-    "attempted": false,
-    "reason": "no cached mysql/mariadb image; network pulls are forbidden"
+    "attempted": true,
+    "image": "mysql:8.4",
+    "selected": {
+      "connectionId": "f1-mysql",
+      "engine": "mysql",
+      "format": "tsv",
+      "output": "id\tname\n1\tAda\n2\tGrace\n",
+      "truncated": false,
+      "rowCount": 2,
+      "byteCount": 22
+    },
+    "writeRejected": true
   },
   "openSsh": true
 }
 ```
 
-`docker ps -a --filter name=cyrus-f1-postgres` returned no containers after the drive, proving cleanup ran.
+`docker ps -a --filter name=cyrus-f1` returned no containers after the drive, proving cleanup ran for both engines.
 
-The drive uses the production gateway, native-client, privilege-preflight, framing, SSH query service, and OpenSSH forced-command paths. The temporary wrapper that maps the native `psql` argv into `docker exec` uses the executor's file-inspection seam because a non-root test process cannot create a root-owned executable. That is the only file-ownership check not exercised by this drive; unit coverage validates it separately.
+The drive uses the production gateway, native-client, privilege-preflight, framing, SSH query service, and OpenSSH forced-command paths for both engines. Temporary wrappers map native `psql` and `mysql` argv into `docker exec` and use the executor's file-inspection seam because a non-root test process cannot create root-owned executables. That is the only file-ownership check not exercised by this drive; unit coverage validates it separately.
 
 ### F1 protocol and renderer smoke
 
@@ -104,11 +113,10 @@ CYRUS_PORT=3600 apps/f1/f1 stop-session --session-id session-1
 
 ## Limitations
 
-- The deterministic F1 fixture fully covers MySQL selection, exact request framing, TSV response decoding, audit metadata, authorization, and policy rejection, but it does not run a real MySQL server/client.
-- The hermetic drive intentionally does not pull images or packages from the network. With no cached MySQL/MariaDB image or client, MySQL server privilege preflight and native-client execution remain unvalidated in this environment.
+- The hermetic drive intentionally does not pull images or packages from the network while it runs; its required PostgreSQL and MySQL images must already be cached.
 - Timeout cancellation is covered by the package's focused process/service tests, not the successful Docker drive; PostgreSQL sleep functions are intentionally rejected by SQL policy before execution.
 - The basic F1 renderer smoke validates CLI pagination/search mechanics, while the credential-free integration test validates database behavior directly and deterministically.
 
 ## Conclusion
 
-PASS for the credential-free PostgreSQL/MySQL production-path fixture and the real OpenSSH/PostgreSQL hermetic path. MySQL Docker/native-client coverage is explicitly incomplete because the required cached artifacts were unavailable and external traffic was prohibited.
+PASS for the credential-free PostgreSQL/MySQL production-path fixture and the real OpenSSH/PostgreSQL/MySQL hermetic paths.
