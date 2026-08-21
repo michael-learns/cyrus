@@ -143,6 +143,9 @@ importers:
       cyrus-slack-event-transport:
         specifier: workspace:*
         version: link:../../packages/slack-event-transport
+      cyrus-ssh-database:
+        specifier: workspace:*
+        version: link:../../packages/ssh-database
     devDependencies:
       '@types/node':
         specifier: ^20.0.0

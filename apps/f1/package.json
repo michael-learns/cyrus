@@ -37,6 +37,7 @@
 		"cyrus-core": "workspace:*",
 		"cyrus-edge-worker": "workspace:*",
 		"cyrus-mcp-tools": "workspace:*",
+		"cyrus-ssh-database": "workspace:*",
 		"cyrus-slack-event-transport": "workspace:*"
 	},
 	"devDependencies": {

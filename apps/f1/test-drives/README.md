@@ -2,6 +2,10 @@
 
 This directory contains logs and findings from F1 test drives.
 
+## Recent drives
+
+- [2026-08-21 SSH database access](./2026-08-21-ssh-database-access.md) — credential-free raw Slack/MCP coverage plus a hermetic OpenSSH/PostgreSQL drive.
+
 ## Purpose
 
 Use this directory to document:

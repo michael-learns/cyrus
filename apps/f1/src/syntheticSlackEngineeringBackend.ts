@@ -17,6 +17,11 @@ interface SyntheticDelivery {
 	ok: boolean;
 }
 
+export interface SyntheticDatabaseAudit {
+	event: string;
+	fields: Record<string, unknown>;
+}
+
 function json(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), {
 		status,
@@ -37,6 +42,7 @@ export class SyntheticSlackEngineeringBackend {
 	readonly issues: SyntheticIssue[] = [];
 	readonly deliveries: SyntheticDelivery[] = [];
 	readonly externalRequests: string[] = [];
+	readonly databaseAudits: SyntheticDatabaseAudit[] = [];
 	failSlackDelivery = false;
 
 	constructor(private readonly statePath?: string) {
@@ -65,15 +71,21 @@ export class SyntheticSlackEngineeringBackend {
 		this.files.set(id, { bytes: Buffer.from(bytes), mimeType });
 	}
 
+	recordDatabaseAudit(event: string, fields: Record<string, unknown>): void {
+		this.databaseAudits.push({ event, fields: structuredClone(fields) });
+	}
+
 	snapshot(): {
 		issues: SyntheticIssue[];
 		deliveries: SyntheticDelivery[];
 		externalRequests: string[];
+		databaseAudits: SyntheticDatabaseAudit[];
 	} {
 		return {
 			issues: structuredClone(this.issues),
 			deliveries: structuredClone(this.deliveries),
 			externalRequests: [...this.externalRequests],
+			databaseAudits: structuredClone(this.databaseAudits),
 		};
 	}
 
