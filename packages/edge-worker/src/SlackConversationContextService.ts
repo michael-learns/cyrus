@@ -42,6 +42,7 @@ export interface SlackConversationMessage {
 	author: string;
 	text: string;
 	links: SlackConversationLink[];
+	attachments?: Array<{ author: string; source?: string; text: string }>;
 	forwarded: Array<{ author: string; source?: string; text: string }>;
 	files: SlackCapturedFile[];
 }
@@ -126,6 +127,14 @@ function messageTextFootprint(message: SlackConversationMessage): number {
 			(total, link) => total + link.label.length + link.url.length,
 			0,
 		) +
+		(message.attachments ?? []).reduce(
+			(total, item) =>
+				total +
+				item.author.length +
+				(item.source?.length ?? 0) +
+				item.text.length,
+			0,
+		) +
 		message.forwarded.reduce(
 			(total, item) =>
 				total +
@@ -163,12 +172,21 @@ function fitMessageToTextBudget(
 		text: take(message.text),
 		author: take(message.author),
 		links: [],
+		attachments: [],
 		forwarded: [],
 		files: [],
 	};
 	for (const link of message.links) {
 		if (remaining === 0) break;
 		fitted.links.push({ label: take(link.label), url: take(link.url) });
+	}
+	for (const item of message.attachments ?? []) {
+		if (remaining === 0) break;
+		fitted.attachments!.push({
+			author: take(item.author),
+			...(item.source !== undefined && { source: take(item.source) }),
+			text: take(item.text),
+		});
 	}
 	for (const item of message.forwarded) {
 		if (remaining === 0) break;
@@ -360,6 +378,49 @@ function forwardedContent(
 		.filter((item) => item.text);
 }
 
+function ordinaryAttachmentContent(
+	attachments: SlackMessageAttachment[] | undefined,
+	token: string,
+) {
+	return (attachments ?? [])
+		.filter((attachment) => !attachment.is_share && !attachment.is_msg_unfurl)
+		.map((attachment) => {
+			const rawAuthor =
+				attachment.author_name ||
+				attachment.author_subname ||
+				attachment.author_id ||
+				attachment.footer ||
+				"unknown";
+			const rawSource =
+				attachment.channel_name ||
+				(attachment.footer && attachment.footer !== rawAuthor
+					? attachment.footer
+					: undefined);
+			const fromMessageBlocks = (attachment.message_blocks ?? [])
+				.map((item) => flattenBlocks(item.message?.blocks))
+				.filter(Boolean)
+				.join("\n");
+			return {
+				author: redact(rawAuthor, token),
+				...(rawSource && {
+					source: redact(
+						attachment.channel_name ? `#${rawSource}` : rawSource,
+						token,
+					),
+				}),
+				text: redact(
+					attachment.text ||
+						flattenBlocks(attachment.blocks) ||
+						fromMessageBlocks ||
+						attachment.fallback ||
+						"",
+					token,
+				),
+			};
+		})
+		.filter((item) => item.text);
+}
+
 export class SlackConversationContextService {
 	private readonly cyrusHome: string;
 	private readonly fetchImpl: typeof fetch;
@@ -517,6 +578,7 @@ export class SlackConversationContextService {
 				message.attachments,
 				token,
 			),
+			attachments: ordinaryAttachmentContent(message.attachments, token),
 			forwarded: forwardedContent(message.attachments, token),
 			files: (message.files ?? []).map((file) => ({
 				id: redact(file.id, token),
@@ -757,6 +819,11 @@ export class SlackConversationContextService {
 		const lines = [`Slack thread: ${manifest.source.permalink}`, ""];
 		for (const message of manifest.messages) {
 			lines.push(`[${message.ts}] ${message.author}`, message.text);
+			for (const item of message.attachments ?? [])
+				lines.push(
+					`[Attachment from ${item.author}${item.source ? ` ${item.source}` : ""}]`,
+					item.text,
+				);
 			for (const item of message.forwarded)
 				lines.push(
 					`[Forwarded from ${item.author}${item.source ? ` ${item.source}` : ""}]`,

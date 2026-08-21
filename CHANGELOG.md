@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Cyrus now reads issue cards, attachment-only parent messages, and screenshots when it is mentioned inside an existing Slack thread, instead of reporting that the first message was empty.
 - Direct Slack mentions now start Cyrus reliably even when Slack delivers the ordinary message event before the app-mention event. ([#3](https://github.com/michael-learns/cyrus/pull/3))
 - Slack keeps requests in progress while background work continues, posts a waiting update for scheduled work, and replies with the agent's actual result instead of a premature `Task completed.` placeholder. ([#4](https://github.com/michael-learns/cyrus/pull/4))
 

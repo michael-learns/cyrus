@@ -1,16 +1,33 @@
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { SDKMessage } from "cyrus-claude-runner";
-import type { AgentPendingWork, IAgentRunner, ILogger } from "cyrus-core";
+import type {
+	AgentImageMediaType,
+	AgentPendingWork,
+	AgentTurn,
+	IAgentRunner,
+	ILogger,
+} from "cyrus-core";
 import { createLogger } from "cyrus-core";
 import {
 	buildPromptText,
+	type SlackEventPayload,
 	SlackMessageService,
 	SlackReactionService,
 	type SlackThreadMessage,
 	type SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
 import type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
-import type { ChatPlatformAdapter } from "./ChatSessionHandler.js";
+import type {
+	ChatPlatformAdapter,
+	ChatThreadTurnContext,
+} from "./ChatSessionHandler.js";
 import { formatPendingWorkThought } from "./PendingWorkFormatter.js";
+import {
+	SlackConversationContextService,
+	type SlackConversationManifest,
+	type SlackConversationMessage,
+} from "./SlackConversationContextService.js";
 
 /**
  * Sentinel the agent emits when it has decided a Slack message does not warrant
@@ -156,6 +173,8 @@ export class SlackChatAdapter
 	private repositoryProvider: ChatRepositoryProvider;
 	private repositoryRoutingContext: string;
 	private behavioursPageUrl: string;
+	private cyrusHome?: string;
+	private contextFetch?: typeof fetch;
 	private logger: ILogger;
 	private selfIdentity:
 		| { botId: string | undefined; userId: string }
@@ -170,6 +189,10 @@ export class SlackChatAdapter
 		logger?: ILogger,
 		options?: {
 			repositoryRoutingContext?: string;
+			/** Cyrus-owned root for transient Slack image capture. */
+			cyrusHome?: string;
+			/** Injectable download boundary for deterministic tests. */
+			contextFetch?: typeof fetch;
 			/**
 			 * Base URL of the hosted Cyrus app (e.g. https://app.atcyrus.com).
 			 * Only set for managed teams — community members have no Behaviours
@@ -183,6 +206,8 @@ export class SlackChatAdapter
 		this.repositoryProvider = repositoryProvider;
 		this.repositoryRoutingContext =
 			options?.repositoryRoutingContext?.trim() || "";
+		this.cyrusHome = options?.cyrusHome;
+		this.contextFetch = options?.contextFetch;
 		const appBaseUrl = options?.cyrusAppBaseUrl?.trim().replace(/\/+$/, "");
 		this.behavioursPageUrl = appBaseUrl
 			? `${appBaseUrl}${BEHAVIOURS_PAGE_ROUTE}`
@@ -560,6 +585,189 @@ Supported mrkdwn syntax:
 			);
 			return null;
 		}
+	}
+
+	/**
+	 * Fetch the verified thread through this event and preserve Slack images as
+	 * ordered local-image parts. The capture service applies the same host,
+	 * redirect, size, MIME, signature, and filename checks used by delegated
+	 * engineering work.
+	 */
+	async fetchThreadTurn(
+		event: SlackWebhookEvent,
+		sinceTs?: string,
+	): Promise<ChatThreadTurnContext | null> {
+		if (!event.payload.thread_ts) return { turn: [] };
+
+		// Community/unit callers that did not provide a Cyrus-owned capture root
+		// retain the existing text-only behavior.
+		if (!this.cyrusHome) {
+			const context = await this.fetchThreadContext(event, sinceTs);
+			return context === null
+				? null
+				: { turn: context ? [{ type: "text", text: context }] : [] };
+		}
+
+		const token = this.getSlackBotToken(event);
+		if (!token) {
+			this.logger.warn(
+				"Cannot fetch Slack thread context: no slackBotToken available",
+			);
+			return null;
+		}
+
+		try {
+			const slackService = new SlackMessageService();
+			const [snapshot, selfBotId] = await Promise.all([
+				slackService.fetchThreadThrough({
+					token,
+					channel: event.payload.channel,
+					thread_ts: event.payload.thread_ts,
+					trigger_ts: event.payload.ts,
+				}),
+				this.getSelfBotId(token),
+			]);
+
+			const messages = sinceTs
+				? snapshot.messages
+						.filter(
+							(message) =>
+								message.ts > sinceTs && !this.isSelfMessage(message, selfBotId),
+						)
+						.flatMap((message) => {
+							if (message.ts !== event.payload.ts) return [message];
+							// The trigger's text is already appended as task instructions, but
+							// buildPromptText cannot carry files. Keep a file-only copy so a
+							// screenshot sent with a follow-up is not silently discarded.
+							return message.files?.length
+								? [
+										{
+											...message,
+											text: "",
+											blocks: undefined,
+											attachments: undefined,
+										},
+									]
+								: [];
+						})
+						.slice(-THREAD_CONTEXT_MESSAGE_LIMIT)
+				: snapshot.messages;
+			if (messages.length === 0) return { turn: [] };
+
+			const capture = await new SlackConversationContextService({
+				cyrusHome: this.cyrusHome,
+				...(this.contextFetch ? { fetch: this.contextFetch } : {}),
+				logger: {
+					warn: (message) => this.logger.warn(message),
+				},
+			}).capture({
+				teamId: event.teamId,
+				channelId: event.payload.channel,
+				threadTs: event.payload.thread_ts,
+				kickoffTs: event.payload.ts,
+				threadPermalink: snapshot.permalink,
+				token,
+				messages,
+			});
+
+			let cleaned = false;
+			return {
+				turn: this.capturedManifestTurn(
+					capture.manifest,
+					capture.directory,
+					sinceTs !== undefined,
+				),
+				cleanup: async () => {
+					if (cleaned) return;
+					cleaned = true;
+					await rm(capture.directory, { recursive: true, force: true });
+				},
+			};
+		} catch (error) {
+			this.logger.warn(
+				`Failed to fetch Slack thread context: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			const textFallback = await this.fetchThreadContext(event, sinceTs);
+			return textFallback === null
+				? null
+				: {
+						turn: textFallback ? [{ type: "text", text: textFallback }] : [],
+					};
+		}
+	}
+
+	private capturedManifestTurn(
+		manifest: SlackConversationManifest,
+		directory: string,
+		isCatchup: boolean,
+	): AgentTurn {
+		const turn: AgentTurn = [];
+		let text = isCatchup
+			? "The following messages were posted in this thread since you last had context. Read them for background before responding.\n\n<slack_thread_context>\n"
+			: "<slack_thread_context>\n";
+
+		for (const message of manifest.messages) {
+			text += this.capturedMessageOpening(message);
+			for (const file of message.files) {
+				if (
+					file.status !== "downloaded" ||
+					!file.localPath ||
+					!this.isAgentImageMediaType(file.mimeType)
+				)
+					continue;
+				if (text) turn.push({ type: "text", text });
+				turn.push({
+					type: "local_image",
+					path: join(directory, file.localPath),
+					mediaType: file.mimeType,
+				});
+				text = "";
+			}
+			text += `${text ? "\n" : ""}  </message>\n`;
+		}
+		text += "</slack_thread_context>";
+		if (text) turn.push({ type: "text", text });
+		return turn;
+	}
+
+	private capturedMessageOpening(message: SlackConversationMessage): string {
+		const content = [message.text];
+		for (const attachment of message.attachments ?? []) {
+			content.push(
+				`[Attachment from ${attachment.author}${attachment.source ? ` ${attachment.source}` : ""}]`,
+				attachment.text,
+			);
+		}
+		for (const forwarded of message.forwarded) {
+			content.push(
+				`[Forwarded from ${forwarded.author}${forwarded.source ? ` ${forwarded.source}` : ""}]`,
+				forwarded.text,
+			);
+		}
+		for (const link of message.links)
+			content.push(`Link: ${link.label} — ${link.url}`);
+		for (const file of message.files)
+			content.push(
+				`File: ${file.name} — ${file.status}${file.reason ? ` (${file.reason})` : ""}`,
+			);
+
+		return `  <message>
+    <author>${message.author}</author>
+    <timestamp>${message.ts}</timestamp>
+    <content>
+${content.filter(Boolean).join("\n")}
+    </content>`;
+	}
+
+	private isAgentImageMediaType(
+		value: string | undefined,
+	): value is AgentImageMediaType {
+		return (
+			value === "image/jpeg" ||
+			value === "image/png" ||
+			value === "image/gif" ||
+			value === "image/webp"
+		);
 	}
 
 	async postReply(
@@ -958,11 +1166,20 @@ Supported mrkdwn syntax:
 				const author = this.isSelfMessage(msg, selfBotId)
 					? "assistant (you)"
 					: (msg.user ?? "unknown");
+				const content = [
+					buildPromptText(msg as unknown as SlackEventPayload),
+					...(msg.files ?? []).map(
+						(file) =>
+							`File: ${file.name || file.id}${file.mimetype ? ` (${file.mimetype})` : ""}`,
+					),
+				]
+					.filter(Boolean)
+					.join("\n");
 				return `  <message>
     <author>${author}</author>
     <timestamp>${msg.ts}</timestamp>
     <content>
-${msg.text}
+${content}
     </content>
   </message>`;
 			})

@@ -1,10 +1,11 @@
 import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { SDKMessage, SdkPluginConfig } from "cyrus-claude-runner";
 import type {
 	AgentPendingWork,
 	AgentRunnerConfig,
 	AgentSessionInfo,
+	AgentTurn,
 	CyrusAgentSession,
 	IAgentRunner,
 	ILogger,
@@ -24,6 +25,18 @@ import type { RunnerConfigBuilder } from "./RunnerConfigBuilder.js";
 /** Platform identifiers supported by the session manager */
 export type ChatPlatformName = "slack" | "linear" | "github";
 type SDKResultMessage = Extract<SDKMessage, { type: "result" }>;
+
+/** Structured thread context whose temporary artifacts can be released after input encoding. */
+export interface ChatThreadTurnContext {
+	turn: AgentTurn;
+	cleanup?: () => Promise<void>;
+}
+
+interface ChatRunnerInput {
+	text: string;
+	turn?: AgentTurn;
+	cleanup?: () => Promise<void>;
+}
 
 export interface ChatPlatformAdapter<TEvent> {
 	readonly platformName: ChatPlatformName;
@@ -58,6 +71,16 @@ export interface ChatPlatformAdapter<TEvent> {
 	 * result advances the cursor.
 	 */
 	fetchThreadContext(event: TEvent, sinceTs?: string): Promise<string | null>;
+
+	/**
+	 * Ordered text/image context for runners that support structured turns.
+	 * `null` has the same retry meaning as `fetchThreadContext`; omitted keeps
+	 * text-only platform adapters backward compatible.
+	 */
+	fetchThreadTurn?(
+		event: TEvent,
+		sinceTs?: string,
+	): Promise<ChatThreadTurnContext | null>;
 
 	/**
 	 * This event's thread position, stored as the catch-up cursor. Optional —
@@ -290,7 +313,7 @@ export class ChatSessionHandler<TEvent> {
 				if (existingSession && existingRunner?.isRunning()) {
 					// Session is actively running — inject the follow-up via streaming input
 					if (
-						existingRunner.addStreamMessage &&
+						(existingRunner.addStreamMessage || existingRunner.addStreamTurn) &&
 						existingRunner.isStreaming?.()
 					) {
 						await this.startActivityStatus(event, taskInstructions);
@@ -298,8 +321,9 @@ export class ChatSessionHandler<TEvent> {
 							`Injecting follow-up prompt into running session ${existingSessionId} (thread ${threadKey})`,
 						);
 						this.enqueueReply(existingSessionId, event);
-						existingRunner.addStreamMessage(
-							await this.withThreadCatchup(
+						await this.addRunnerInput(
+							existingRunner,
+							await this.withThreadCatchupInput(
 								existingSession,
 								event,
 								taskInstructions,
@@ -438,7 +462,7 @@ export class ChatSessionHandler<TEvent> {
 			await this.deps.onStateChange();
 
 			// Fetch thread context for threaded mentions
-			const userPrompt = await this.withThreadContext(
+			const runnerInput = await this.withThreadInput(
 				session,
 				event,
 				taskInstructions,
@@ -456,10 +480,10 @@ export class ChatSessionHandler<TEvent> {
 			// completion here, because with warm sessions the streaming prompt
 			// stays open and the start() promise doesn't resolve until the
 			// whole session ends.
-			const startPromise =
-				runner.supportsStreamingInput && runner.startStreaming
-					? runner.startStreaming(userPrompt)
-					: runner.start(userPrompt);
+			const { promise: startPromise } = await this.startRunnerInput(
+				runner,
+				runnerInput,
+			);
 			startPromise
 				.then((sessionInfo: AgentSessionInfo) => {
 					this.logger.info(
@@ -626,19 +650,160 @@ export class ChatSessionHandler<TEvent> {
 		return context ? `${context}\n\n${taskInstructions}` : taskInstructions;
 	}
 
-	/**
-	 * Follow-up variant. Platforms with no thread cursor deliver every message
-	 * already, so re-reading the thread would only duplicate what the session has.
-	 */
-	private async withThreadCatchup(
+	/** Build an ordered turn when the platform captured images, else preserve text mode. */
+	private async withThreadInput(
 		session: CyrusAgentSession,
 		event: TEvent,
 		taskInstructions: string,
-	): Promise<string> {
-		if (!this.adapter.getThreadContextTs) {
-			return taskInstructions;
+	): Promise<ChatRunnerInput> {
+		if (!this.adapter.fetchThreadTurn) {
+			return {
+				text: await this.withThreadContext(session, event, taskInstructions),
+			};
 		}
-		return this.withThreadContext(session, event, taskInstructions);
+
+		let context: ChatThreadTurnContext | null;
+		try {
+			context = await this.adapter.fetchThreadTurn(
+				event,
+				session.metadata?.lastContextTs,
+			);
+		} catch (error) {
+			this.logger.warn(
+				`Failed to fetch structured thread context for ${this.adapter.platformName} session: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return { text: taskInstructions };
+		}
+
+		if (context !== null) this.recordThreadContextTs(session, event);
+		if (context === null) return { text: taskInstructions };
+
+		const turn: AgentTurn = [
+			...context.turn,
+			{ type: "text", text: taskInstructions },
+		];
+		return {
+			text: turn
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.filter(Boolean)
+				.join("\n\n"),
+			...(turn.some((part) => part.type === "local_image") && { turn }),
+			...(context.cleanup && { cleanup: context.cleanup }),
+		};
+	}
+
+	private async withThreadCatchupInput(
+		session: CyrusAgentSession,
+		event: TEvent,
+		taskInstructions: string,
+	): Promise<ChatRunnerInput> {
+		if (!this.adapter.getThreadContextTs) return { text: taskInstructions };
+		return this.withThreadInput(session, event, taskInstructions);
+	}
+
+	private releaseInputLeases(leases: Array<{ release(): void }>): void {
+		for (const lease of leases.reverse()) {
+			try {
+				lease.release();
+			} catch (error) {
+				this.logger.warn(
+					`Failed to release transient chat image access: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+	}
+
+	private async cleanupRunnerInput(input: ChatRunnerInput): Promise<void> {
+		if (!input.cleanup) return;
+		try {
+			await input.cleanup();
+		} catch (error) {
+			this.logger.warn(
+				`Failed to clean transient ${this.adapter.platformName} context: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/**
+	 * Encode local images synchronously at the runner boundary, revoke the
+	 * temporary directory grants, and delete the capture before model work runs.
+	 */
+	private async startRunnerInput(
+		runner: IAgentRunner,
+		input: ChatRunnerInput,
+	): Promise<{ promise: Promise<AgentSessionInfo> }> {
+		const imageDirectories = input.turn
+			? [
+					...new Set(
+						input.turn
+							.filter((part) => part.type === "local_image")
+							.map((part) => dirname(part.path)),
+					),
+				]
+			: [];
+		const canUseStructured = Boolean(
+			input.turn &&
+				imageDirectories.length > 0 &&
+				runner.allowLocalImageDirectory &&
+				((runner.supportsStreamingInput && runner.startStreamingTurn) ||
+					runner.startTurn),
+		);
+		const leases: Array<{ release(): void }> = [];
+		try {
+			if (canUseStructured) {
+				for (const directory of imageDirectories)
+					leases.push(runner.allowLocalImageDirectory!(directory));
+				const promise =
+					runner.supportsStreamingInput && runner.startStreamingTurn
+						? runner.startStreamingTurn(input.turn!)
+						: runner.startTurn!(input.turn!);
+				return { promise };
+			}
+			const promise =
+				runner.supportsStreamingInput && runner.startStreaming
+					? runner.startStreaming(input.text)
+					: runner.start(input.text);
+			return { promise };
+		} finally {
+			this.releaseInputLeases(leases);
+			await this.cleanupRunnerInput(input);
+		}
+	}
+
+	private async addRunnerInput(
+		runner: IAgentRunner,
+		input: ChatRunnerInput,
+	): Promise<void> {
+		const imageDirectories = input.turn
+			? [
+					...new Set(
+						input.turn
+							.filter((part) => part.type === "local_image")
+							.map((part) => dirname(part.path)),
+					),
+				]
+			: [];
+		const leases: Array<{ release(): void }> = [];
+		try {
+			if (
+				input.turn &&
+				imageDirectories.length > 0 &&
+				runner.addStreamTurn &&
+				runner.allowLocalImageDirectory
+			) {
+				for (const directory of imageDirectories)
+					leases.push(runner.allowLocalImageDirectory(directory));
+				runner.addStreamTurn(input.turn);
+			} else if (runner.addStreamMessage) {
+				runner.addStreamMessage(input.text);
+			} else {
+				throw new Error("Runner does not support streaming chat input");
+			}
+		} finally {
+			this.releaseInputLeases(leases);
+			await this.cleanupRunnerInput(input);
+		}
 	}
 
 	/**
@@ -665,7 +830,7 @@ export class ChatSessionHandler<TEvent> {
 		const runner = await this.deps.createRunner(runnerConfig);
 		this.sessionManager.addAgentRunner(sessionId, runner);
 
-		const resumePrompt = await this.withThreadCatchup(
+		const resumeInput = await this.withThreadCatchupInput(
 			existingSession,
 			event,
 			taskInstructions,
@@ -675,10 +840,10 @@ export class ChatSessionHandler<TEvent> {
 		// (see handleAgentMessage). We must not await turn completion here —
 		// warm sessions hold the streaming prompt open across turns so the
 		// start() promise only resolves when the whole session ends.
-		const startPromise =
-			runner.supportsStreamingInput && runner.startStreaming
-				? runner.startStreaming(resumePrompt)
-				: runner.start(resumePrompt);
+		const { promise: startPromise } = await this.startRunnerInput(
+			runner,
+			resumeInput,
+		);
 		startPromise
 			.then((sessionInfo: AgentSessionInfo) => {
 				this.logger.info(

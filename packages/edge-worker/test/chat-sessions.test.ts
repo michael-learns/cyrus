@@ -1,4 +1,6 @@
-import { join } from "node:path";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { getReadOnlyTools } from "cyrus-claude-runner";
 import type { RepositoryConfig } from "cyrus-core";
 import {
@@ -232,6 +234,150 @@ describe("ChatSessionHandler chat session permissions", () => {
 			"agent-browser",
 			"test-user-skills",
 		]);
+	});
+});
+
+describe("ChatSessionHandler structured thread context", () => {
+	it("passes parent-message images to the runner and cleans the transient capture", async () => {
+		const adapter = new TestChatAdapter("thread-with-image");
+		const cleanup = vi.fn().mockResolvedValue(undefined);
+		(adapter as any).fetchThreadTurn = vi.fn().mockResolvedValue({
+			turn: [
+				{ type: "text", text: "parent issue context" },
+				{
+					type: "local_image",
+					path: "/tmp/cyrus-chat-capture/images/image-001.png",
+					mediaType: "image/png",
+				},
+			],
+			cleanup,
+		});
+		const release = vi.fn();
+		const startStreamingTurn = vi
+			.fn()
+			.mockResolvedValue({ sessionId: "session-1" });
+		const startStreaming = vi
+			.fn()
+			.mockResolvedValue({ sessionId: "wrong-string-session" });
+		const runner = {
+			supportsStreamingInput: true,
+			start: vi.fn().mockResolvedValue({ sessionId: "wrong-start" }),
+			startStreaming,
+			startStreamingTurn,
+			allowLocalImageDirectory: vi.fn().mockReturnValue({ release }),
+			stop: vi.fn(),
+			isRunning: vi.fn().mockReturnValue(false),
+			isStreaming: vi.fn().mockReturnValue(false),
+			addStreamMessage: vi.fn(),
+			getMessages: vi.fn().mockReturnValue([]),
+		};
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner: vi.fn().mockReturnValue(runner),
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		await handler.handleEvent({
+			eventId: "image-mention",
+			threadKey: "thread-with-image",
+		});
+
+		expect(startStreamingTurn).toHaveBeenCalledWith([
+			{ type: "text", text: "parent issue context" },
+			{
+				type: "local_image",
+				path: "/tmp/cyrus-chat-capture/images/image-001.png",
+				mediaType: "image/png",
+			},
+			{ type: "text", text: "Inspect repository configuration" },
+		]);
+		expect(startStreaming).not.toHaveBeenCalled();
+		expect(runner.allowLocalImageDirectory).toHaveBeenCalledWith(
+			"/tmp/cyrus-chat-capture/images",
+		);
+		expect(release).toHaveBeenCalledOnce();
+		expect(cleanup).toHaveBeenCalledOnce();
+		expect(release.mock.invocationCallOrder[0]).toBeLessThan(
+			cleanup.mock.invocationCallOrder[0]!,
+		);
+	});
+
+	it("injects a follow-up image into an active streaming turn", async () => {
+		const adapter = new TestChatAdapter("active-image-thread");
+		(adapter as any).getThreadContextTs = (event: TestEvent) => event.ts;
+		const cleanup = vi.fn().mockResolvedValue(undefined);
+		(adapter as any).fetchThreadTurn = vi
+			.fn()
+			.mockResolvedValueOnce({ turn: [] })
+			.mockResolvedValueOnce({
+				turn: [
+					{ type: "text", text: "new screenshot" },
+					{
+						type: "local_image",
+						path: "/tmp/cyrus-chat-followup/images/image-001.png",
+						mediaType: "image/png",
+					},
+				],
+				cleanup,
+			});
+		const release = vi.fn();
+		const addStreamTurn = vi.fn();
+		const runner = {
+			supportsStreamingInput: true,
+			start: vi.fn(),
+			startStreaming: vi
+				.fn()
+				.mockResolvedValue({ sessionId: "streaming-session" }),
+			startStreamingTurn: vi.fn(),
+			allowLocalImageDirectory: vi.fn().mockReturnValue({ release }),
+			stop: vi.fn(),
+			isRunning: vi.fn().mockReturnValue(true),
+			isStreaming: vi.fn().mockReturnValue(true),
+			addStreamMessage: vi.fn(),
+			addStreamTurn,
+			getMessages: vi.fn().mockReturnValue([]),
+		};
+		const handler = new ChatSessionHandler(adapter, {
+			cyrusHome: TEST_CYRUS_CHAT,
+			chatRepositoryProvider: createStaticProvider([]),
+			runnerConfigBuilder: createMockRunnerConfigBuilder(),
+			createRunner: vi.fn().mockReturnValue(runner),
+			onWebhookStart: vi.fn(),
+			onWebhookEnd: vi.fn(),
+			onStateChange: vi.fn().mockResolvedValue(undefined),
+			onClaudeError: vi.fn(),
+		});
+
+		await handler.handleEvent({
+			eventId: "initial",
+			threadKey: "active-image-thread",
+			ts: "1.000",
+		});
+		await handler.handleEvent({
+			eventId: "follow-up",
+			threadKey: "active-image-thread",
+			ts: "2.000",
+		});
+
+		expect(addStreamTurn).toHaveBeenCalledWith([
+			{ type: "text", text: "new screenshot" },
+			{
+				type: "local_image",
+				path: "/tmp/cyrus-chat-followup/images/image-001.png",
+				mediaType: "image/png",
+			},
+			{ type: "text", text: "Inspect repository configuration" },
+		]);
+		expect(runner.allowLocalImageDirectory).toHaveBeenCalledWith(
+			"/tmp/cyrus-chat-followup/images",
+		);
+		expect(release).toHaveBeenCalledOnce();
+		expect(cleanup).toHaveBeenCalledOnce();
 	});
 });
 
@@ -1991,6 +2137,201 @@ original ask
   </message>
 </slack_thread_context>`,
 		);
+	});
+
+	it("reads an issue body from an attachment-only parent in text fallback mode", async () => {
+		const adapter = new SlackChatAdapter(createStaticProvider([]));
+		mockIdentity();
+		vi.spyOn(
+			SlackMessageService.prototype,
+			"fetchThreadMessages",
+		).mockResolvedValue([
+			{
+				user: "UGITHUB",
+				text: "",
+				ts: PARENT_TS,
+				attachments: [
+					{
+						author_name: "GitHub",
+						text: "Implement GitHub issue #451 end-to-end.",
+					},
+				],
+			},
+		] as any);
+
+		await expect(adapter.fetchThreadContext(mentionEvent())).resolves.toBe(
+			`<slack_thread_context>
+  <message>
+    <author>UGITHUB</author>
+    <timestamp>${PARENT_TS}</timestamp>
+    <content>
+[Attachment from GitHub]
+Implement GitHub issue #451 end-to-end.
+    </content>
+  </message>
+</slack_thread_context>`,
+		);
+	});
+
+	it("captures a parent-message screenshot as ordered Claude context", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-chat-image-"));
+		const png = Buffer.from([
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+			0x49, 0x48, 0x44, 0x52,
+		]);
+		const imageFetch = vi.fn().mockResolvedValue(
+			new Response(png, {
+				headers: {
+					"content-type": "image/png",
+					"content-length": String(png.length),
+				},
+			}),
+		);
+		const adapter = new SlackChatAdapter(createStaticProvider([]), undefined, {
+			cyrusHome,
+			contextFetch: imageFetch as typeof fetch,
+		});
+		mockIdentity();
+		vi.spyOn(
+			SlackMessageService.prototype,
+			"fetchThreadThrough",
+		).mockResolvedValue({
+			permalink: "https://workspace.slack.com/archives/C1/p1700000000000100",
+			messages: [
+				{
+					user: "U1",
+					text: "Login fails after I sign in",
+					ts: PARENT_TS,
+					files: [
+						{
+							id: "F1",
+							name: "authentication-error.png",
+							mimetype: "image/png",
+							size: png.length,
+							url_private_download:
+								"https://files.slack.com/files-pri/T1-F1/authentication-error.png",
+						},
+					],
+				},
+				{
+					user: "U1",
+					text: "<@U0BOT> can you explain this issue simply?",
+					ts: TRIGGER_TS,
+				},
+			],
+		});
+
+		try {
+			const result = await (adapter as any).fetchThreadTurn(mentionEvent());
+			const imagePart = result.turn.find(
+				(part: { type: string }) => part.type === "local_image",
+			);
+			expect(result.turn).toEqual([
+				{
+					type: "text",
+					text: `<slack_thread_context>
+  <message>
+    <author>U1</author>
+    <timestamp>${PARENT_TS}</timestamp>
+    <content>
+Login fails after I sign in
+File: authentication-error.png — downloaded
+    </content>`,
+				},
+				{
+					type: "local_image",
+					path: imagePart.path,
+					mediaType: "image/png",
+				},
+				{
+					type: "text",
+					text: `  </message>
+  <message>
+    <author>U1</author>
+    <timestamp>${TRIGGER_TS}</timestamp>
+    <content>
+<@U0BOT> can you explain this issue simply?
+    </content>
+  </message>
+</slack_thread_context>`,
+				},
+			]);
+			expect(await readFile(imagePart.path)).toEqual(png);
+			expect(dirname(imagePart.path)).toContain(cyrusHome);
+
+			await result.cleanup();
+			await expect(access(imagePart.path)).rejects.toThrow();
+		} finally {
+			await rm(cyrusHome, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an image attached to the triggering follow-up without duplicating its text", async () => {
+		const cyrusHome = await mkdtemp(
+			join(tmpdir(), "cyrus-slack-followup-image-"),
+		);
+		const png = Buffer.from([
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+			0x49, 0x48, 0x44, 0x52,
+		]);
+		const adapter = new SlackChatAdapter(createStaticProvider([]), undefined, {
+			cyrusHome,
+			contextFetch: vi.fn().mockResolvedValue(
+				new Response(png, {
+					headers: {
+						"content-type": "image/png",
+						"content-length": String(png.length),
+					},
+				}),
+			) as typeof fetch,
+		});
+		mockIdentity();
+		vi.spyOn(
+			SlackMessageService.prototype,
+			"fetchThreadThrough",
+		).mockResolvedValue({
+			permalink: "https://workspace.slack.com/archives/C1/p1700000000000100",
+			messages: [
+				{ user: "U1", text: "old context", ts: PARENT_TS },
+				{
+					user: "U1",
+					text: "<@U0BOT> this screenshot has the new error",
+					ts: TRIGGER_TS,
+					files: [
+						{
+							id: "F2",
+							name: "new-error.png",
+							mimetype: "image/png",
+							size: png.length,
+							url_private:
+								"https://files.slack.com/files-pri/T1-F2/new-error.png",
+						},
+					],
+				},
+			],
+		});
+
+		try {
+			const result = await adapter.fetchThreadTurn(
+				mentionEvent(),
+				"1700000000.000400",
+			);
+			expect(result?.turn.map((part) => part.type)).toEqual([
+				"text",
+				"local_image",
+				"text",
+			]);
+			const text = result?.turn
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			expect(text).toContain("File: new-error.png — downloaded");
+			expect(text).not.toContain("this screenshot has the new error");
+			expect(text).not.toContain("old context");
+			await result?.cleanup?.();
+		} finally {
+			await rm(cyrusHome, { recursive: true, force: true });
+		}
 	});
 
 	it("asks Slack for messages after the cursor and drops the ones already known", async () => {

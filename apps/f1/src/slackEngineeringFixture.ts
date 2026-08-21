@@ -1,4 +1,5 @@
 import type {
+	SlackMessageAttachment,
 	SlackThreadMessage,
 	SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
@@ -21,6 +22,7 @@ export interface SlackEngineeringFixtureMessage {
 	text: string;
 	links?: SlackEngineeringFixtureLink[];
 	images?: SlackEngineeringFixtureImage[];
+	attachments?: SlackMessageAttachment[];
 }
 
 export interface SlackEngineeringFixture {
@@ -54,6 +56,7 @@ export function normalizeSlackEngineeringFixture(
 		}
 		const links = message.links ?? [];
 		const images = message.images ?? [];
+		const attachments = message.attachments ?? [];
 		for (const image of images) {
 			files.set(image.id, {
 				bytes: Buffer.from(image.base64, "base64"),
@@ -90,6 +93,7 @@ export function normalizeSlackEngineeringFixture(
 					url_private_download: `https://files.slack.com/f1/${encodeURIComponent(image.id)}`,
 				})),
 			}),
+			...(attachments.length > 0 && { attachments }),
 		} satisfies SlackThreadMessage;
 	});
 

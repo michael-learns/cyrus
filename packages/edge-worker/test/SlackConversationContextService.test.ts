@@ -116,6 +116,51 @@ describe("SlackConversationContextService", () => {
 		expect(result.directory.startsWith(cyrusHome)).toBe(true);
 	});
 
+	it("preserves an ordinary GitHub attachment when the Slack message text is empty", async () => {
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1.000",
+			kickoffTs: "1.000",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "UAPP",
+					text: "",
+					ts: "1.000",
+					attachments: [
+						{
+							footer: "GitHub",
+							text: "Implement GitHub issue #451 end-to-end. The payroll engine sends an unsupported field.",
+							fallback: "Issue opened by Cyrus",
+						},
+					],
+				},
+			],
+		});
+
+		expect(result.manifest.messages).toEqual([
+			{
+				ts: "1.000",
+				author: "UAPP",
+				text: "",
+				links: [],
+				attachments: [
+					{
+						author: "GitHub",
+						text: "Implement GitHub issue #451 end-to-end. The payroll engine sends an unsupported field.",
+					},
+				],
+				forwarded: [],
+				files: [],
+			},
+		]);
+		expect(await readFile(result.transcriptPath, "utf8")).toContain(
+			"[Attachment from GitHub]\nImplement GitHub issue #451 end-to-end.",
+		);
+	});
+
 	it("preserves the root and newest 199 messages and explicitly records message and text truncation", async () => {
 		const messages = Array.from({ length: 205 }, (_, index) => ({
 			user: `U${index}`,

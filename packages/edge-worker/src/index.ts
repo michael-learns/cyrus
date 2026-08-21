@@ -22,6 +22,7 @@ export type {
 	ChatPlatformAdapter,
 	ChatPlatformName,
 	ChatSessionHandlerDeps,
+	ChatThreadTurnContext,
 } from "./ChatSessionHandler.js";
 export { ChatSessionHandler } from "./ChatSessionHandler.js";
 export {
