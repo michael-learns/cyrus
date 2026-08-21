@@ -6,6 +6,71 @@ import { z } from "zod";
 export const RunnerTypeSchema = z.enum(["claude", "gemini", "codex", "cursor"]);
 export type RunnerType = z.infer<typeof RunnerTypeSchema>;
 
+export const SSH_DATABASE_DEFAULT_LIMITS = {
+	connectTimeoutMs: 10_000,
+	queryTimeoutMs: 15_000,
+	maxSqlBytes: 16_384,
+	maxRows: 100,
+	maxOutputBytes: 32_768,
+} as const;
+
+const SafeDatabaseIdSchema = z
+	.string()
+	.min(1)
+	.max(128)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+const SafeDatabaseHostSchema = z
+	.string()
+	.min(1)
+	.max(253)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9.:-]*$/);
+const SafeDatabaseUserSchema = z
+	.string()
+	.min(1)
+	.max(64)
+	.regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/);
+const SlackDestinationIdSchema = z
+	.string()
+	.min(1)
+	.max(64)
+	.regex(/^[A-Z0-9]+$/);
+
+export const SshDatabaseConnectionSchema = z.object({
+	id: SafeDatabaseIdSchema,
+	name: z.string().min(1).max(200),
+	engine: z.enum(["postgres", "mysql"]),
+	repositoryIds: z.array(z.string().min(1)).min(1),
+	slackDestinations: z
+		.array(
+			z.object({
+				teamId: SlackDestinationIdSchema,
+				channelId: SlackDestinationIdSchema,
+			}),
+		)
+		.min(1),
+	ssh: z.object({
+		host: SafeDatabaseHostSchema,
+		user: SafeDatabaseUserSchema.optional(),
+		port: z.number().int().min(1).max(65_535).default(22),
+		identityFile: z.string().min(1),
+		knownHostsFile: z.string().min(1),
+	}),
+	database: z.object({
+		name: SafeDatabaseIdSchema,
+		profile: SafeDatabaseIdSchema,
+	}),
+	limits: z
+		.object({
+			connectTimeoutMs: z.number().int().min(1).max(60_000).default(10_000),
+			queryTimeoutMs: z.number().int().min(1).max(60_000).default(15_000),
+			maxSqlBytes: z.number().int().min(1).max(65_536).default(16_384),
+			maxRows: z.number().int().min(1).max(1_000).default(100),
+			maxOutputBytes: z.number().int().min(1).max(1_048_576).default(32_768),
+		})
+		.default(SSH_DATABASE_DEFAULT_LIMITS),
+	allowModelDataRetention: z.literal(true),
+});
+
 /**
  * User identifier for access control matching.
  * Supports multiple formats for flexibility:
@@ -324,6 +389,24 @@ export const EdgeConfigSchema = z.object({
 	/** Array of repository configurations */
 	repositories: z.array(RepositoryConfigSchema),
 
+	/** Restricted read-only database connections available to authorized Slack sessions. */
+	databaseConnections: z
+		.array(SshDatabaseConnectionSchema)
+		.superRefine((connections, context) => {
+			const seen = new Set<string>();
+			for (const [index, connection] of connections.entries()) {
+				if (seen.has(connection.id)) {
+					context.addIssue({
+						code: "custom",
+						message: `Duplicate database connection id '${connection.id}'`,
+						path: [index, "id"],
+					});
+				}
+				seen.add(connection.id);
+			}
+		})
+		.optional(),
+
 	/**
 	 * Linear workspace credentials keyed by workspace ID.
 	 * Centralizes tokens that were previously duplicated per-repository.
@@ -605,6 +688,7 @@ export type UserAccessControlConfig = z.infer<
 >;
 export type LinearWorkspaceConfig = z.infer<typeof LinearWorkspaceConfigSchema>;
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
+export type SshDatabaseConnection = z.infer<typeof SshDatabaseConnectionSchema>;
 export type EdgeConfig = z.infer<typeof EdgeConfigSchema>;
 export type SandboxConfig = z.infer<typeof SandboxConfigSchema>;
 export type NetworkPolicy = z.infer<typeof NetworkPolicySchema>;

@@ -481,6 +481,178 @@
 				"additionalProperties": false
 			}
 		},
+		"databaseConnections": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 128,
+						"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+					},
+					"name": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 200
+					},
+					"engine": {
+						"type": "string",
+						"enum": ["postgres", "mysql"]
+					},
+					"repositoryIds": {
+						"minItems": 1,
+						"type": "array",
+						"items": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"slackDestinations": {
+						"minItems": 1,
+						"type": "array",
+						"items": {
+							"type": "object",
+							"properties": {
+								"teamId": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 64,
+									"pattern": "^[A-Z0-9]+$"
+								},
+								"channelId": {
+									"type": "string",
+									"minLength": 1,
+									"maxLength": 64,
+									"pattern": "^[A-Z0-9]+$"
+								}
+							},
+							"required": ["teamId", "channelId"],
+							"additionalProperties": false
+						}
+					},
+					"ssh": {
+						"type": "object",
+						"properties": {
+							"host": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 253,
+								"pattern": "^[A-Za-z0-9][A-Za-z0-9.:-]*$"
+							},
+							"user": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 64,
+								"pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+							},
+							"port": {
+								"default": 22,
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 65535
+							},
+							"identityFile": {
+								"type": "string",
+								"minLength": 1
+							},
+							"knownHostsFile": {
+								"type": "string",
+								"minLength": 1
+							}
+						},
+						"required": ["host", "port", "identityFile", "knownHostsFile"],
+						"additionalProperties": false
+					},
+					"database": {
+						"type": "object",
+						"properties": {
+							"name": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 128,
+								"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+							},
+							"profile": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 128,
+								"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+							}
+						},
+						"required": ["name", "profile"],
+						"additionalProperties": false
+					},
+					"limits": {
+						"default": {
+							"connectTimeoutMs": 10000,
+							"queryTimeoutMs": 15000,
+							"maxSqlBytes": 16384,
+							"maxRows": 100,
+							"maxOutputBytes": 32768
+						},
+						"type": "object",
+						"properties": {
+							"connectTimeoutMs": {
+								"default": 10000,
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 60000
+							},
+							"queryTimeoutMs": {
+								"default": 15000,
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 60000
+							},
+							"maxSqlBytes": {
+								"default": 16384,
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 65536
+							},
+							"maxRows": {
+								"default": 100,
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 1000
+							},
+							"maxOutputBytes": {
+								"default": 32768,
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 1048576
+							}
+						},
+						"required": [
+							"connectTimeoutMs",
+							"queryTimeoutMs",
+							"maxSqlBytes",
+							"maxRows",
+							"maxOutputBytes"
+						],
+						"additionalProperties": false
+					},
+					"allowModelDataRetention": {
+						"type": "boolean",
+						"const": true
+					}
+				},
+				"required": [
+					"id",
+					"name",
+					"engine",
+					"repositoryIds",
+					"slackDestinations",
+					"ssh",
+					"database",
+					"limits",
+					"allowModelDataRetention"
+				],
+				"additionalProperties": false
+			}
+		},
 		"linearWorkspaces": {
 			"type": "object",
 			"propertyNames": {

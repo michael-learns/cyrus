@@ -379,6 +379,14 @@ export class EdgeWorker extends EventEmitter {
 			slackMcpConfigs: resolveList(config.slackMcpConfigs),
 			linearMcpConfigs: resolveList(config.linearMcpConfigs),
 			githubMcpConfigs: resolveList(config.githubMcpConfigs),
+			databaseConnections: config.databaseConnections?.map((connection) => ({
+				...connection,
+				ssh: {
+					...connection.ssh,
+					identityFile: resolvePath(connection.ssh.identityFile),
+					knownHostsFile: resolvePath(connection.ssh.knownHostsFile),
+				},
+			})),
 		};
 	}
 

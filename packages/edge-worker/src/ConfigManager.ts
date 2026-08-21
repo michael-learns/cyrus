@@ -1,7 +1,12 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { watch as chokidarWatch, type FSWatcher } from "chokidar";
-import type { EdgeWorkerConfig, ILogger, RepositoryConfig } from "cyrus-core";
+import {
+	EdgeConfigSchema,
+	type EdgeWorkerConfig,
+	type ILogger,
+	type RepositoryConfig,
+} from "cyrus-core";
 
 /**
  * Describes the set of repository-level changes detected after a config
@@ -243,6 +248,8 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.linearMcpConfigs || this.config.linearMcpConfigs,
 				githubMcpConfigs:
 					parsedConfig.githubMcpConfigs || this.config.githubMcpConfigs,
+				databaseConnections:
+					parsedConfig.databaseConnections ?? this.config.databaseConnections,
 				defaultDisallowedTools:
 					parsedConfig.defaultDisallowedTools ||
 					this.config.defaultDisallowedTools,
@@ -284,7 +291,19 @@ export class ConfigManager extends EventEmitter {
 				}
 			}
 
-			return newConfig;
+			const validated = EdgeConfigSchema.safeParse(newConfig);
+			if (!validated.success) {
+				this.logger.error(
+					"❌ Invalid config file:",
+					validated.error.issues.map((issue) => ({
+						path: issue.path.join("."),
+						message: issue.message,
+					})),
+				);
+				return null;
+			}
+
+			return { ...newConfig, ...validated.data };
 		} catch (error) {
 			this.logger.error("❌ Failed to load config file:", error);
 			return null;
@@ -352,6 +371,7 @@ export class ConfigManager extends EventEmitter {
 			"slackMcpConfigs",
 			"linearMcpConfigs",
 			"githubMcpConfigs",
+			"databaseConnections",
 			"defaultDisallowedTools",
 			"promptDefaults",
 			"issueUpdateTrigger",

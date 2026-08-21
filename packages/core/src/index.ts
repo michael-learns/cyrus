@@ -92,6 +92,7 @@ export type {
 	RepositoryConfigPayload,
 	RunnerType,
 	SandboxConfig,
+	SshDatabaseConnection,
 	UserAccessControlConfig,
 	UserIdentifier,
 } from "./config-types.js";
@@ -108,6 +109,8 @@ export {
 	requireLinearWorkspaceId,
 	resolvePath,
 	SandboxConfigSchema,
+	SSH_DATABASE_DEFAULT_LIMITS,
+	SshDatabaseConnectionSchema,
 	TRUSTED_DOMAINS,
 	UserAccessControlConfigSchema,
 	UserIdentifierSchema,
