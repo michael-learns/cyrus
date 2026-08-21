@@ -142,6 +142,67 @@ Note: Linear MCP tools (`mcp__linear`) are included when a Linear workspace is c
 
 ---
 
+## Read-only databases over SSH
+
+Self-hosted Cyrus can expose named PostgreSQL or MySQL connections to specific
+Slack workspace/channel pairs and configured repositories. Cyrus does not give
+the model a shell or SSH credentials. It sends bounded read-only queries to a
+restricted SSH key whose forced command runs the Cyrus database gateway.
+
+```json
+{
+  "databaseConnections": [
+    {
+      "id": "payroll-production",
+      "name": "Payroll production (read-only)",
+      "engine": "postgres",
+      "repositoryIds": ["one-payroll", "one-payroll-api"],
+      "slackDestinations": [
+        {
+          "teamId": "T0123456789",
+          "channelId": "C0123456789"
+        }
+      ],
+      "ssh": {
+        "host": "db-gateway.internal.example",
+        "user": "cyrus-db",
+        "port": 22,
+        "identityFile": "~/.cyrus/ssh/payroll_ed25519",
+        "knownHostsFile": "~/.cyrus/ssh/payroll_known_hosts"
+      },
+      "database": {
+        "name": "payroll",
+        "profile": "payroll-production"
+      },
+      "limits": {
+        "connectTimeoutMs": 10000,
+        "queryTimeoutMs": 15000,
+        "maxSqlBytes": 16384,
+        "maxRows": 100,
+        "maxOutputBytes": 32768
+      },
+      "allowModelDataRetention": true
+    }
+  ]
+}
+```
+
+`repositoryIds` must match active repository IDs in this file. A Slack chat
+must match the exact `teamId` and `channelId`. A Slack-started engineering job
+must also include at least one listed repository. Omitting the field or setting
+`"databaseConnections": []` revokes database access on reload.
+
+The literal `allowModelDataRetention: true` is required because the selected
+Claude provider receives the query and result, the local Claude transcript may
+retain them, and rows explicitly shown in Slack are retained by Slack. Cyrus
+does not automatically copy database tool payloads into issues, pull requests,
+commits, activities, summaries, or the hosted session store.
+
+For gateway installation, database grants, SSH hardening, firewall rules, and
+troubleshooting, see [SSH Database Access](./SSH_DATABASE_ACCESS.md).
+
+---
+
 ## User Access Control
 
 Control which Linear users can delegate issues to Cyrus. Supports both global configuration and per-repository overrides.

@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Self-hosted Cyrus can now use operator-configured, strictly read-only PostgreSQL or MySQL connections from approved Slack channels and Slack-started engineering work. Access is routed by channel and repository through a restricted SSH gateway, with bounded queries, pinned host keys, privilege checks, sensitive-payload redaction, and no general SSH capability.
 - Slack threads can now start new engineering work directly: Cyrus securely captures ordered text, supported images, and relevant links, asks for a repository when routing is ambiguous, creates exactly one GitHub Issue, accepts follow-up guidance, and reliably returns pull-request or terminal status after retries and restarts.
 - Connected GitHub Issues can now be started manually from the Cyrus work inbox with a selected agent. Cyrus creates an isolated branch and worktree, accepts follow-up comments, reports progress and pull-request status, supports safe retries, and stops and cleans up when requested by the control plane. ([#2](https://github.com/michael-learns/cyrus/pull/2))
 - Slack threads now show task-specific live activity statuses while Cyrus is thinking, inspecting repositories, searching or editing code, running checks, and waiting for background work. ([#5](https://github.com/michael-learns/cyrus/pull/5))
