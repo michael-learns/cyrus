@@ -265,6 +265,17 @@ export class McpConfigService {
 		return context;
 	}
 
+	/** Resolve a still-valid database authorization capability for one session. */
+	getDatabaseAuthorizationContext(
+		capabilityId: string,
+		parentSessionId: string,
+	): DatabaseAuthorizationContext | undefined {
+		return this.databaseAuthorizationContexts.get(
+			capabilityId,
+			parentSessionId,
+		);
+	}
+
 	/**
 	 * Clear the prebuilt server from a context entry (after first use).
 	 */

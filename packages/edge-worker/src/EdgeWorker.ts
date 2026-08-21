@@ -149,6 +149,7 @@ import {
 	SlackMessageService,
 	type SlackWebhookEvent,
 } from "cyrus-slack-event-transport";
+import { SshDatabaseQueryService } from "cyrus-ssh-database";
 import { Sessions, streamableHttp } from "fastify-mcp";
 import { ActivityPoster } from "./ActivityPoster.js";
 import { AgentSessionManager } from "./AgentSessionManager.js";
@@ -157,7 +158,11 @@ import { AttachmentService } from "./AttachmentService.js";
 import { LiveChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import { ChatSessionHandler } from "./ChatSessionHandler.js";
 import { ConfigManager, type RepositoryChanges } from "./ConfigManager.js";
-import type { DatabaseAuthorizationContext } from "./DatabaseAuthorizationContextService.js";
+import { DatabaseAccessController } from "./DatabaseAccessController.js";
+import type {
+	DatabaseAuthorizationContext,
+	DatabaseAuthorizationContextInput,
+} from "./DatabaseAuthorizationContextService.js";
 import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
 import {
@@ -284,6 +289,9 @@ export class EdgeWorker extends EventEmitter {
 		ReturnType<typeof setTimeout>
 	>();
 	private slackEngineeringOrchestrator: SlackEngineeringOrchestrator;
+	private readonly slackEngineeringControlCapability = Symbol(
+		"slack-engineering-control",
+	);
 	private gitHubCommentService: GitHubCommentService; // Service for posting comments back to GitHub PRs
 	private gitLabCommentService: GitLabCommentService; // Service for posting comments back to GitLab MRs
 	private cliRPCServer: CLIRPCServer | null = null; // CLI RPC server for CLI platform mode
@@ -307,6 +315,7 @@ export class EdgeWorker extends EventEmitter {
 	private runnerSelectionService: RunnerSelectionService;
 	private toolPermissionResolver: ToolPermissionResolver;
 	private mcpConfigService: McpConfigService;
+	private databaseAccessController: DatabaseAccessController;
 	private runnerConfigBuilder: RunnerConfigBuilder;
 	private activityPoster: ActivityPoster;
 	private configManager: ConfigManager;
@@ -659,6 +668,20 @@ export class EdgeWorker extends EventEmitter {
 					parentSessionId,
 					databaseAuthorizationContext,
 				),
+			resolveDatabaseAuthorizationContext: (input) =>
+				this.resolveDatabaseAuthorizationContext(input),
+		});
+		this.databaseAccessController = new DatabaseAccessController({
+			getConnections: () => this.config.databaseConnections ?? [],
+			getRepositories: () => Array.from(this.repositories.values()),
+			resolveAuthorizationContext: (capabilityId, parentSessionId) =>
+				this.mcpConfigService.getDatabaseAuthorizationContext(
+					capabilityId,
+					parentSessionId,
+				),
+			queryService: new SshDatabaseQueryService(),
+			audit: (event, fields) =>
+				this.logger.info("Database access audit", { event, ...fields }),
 		});
 		this.runnerConfigBuilder = new RunnerConfigBuilder(
 			this.toolPermissionResolver,
@@ -1494,10 +1517,71 @@ export class EdgeWorker extends EventEmitter {
 		};
 	}
 
+	private assertSlackEngineeringControl(
+		workItemId: string,
+		controlCapability?: symbol,
+	): void {
+		// Focused unit harnesses sometimes construct EdgeWorker from its prototype.
+		// Real instances always initialize this orchestrator in the constructor.
+		if (
+			!this.slackEngineeringOrchestrator ||
+			typeof this.slackEngineeringOrchestrator.allReceipts !== "function"
+		) {
+			return;
+		}
+		const receipts = this.slackEngineeringOrchestrator
+			.allReceipts()
+			.filter((receipt) => receipt.workItemId === workItemId);
+		if (receipts.length === 0) return;
+		const receipt = receipts.length === 1 ? receipts[0]! : undefined;
+		const activeRepositories = new Map(
+			Array.from(this.repositories.values())
+				.filter((repository) => repository.isActive !== false)
+				.map((repository) => [repository.id, repository]),
+		);
+		const receiptRepositoryNames = new Set(
+			receipt
+				? [receipt.issueRepository, ...receipt.targetRepositories].map((name) =>
+						name.toLowerCase(),
+					)
+				: [],
+		);
+		const databaseCapable =
+			!receipt ||
+			(this.config.databaseConnections ?? []).some(
+				(connection) =>
+					connection.slackDestinations.some(
+						(destination) =>
+							destination.teamId === receipt.teamId &&
+							destination.channelId === receipt.channelId,
+					) &&
+					connection.repositoryIds.some((repositoryId) => {
+						const repository = activeRepositories.get(repositoryId);
+						return Boolean(
+							repository &&
+								receiptRepositoryNames.has(
+									this.configuredRepositoryFullName(repository).toLowerCase(),
+								),
+						);
+					}),
+			);
+		if (
+			databaseCapable &&
+			controlCapability !== this.slackEngineeringControlCapability
+		) {
+			throw this.gitHubWorkItemError(
+				"Slack engineering work item control is not authorized",
+				403,
+			);
+		}
+	}
+
 	private async attachSlackSubscriber(
 		workItemId: string,
 		parentSessionId: string,
+		controlCapability?: symbol,
 	): Promise<void> {
+		this.assertSlackEngineeringControl(workItemId, controlCapability);
 		const event =
 			this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
 		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
@@ -1587,6 +1671,7 @@ export class EdgeWorker extends EventEmitter {
 		if (receipt) {
 			if (!(await this.persistSlackWorkItemTerminalReceipt(workItem, status)))
 				return;
+			this.mcpConfigService?.revokeContextsForParentSession(workItem.sessionId);
 			try {
 				await this.cleanupSlackContextDirectories(receipt);
 				this.chatSessionHandler?.setDelegatedWorkActive(
@@ -1995,7 +2080,9 @@ export class EdgeWorker extends EventEmitter {
 	private async startGitHubIssueWorkItem(
 		request: TrustedGitHubIssueStartRequest,
 		installationToken?: string,
+		controlCapability?: symbol,
 	): Promise<GitHubIssueStartResult> {
+		this.assertSlackEngineeringControl(request.workItemId, controlCapability);
 		const existing = this.getGitHubIssueWorkItemSession(request.workItemId);
 		if (existing) {
 			if (existing.status === "stopped") {
@@ -2064,6 +2151,10 @@ export class EdgeWorker extends EventEmitter {
 				item.status !== "stopped",
 		);
 		if (existingForIssue) {
+			this.assertSlackEngineeringControl(
+				existingForIssue.workItemId,
+				controlCapability,
+			);
 			const requestedTargets = [
 				...(request.targetRepositoryFullNames ?? [request.repositoryFullName]),
 			]
@@ -2088,6 +2179,7 @@ export class EdgeWorker extends EventEmitter {
 				return this.startGitHubIssueWorkItem(
 					{ ...request, workItemId: existingForIssue.workItemId },
 					installationToken,
+					controlCapability,
 				);
 			}
 			if (existingForIssue.status === "stopped") {
@@ -2294,7 +2386,9 @@ export class EdgeWorker extends EventEmitter {
 		workItemId: string,
 		request: GitHubIssuePromptRequest,
 		installationToken?: string,
+		controlCapability?: symbol,
 	): Promise<void> {
+		this.assertSlackEngineeringControl(workItemId, controlCapability);
 		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
 		if (!workItem) {
 			throw this.gitHubWorkItemError(
@@ -2357,7 +2451,9 @@ export class EdgeWorker extends EventEmitter {
 	private async stopGitHubIssueWorkItem(
 		workItemId: string,
 		_request: GitHubIssueStopRequest,
+		controlCapability?: symbol,
 	): Promise<void> {
+		this.assertSlackEngineeringControl(workItemId, controlCapability);
 		const workItem = this.getGitHubIssueWorkItemSession(workItemId);
 		if (!workItem) return;
 		if (!(await this.persistSlackWorkItemTerminalReceipt(workItem, "stopped")))
@@ -7691,7 +7787,7 @@ ${taskSection}`;
 
 	private createCyrusToolsOptions(
 		parentSessionId?: string,
-		_databaseAuthorizationContext?: DatabaseAuthorizationContext,
+		databaseAuthorizationContext?: DatabaseAuthorizationContext,
 	): CyrusToolsOptions {
 		const failureModesClient = this.getFailureModesClient();
 		const options: CyrusToolsOptions = {
@@ -7819,6 +7915,22 @@ ${taskSection}`;
 					this.slackEngineeringOrchestrator.stop(engineeringParentSessionId()),
 			};
 		}
+		if (parentSessionId && databaseAuthorizationContext) {
+			const capabilityId = databaseAuthorizationContext.capabilityId;
+			options.database = {
+				connectionsList: () =>
+					this.databaseAccessController.connectionsList(
+						capabilityId,
+						parentSessionId,
+					),
+				query: (input) =>
+					this.databaseAccessController.query(
+						capabilityId,
+						parentSessionId,
+						input,
+					),
+			};
+		}
 		if (failureModesClient) {
 			options.failureModes = {
 				resolveSessionFromCwd: (cwd: string) => this.resolveSessionFromCwd(cwd),
@@ -7826,6 +7938,107 @@ ${taskSection}`;
 			};
 		}
 		return options;
+	}
+
+	private resolveDatabaseAuthorizationContext(input: {
+		capabilityId: string;
+		repositoryId: string;
+		parentSessionId?: string;
+	}): DatabaseAuthorizationContextInput | undefined {
+		if (!input.parentSessionId) return undefined;
+		const slackEvent = this.chatSessionHandler?.getLatestEventForSession(
+			input.parentSessionId,
+		);
+		if (slackEvent) {
+			const repositoryIds = Array.from(this.repositories.values())
+				.filter((repository) => repository.isActive !== false)
+				.map((repository) => repository.id);
+			if (
+				repositoryIds.length === 0 ||
+				!this.hasAuthorizedDatabaseConnection(
+					slackEvent.teamId,
+					slackEvent.payload.channel,
+					repositoryIds,
+				)
+			) {
+				return undefined;
+			}
+			return {
+				platform: "slack",
+				teamId: slackEvent.teamId,
+				channelId: slackEvent.payload.channel,
+				userId: slackEvent.payload.user,
+				parentSessionId: input.parentSessionId,
+				repositoryIds,
+			};
+		}
+
+		const workItem = Array.from(this.gitHubIssueWorkItemSessions.values()).find(
+			(candidate) => candidate.sessionId === input.parentSessionId,
+		);
+		if (!workItem) return undefined;
+		const matchingReceipts = this.slackEngineeringOrchestrator
+			.allReceipts()
+			.filter(
+				(receipt) =>
+					receipt.workItemId === workItem.workItemId &&
+					(receipt.status === "starting" || receipt.status === "in_progress"),
+			);
+		if (matchingReceipts.length !== 1) return undefined;
+		const receipt = matchingReceipts[0]!;
+		const targetNames = new Set(
+			[receipt.issueRepository, ...receipt.targetRepositories].map((name) =>
+				name.toLowerCase(),
+			),
+		);
+		const repositoryIds = Array.from(this.repositories.values())
+			.filter(
+				(repository) =>
+					repository.isActive !== false &&
+					targetNames.has(
+						this.configuredRepositoryFullName(repository).toLowerCase(),
+					),
+			)
+			.map((repository) => repository.id);
+		if (
+			repositoryIds.length === 0 ||
+			!receipt.workItemId ||
+			!this.hasAuthorizedDatabaseConnection(
+				receipt.teamId,
+				receipt.channelId,
+				repositoryIds,
+			)
+		) {
+			return undefined;
+		}
+		return {
+			platform: "slack-engineering",
+			teamId: receipt.teamId,
+			channelId: receipt.channelId,
+			userId: receipt.userId,
+			parentSessionId: input.parentSessionId,
+			workItemId: receipt.workItemId,
+			repositoryIds,
+		};
+	}
+
+	private hasAuthorizedDatabaseConnection(
+		teamId: string,
+		channelId: string,
+		repositoryIds: readonly string[],
+	): boolean {
+		const allowedRepositories = new Set(repositoryIds);
+		return (this.config.databaseConnections ?? []).some(
+			(connection) =>
+				connection.slackDestinations.some(
+					(destination) =>
+						destination.teamId === teamId &&
+						destination.channelId === channelId,
+				) &&
+				connection.repositoryIds.some((repositoryId) =>
+					allowedRepositories.has(repositoryId),
+				),
+		);
 	}
 
 	private createSlackEngineeringOrchestrator(): SlackEngineeringOrchestrator {
@@ -7855,21 +8068,34 @@ ${taskSection}`;
 			findIssueByMarker: (repository, marker) =>
 				this.findSlackEngineeringIssueByMarker(repository, marker),
 			startWorkItem: async (input) => {
-				const result = await this.startGitHubIssueWorkItem(input);
+				const result = await this.startGitHubIssueWorkItem(
+					input,
+					undefined,
+					this.slackEngineeringControlCapability,
+				);
 				return { workItemId: input.workItemId, ...result };
 			},
 			promptWorkItem: async (workItemId, message) =>
-				this.promptGitHubIssueWorkItem(workItemId, {
-					requestId: randomUUID(),
-					commentId: Date.now(),
-					author: "Slack user",
-					body: message,
-				}),
+				this.promptGitHubIssueWorkItem(
+					workItemId,
+					{
+						requestId: randomUUID(),
+						commentId: Date.now(),
+						author: "Slack user",
+						body: message,
+					},
+					undefined,
+					this.slackEngineeringControlCapability,
+				),
 			stopWorkItem: async (workItemId) =>
-				this.stopGitHubIssueWorkItem(workItemId, {
-					requestId: randomUUID(),
-					reason: "user_requested",
-				}),
+				this.stopGitHubIssueWorkItem(
+					workItemId,
+					{
+						requestId: randomUUID(),
+						reason: "user_requested",
+					},
+					this.slackEngineeringControlCapability,
+				),
 			audit: (decision, fields) =>
 				this.logger.info("Slack engineering audit", { ...fields, decision }),
 		});
@@ -7962,7 +8188,11 @@ ${taskSection}`;
 			]);
 			throw error;
 		}
-		await this.attachSlackSubscriber(receipt.workItemId!, parentSessionId);
+		await this.attachSlackSubscriber(
+			receipt.workItemId!,
+			parentSessionId,
+			this.slackEngineeringControlCapability,
+		);
 		return receipt;
 	}
 

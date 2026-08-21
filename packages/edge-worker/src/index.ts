@@ -25,6 +25,12 @@ export type {
 } from "./ChatSessionHandler.js";
 export { ChatSessionHandler } from "./ChatSessionHandler.js";
 export {
+	type AuthorizedDatabaseQueryResult,
+	DatabaseAccessController,
+	type DatabaseAccessControllerDependencies,
+	type DatabaseConnectionListResult,
+} from "./DatabaseAccessController.js";
+export {
 	type DatabaseAuthorizationContext,
 	type DatabaseAuthorizationContextInput,
 	DatabaseAuthorizationContextService,
