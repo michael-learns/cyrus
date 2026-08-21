@@ -34,6 +34,10 @@ export const releasePackages = [
 		name: "cyrus-slack-event-transport",
 	},
 	{
+		directory: "packages/ssh-database",
+		name: "cyrus-ssh-database",
+	},
+	{
 		directory: "packages/simple-agent-runner",
 		name: "cyrus-simple-agent-runner",
 	},

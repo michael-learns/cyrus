@@ -76,6 +76,9 @@ importers:
       cyrus-slack-event-transport:
         specifier: workspace:*
         version: link:../../packages/slack-event-transport
+      cyrus-ssh-database:
+        specifier: workspace:*
+        version: link:../../packages/ssh-database
       dotenv:
         specifier: ^16.5.0
         version: 16.6.1

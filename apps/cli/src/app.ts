@@ -10,6 +10,7 @@ import dotenv from "dotenv";
 import { Application } from "./Application.js";
 import { AuthCommand } from "./commands/AuthCommand.js";
 import { CheckTokensCommand } from "./commands/CheckTokensCommand.js";
+import { DatabaseGatewayCommand } from "./commands/DatabaseGatewayCommand.js";
 import { RefreshTokenCommand } from "./commands/RefreshTokenCommand.js";
 import { SelfAddRepoCommand } from "./commands/SelfAddRepoCommand.js";
 import { SelfAuthCommand } from "./commands/SelfAuthCommand.js";
@@ -65,6 +66,21 @@ program
 			errorReporter,
 		);
 		await new StartCommand(app).execute([]);
+	});
+
+program
+	.command("database-gateway")
+	.description("Run the restricted forced-command database gateway")
+	.requiredOption(
+		"--config <path>",
+		"Path to the root-owned gateway profile file",
+	)
+	.requiredOption("--profile <id>", "Gateway profile identifier")
+	.action(async (options: { config: string; profile: string }) => {
+		process.exitCode = await new DatabaseGatewayCommand().execute({
+			configPath: options.config,
+			profileId: options.profile,
+		});
 	});
 
 // Auth command
