@@ -1,3 +1,9 @@
+import {
+	createHash,
+	randomBytes,
+	randomUUID,
+	timingSafeEqual,
+} from "node:crypto";
 import type { LinearClient } from "@linear/sdk";
 import type { McpServerConfig } from "cyrus-claude-runner";
 import type { IIssueTrackerService, RepositoryConfig } from "cyrus-core";
@@ -5,15 +11,33 @@ import {
 	type CyrusToolsOptions,
 	createCyrusToolsServer,
 } from "cyrus-mcp-tools";
+import {
+	type DatabaseAuthorizationContext,
+	type DatabaseAuthorizationContextInput,
+	DatabaseAuthorizationContextService,
+} from "./DatabaseAuthorizationContextService.js";
 
 type CyrusToolsMcpContextEntry = {
 	contextId: string;
+	repositoryId: string;
 	linearToken?: string;
 	linearClient?: LinearClient;
 	parentSessionId?: string;
+	databaseAuthorizationContext?: DatabaseAuthorizationContext;
 	prebuiltServer?: ReturnType<typeof createCyrusToolsServer>;
 	createdAt: number;
+	lastAccessAt: number;
+	expiresAt: number;
 };
+
+export interface McpConfigServiceOptions {
+	now?: () => number;
+	contextTtlMs?: number;
+	maxContexts?: number;
+}
+
+const DEFAULT_CONTEXT_TTL_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_MAX_CONTEXTS = 500;
 
 /**
  * Dependencies injected into McpConfigService from the EdgeWorker.
@@ -28,7 +52,16 @@ export interface McpConfigServiceDeps {
 	/** Get the HTTP URL where the cyrus-tools MCP endpoint is registered */
 	getCyrusToolsMcpUrl: () => string;
 	/** Factory that creates CyrusToolsOptions with session callbacks */
-	createCyrusToolsOptions: (parentSessionId?: string) => CyrusToolsOptions;
+	createCyrusToolsOptions: (
+		parentSessionId?: string,
+		databaseAuthorizationContext?: DatabaseAuthorizationContext,
+	) => CyrusToolsOptions;
+	/** Derive database authority from server-verified session state only. */
+	resolveDatabaseAuthorizationContext?: (input: {
+		capabilityId: string;
+		repositoryId: string;
+		parentSessionId?: string;
+	}) => DatabaseAuthorizationContextInput | undefined;
 }
 
 /**
@@ -45,9 +78,26 @@ export interface McpConfigServiceDeps {
 export class McpConfigService {
 	private deps: McpConfigServiceDeps;
 	private contexts = new Map<string, CyrusToolsMcpContextEntry>();
+	private readonly localBearer = randomBytes(32).toString("base64url");
+	private readonly now: () => number;
+	private readonly contextTtlMs: number;
+	private readonly maxContexts: number;
+	private readonly databaseAuthorizationContexts: DatabaseAuthorizationContextService;
 
-	constructor(deps: McpConfigServiceDeps) {
+	constructor(
+		deps: McpConfigServiceDeps,
+		options: McpConfigServiceOptions = {},
+	) {
 		this.deps = deps;
+		this.now = options.now ?? Date.now;
+		this.contextTtlMs = options.contextTtlMs ?? DEFAULT_CONTEXT_TTL_MS;
+		this.maxContexts = options.maxContexts ?? DEFAULT_MAX_CONTEXTS;
+		this.databaseAuthorizationContexts =
+			new DatabaseAuthorizationContextService({
+				now: this.now,
+				ttlMs: this.contextTtlMs,
+				maxContexts: this.maxContexts,
+			});
 	}
 
 	/**
@@ -69,7 +119,19 @@ export class McpConfigService {
 		linearWorkspaceId: string,
 		parentSessionId?: string,
 	): Record<string, McpServerConfig> {
-		const contextId = this.buildContextId(repoId, parentSessionId);
+		const contextId = randomUUID();
+		const databaseAuthorizationInput =
+			this.deps.resolveDatabaseAuthorizationContext?.({
+				capabilityId: contextId,
+				repositoryId: repoId,
+				parentSessionId,
+			});
+		const databaseAuthorizationContext = databaseAuthorizationInput
+			? this.databaseAuthorizationContexts.issue(
+					contextId,
+					databaseAuthorizationInput,
+				)
+			: undefined;
 
 		// Prebuild one SDK server for this context so callback wiring remains deterministic.
 		const linearToken = this.deps.getLinearTokenForWorkspace(linearWorkspaceId);
@@ -80,18 +142,26 @@ export class McpConfigService {
 				: undefined;
 		const prebuiltServer = createCyrusToolsServer(
 			linearClient,
-			this.deps.createCyrusToolsOptions(parentSessionId),
+			this.deps.createCyrusToolsOptions(
+				parentSessionId,
+				databaseAuthorizationContext,
+			),
 		);
 
+		const now = this.now();
 		this.contexts.set(contextId, {
 			contextId,
+			repositoryId: repoId,
 			linearToken: linearToken ?? undefined,
 			linearClient,
 			parentSessionId,
+			databaseAuthorizationContext,
 			prebuiltServer,
-			createdAt: Date.now(),
+			createdAt: now,
+			lastAccessAt: now,
+			expiresAt: now + this.contextTtlMs,
 		});
-		this.pruneContexts();
+		this.pruneContexts(this.maxContexts);
 
 		const cyrusToolsAuthorizationHeader = this.getAuthorizationHeaderValue();
 
@@ -103,11 +173,7 @@ export class McpConfigService {
 				url: this.deps.getCyrusToolsMcpUrl(),
 				headers: {
 					"x-cyrus-mcp-context-id": contextId,
-					...(cyrusToolsAuthorizationHeader
-						? {
-								Authorization: cyrusToolsAuthorizationHeader,
-							}
-						: {}),
+					Authorization: cyrusToolsAuthorizationHeader,
 				},
 			},
 			"cyrus-docs": {
@@ -176,7 +242,27 @@ export class McpConfigService {
 	 * Used by the MCP endpoint handler to retrieve prebuilt servers.
 	 */
 	getContext(contextId: string): CyrusToolsMcpContextEntry | undefined {
-		return this.contexts.get(contextId);
+		const context = this.contexts.get(contextId);
+		if (!context) return undefined;
+		const now = this.now();
+		if (context.expiresAt <= now) {
+			this.contexts.delete(contextId);
+			this.databaseAuthorizationContexts.revoke(contextId);
+			return undefined;
+		}
+		if (
+			context.databaseAuthorizationContext &&
+			!this.databaseAuthorizationContexts.get(
+				contextId,
+				context.parentSessionId,
+			)
+		) {
+			this.contexts.delete(contextId);
+			return undefined;
+		}
+		context.lastAccessAt = now;
+		context.expiresAt = now + this.contextTtlMs;
+		return context;
 	}
 
 	/**
@@ -194,50 +280,57 @@ export class McpConfigService {
 	 */
 	clearAllContexts(): void {
 		this.contexts.clear();
+		this.databaseAuthorizationContexts.revokeAll();
+	}
+
+	/** Revoke every MCP context issued for a parent session. */
+	revokeContextsForParentSession(parentSessionId: string): number {
+		let revoked = 0;
+		for (const [contextId, context] of this.contexts) {
+			if (context.parentSessionId === parentSessionId) {
+				this.contexts.delete(contextId);
+				this.databaseAuthorizationContexts.revoke(contextId);
+				revoked++;
+			}
+		}
+		return revoked;
 	}
 
 	/**
 	 * Get the authorization header value for cyrus-tools MCP requests.
 	 */
-	getAuthorizationHeaderValue(): string | undefined {
-		const apiKey = process.env.CYRUS_API_KEY?.trim();
-		if (!apiKey) {
-			return undefined;
-		}
-		return `Bearer ${apiKey}`;
+	getAuthorizationHeaderValue(): string {
+		return `Bearer ${this.localBearer}`;
 	}
 
 	/**
 	 * Validate an incoming authorization header against the expected value.
 	 */
 	isAuthorizationValid(rawAuthorizationHeader: unknown): boolean {
-		const expectedHeader = this.getAuthorizationHeaderValue();
-		if (!expectedHeader) {
-			return true;
-		}
-
-		const authorizationHeader = Array.isArray(rawAuthorizationHeader)
-			? rawAuthorizationHeader[0]
-			: rawAuthorizationHeader;
-
-		return authorizationHeader === expectedHeader;
+		if (typeof rawAuthorizationHeader !== "string") return false;
+		const expectedDigest = createHash("sha256")
+			.update(this.getAuthorizationHeaderValue())
+			.digest();
+		const receivedDigest = createHash("sha256")
+			.update(rawAuthorizationHeader)
+			.digest();
+		return timingSafeEqual(receivedDigest, expectedDigest);
 	}
 
-	private buildContextId(repoId: string, parentSessionId?: string): string {
-		if (parentSessionId) {
-			return `${repoId}:${parentSessionId}`;
+	private pruneContexts(maxEntries: number): void {
+		const now = this.now();
+		for (const [contextId, context] of this.contexts) {
+			if (context.expiresAt <= now) {
+				this.contexts.delete(contextId);
+				this.databaseAuthorizationContexts.revoke(contextId);
+			}
 		}
-
-		return `${repoId}:anon:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-	}
-
-	private pruneContexts(maxEntries: number = 500): void {
 		if (this.contexts.size <= maxEntries) {
 			return;
 		}
 
 		const entriesByAge = Array.from(this.contexts.entries()).sort(
-			(a, b) => a[1].createdAt - b[1].createdAt,
+			(a, b) => a[1].lastAccessAt - b[1].lastAccessAt,
 		);
 
 		const pruneCount = this.contexts.size - maxEntries;
@@ -248,6 +341,7 @@ export class McpConfigService {
 			}
 			const [contextId] = entry;
 			this.contexts.delete(contextId);
+			this.databaseAuthorizationContexts.revoke(contextId);
 		}
 	}
 }

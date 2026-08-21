@@ -463,7 +463,7 @@ describe("EdgeWorker - Feedback Delivery", () => {
 			expect(mockOnSessionCreated).toBeDefined();
 		});
 
-		it("should include CYRUS_API_KEY as Authorization header for cyrus-tools MCP config", () => {
+		it("should use a process-local Authorization header instead of CYRUS_API_KEY", () => {
 			const previousApiKey = process.env.CYRUS_API_KEY;
 			process.env.CYRUS_API_KEY = "test-cyrus-api-key";
 
@@ -477,7 +477,10 @@ describe("EdgeWorker - Feedback Delivery", () => {
 					headers?: Record<string, string>;
 				};
 
-				expect(cyrusToolsConfig.headers?.Authorization).toBe(
+				expect(cyrusToolsConfig.headers?.Authorization).toMatch(
+					/^Bearer [A-Za-z0-9_-]{43}$/,
+				);
+				expect(cyrusToolsConfig.headers?.Authorization).not.toBe(
 					"Bearer test-cyrus-api-key",
 				);
 			} finally {
@@ -489,16 +492,22 @@ describe("EdgeWorker - Feedback Delivery", () => {
 			}
 		});
 
-		it("should validate cyrus-tools MCP Authorization header against CYRUS_API_KEY", () => {
+		it("should validate cyrus-tools MCP Authorization against its local bearer", () => {
 			const previousApiKey = process.env.CYRUS_API_KEY;
 			process.env.CYRUS_API_KEY = "test-cyrus-api-key";
 
 			try {
+				const expected = (edgeWorker as any).mcpConfigService
+					.getAuthorizationHeaderValue()
+					.toString();
+				expect(
+					(edgeWorker as any).mcpConfigService.isAuthorizationValid(expected),
+				).toBe(true);
 				expect(
 					(edgeWorker as any).mcpConfigService.isAuthorizationValid(
 						"Bearer test-cyrus-api-key",
 					),
-				).toBe(true);
+				).toBe(false);
 				expect(
 					(edgeWorker as any).mcpConfigService.isAuthorizationValid(
 						"Bearer wrong-key",

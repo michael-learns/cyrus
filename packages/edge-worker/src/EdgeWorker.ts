@@ -157,6 +157,7 @@ import { AttachmentService } from "./AttachmentService.js";
 import { LiveChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import { ChatSessionHandler } from "./ChatSessionHandler.js";
 import { ConfigManager, type RepositoryChanges } from "./ConfigManager.js";
+import type { DatabaseAuthorizationContext } from "./DatabaseAuthorizationContextService.js";
 import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
 import {
@@ -650,8 +651,14 @@ export class EdgeWorker extends EventEmitter {
 					  })
 					| undefined,
 			getCyrusToolsMcpUrl: () => this.getCyrusToolsMcpUrl(),
-			createCyrusToolsOptions: (parentSessionId) =>
-				this.createCyrusToolsOptions(parentSessionId),
+			createCyrusToolsOptions: (
+				parentSessionId,
+				databaseAuthorizationContext,
+			) =>
+				this.createCyrusToolsOptions(
+					parentSessionId,
+					databaseAuthorizationContext,
+				),
 		});
 		this.runnerConfigBuilder = new RunnerConfigBuilder(
 			this.toolPermissionResolver,
@@ -715,6 +722,9 @@ export class EdgeWorker extends EventEmitter {
 		this.configManager.on(
 			"configChanged",
 			async (changes: RepositoryChanges) => {
+				const databaseAuthorizationChanged =
+					JSON.stringify(this.config.databaseConnections ?? []) !==
+					JSON.stringify(changes.newConfig.databaseConnections ?? []);
 				this.updateLinearWorkspaceTokens(changes.newConfig);
 				await this.removeDeletedRepositories(changes.removed);
 				await this.updateModifiedRepositories(changes.modified);
@@ -725,6 +735,11 @@ export class EdgeWorker extends EventEmitter {
 				this.configManager.setConfig(changes.newConfig);
 				this.runnerSelectionService.setConfig(changes.newConfig);
 				this.toolPermissionResolver.setConfig(changes.newConfig);
+				if (databaseAuthorizationChanged) {
+					// Existing MCP connections must not retain authority removed by a
+					// database configuration reload. New turns receive fresh capabilities.
+					this.mcpConfigService.clearAllContexts();
+				}
 			},
 		);
 		this.configManager.startConfigWatcher();
@@ -7499,16 +7514,17 @@ ${taskSection}`;
 
 				const context = this.mcpConfigService.getContext(contextId);
 				if (!context) {
-					throw new Error(
-						`Unknown cyrus-tools MCP context '${contextId}'. Build MCP config before connecting.`,
-					);
+					throw new Error("Unknown or expired cyrus-tools MCP context");
 				}
 
 				const sdkServer =
 					context.prebuiltServer ||
 					createCyrusToolsServer(
 						context.linearClient,
-						this.createCyrusToolsOptions(context.parentSessionId),
+						this.createCyrusToolsOptions(
+							context.parentSessionId,
+							context.databaseAuthorizationContext,
+						),
 					);
 				this.mcpConfigService.clearPrebuiltServer(contextId);
 
@@ -7673,7 +7689,10 @@ ${taskSection}`;
 		);
 	}
 
-	private createCyrusToolsOptions(parentSessionId?: string): CyrusToolsOptions {
+	private createCyrusToolsOptions(
+		parentSessionId?: string,
+		_databaseAuthorizationContext?: DatabaseAuthorizationContext,
+	): CyrusToolsOptions {
 		const failureModesClient = this.getFailureModesClient();
 		const options: CyrusToolsOptions = {
 			parentSessionId,

@@ -24,6 +24,12 @@ export type {
 	ChatSessionHandlerDeps,
 } from "./ChatSessionHandler.js";
 export { ChatSessionHandler } from "./ChatSessionHandler.js";
+export {
+	type DatabaseAuthorizationContext,
+	type DatabaseAuthorizationContextInput,
+	DatabaseAuthorizationContextService,
+	type DatabaseAuthorizationContextServiceOptions,
+} from "./DatabaseAuthorizationContextService.js";
 export { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 export { EdgeWorker } from "./EdgeWorker.js";
 export { EgressProxy } from "./EgressProxy.js";
@@ -39,7 +45,10 @@ export type { CreateGitWorktreeOptions } from "./GitService.js";
 export { GitService } from "./GitService.js";
 export type { SerializedGlobalRegistryState } from "./GlobalSessionRegistry.js";
 export { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
-export type { McpConfigServiceDeps } from "./McpConfigService.js";
+export type {
+	McpConfigServiceDeps,
+	McpConfigServiceOptions,
+} from "./McpConfigService.js";
 export { McpConfigService } from "./McpConfigService.js";
 export { RepositoryRouter } from "./RepositoryRouter.js";
 export type {
