@@ -597,7 +597,9 @@ Supported mrkdwn syntax:
 		event: SlackWebhookEvent,
 		sinceTs?: string,
 	): Promise<ChatThreadTurnContext | null> {
-		if (!event.payload.thread_ts) return { turn: [] };
+		const threadTs = event.payload.thread_ts ?? event.payload.ts;
+		if (!event.payload.thread_ts && !event.payload.files?.length)
+			return { turn: [] };
 
 		// Community/unit callers that did not provide a Cyrus-owned capture root
 		// retain the existing text-only behavior.
@@ -622,7 +624,7 @@ Supported mrkdwn syntax:
 				slackService.fetchThreadThrough({
 					token,
 					channel: event.payload.channel,
-					thread_ts: event.payload.thread_ts,
+					thread_ts: threadTs,
 					trigger_ts: event.payload.ts,
 				}),
 				this.getSelfBotId(token),
@@ -663,7 +665,7 @@ Supported mrkdwn syntax:
 			}).capture({
 				teamId: event.teamId,
 				channelId: event.payload.channel,
-				threadTs: event.payload.thread_ts,
+				threadTs,
 				kickoffTs: event.payload.ts,
 				threadPermalink: snapshot.permalink,
 				token,

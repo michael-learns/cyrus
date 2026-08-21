@@ -48,3 +48,26 @@ Two existing Slack threads were fetched without posting or mutating Slack:
 
 No Claude inference, GitHub mutation, issue creation, pull request, merge, or
 deployment was performed during the live checks.
+
+## Top-Level Image Regression
+
+A later live report exposed a separate entry path: when a supported image was
+attached to the top-level `@Cyrus` message that starts a thread, Slack omitted
+`thread_ts`. Cyrus therefore skipped structured capture before it reached the
+secure downloader, even though the event contained complete `files[]`
+metadata.
+
+The F1 drive now also sends a production-shaped top-level mention containing a
+PNG. It proves that Cyrus treats the message timestamp as the new thread root,
+downloads and signature-validates the image, authorizes it only while the real
+chat runner boundary reads the exact bytes, revokes access, deletes the capture,
+and makes no unexpected external request.
+
+```text
+pnpm --filter cyrus-f1 exec vitest run \
+  src/slackChatThreadContext.test.ts \
+  src/slackEngineeringFixture.test.ts
+
+Test Files  2 passed (2)
+Tests       4 passed (4)
+```

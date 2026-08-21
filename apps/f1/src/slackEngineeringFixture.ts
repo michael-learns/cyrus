@@ -28,7 +28,7 @@ export interface SlackEngineeringFixtureMessage {
 export interface SlackEngineeringFixture {
 	channel: string;
 	user: string;
-	threadTs: string;
+	threadTs?: string;
 	kickoffTs: string;
 	text: string;
 	history?: SlackEngineeringFixtureMessage[];
@@ -105,6 +105,9 @@ export function normalizeSlackEngineeringFixture(
 		});
 	}
 	messages.sort((left, right) => left.ts.localeCompare(right.ts));
+	const kickoffMessage = messages.find(
+		(message) => message.ts === fixture.kickoffTs,
+	);
 
 	return {
 		event: {
@@ -118,8 +121,13 @@ export function normalizeSlackEngineeringFixture(
 				text: fixture.text,
 				ts: fixture.kickoffTs,
 				channel: fixture.channel,
-				thread_ts: fixture.threadTs,
+				...(fixture.threadTs ? { thread_ts: fixture.threadTs } : {}),
 				event_ts: fixture.kickoffTs,
+				...(kickoffMessage?.blocks && { blocks: kickoffMessage.blocks }),
+				...(kickoffMessage?.attachments && {
+					attachments: kickoffMessage.attachments,
+				}),
+				...(kickoffMessage?.files && { files: kickoffMessage.files }),
 			},
 		},
 		messages,

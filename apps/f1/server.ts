@@ -674,9 +674,11 @@ async function startServer(): Promise<void> {
 					let parentSessionId: string | undefined;
 					if (body.fixture) {
 						const normalized = normalizeSlackEngineeringFixture(body.fixture);
+						const fixtureThreadTs =
+							body.fixture.threadTs ?? body.fixture.kickoffTs;
 						syntheticBackend.setThread(
 							body.fixture.channel,
-							body.fixture.threadTs,
+							fixtureThreadTs,
 							normalized.messages,
 						);
 						for (const [id, file] of normalized.files) {
@@ -692,7 +694,7 @@ async function startServer(): Promise<void> {
 						);
 						if (body.control !== "complete")
 							await edgeWorker.dispatchChatTestEvent(normalized.event);
-						threadKey = `${body.fixture.channel}:${body.fixture.threadTs}`;
+						threadKey = `${body.fixture.channel}:${fixtureThreadTs}`;
 						parentSessionId = edgeWorker
 							.listChatThreads()
 							.find((thread) => thread.threadKey === threadKey)?.sessionId;

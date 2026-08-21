@@ -2266,6 +2266,97 @@ File: authentication-error.png — downloaded
 		}
 	});
 
+	it("captures an image attached to the top-level mention that starts a thread", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-root-image-"));
+		const png = Buffer.from([
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+			0x49, 0x48, 0x44, 0x52,
+		]);
+		const imageFetch = vi.fn().mockResolvedValue(
+			new Response(png, {
+				headers: {
+					"content-type": "image/png",
+					"content-length": String(png.length),
+				},
+			}),
+		);
+		const adapter = new SlackChatAdapter(createStaticProvider([]), undefined, {
+			cyrusHome,
+			contextFetch: imageFetch as typeof fetch,
+		});
+		mockIdentity();
+		const event = mentionEvent(false);
+		event.payload.text =
+			"<@U0BOT> can you analyze this image for me? No need to do any coding.";
+		event.payload.files = [
+			{
+				id: "F1",
+				name: "IMG_4421.png",
+				mimetype: "image/png",
+				size: png.length,
+				url_private_download:
+					"https://files.slack.com/files-pri/T1-F1/IMG_4421.png",
+			},
+		];
+		const fetchThreadThrough = vi
+			.spyOn(SlackMessageService.prototype, "fetchThreadThrough")
+			.mockResolvedValue({
+				permalink: "https://workspace.slack.com/archives/C1/p1700000000000500",
+				messages: [
+					{
+						user: "U1",
+						text: event.payload.text,
+						ts: TRIGGER_TS,
+						files: event.payload.files,
+					},
+				],
+			});
+
+		try {
+			const result = await adapter.fetchThreadTurn(event);
+			if (!result) throw new Error("missing structured Slack context");
+			const imagePart = result.turn.find(
+				(part: { type: string }) => part.type === "local_image",
+			);
+			if (!imagePart || imagePart.type !== "local_image")
+				throw new Error("missing image input");
+
+			expect(fetchThreadThrough).toHaveBeenCalledWith({
+				token: "xoxb-test",
+				channel: "C1",
+				thread_ts: TRIGGER_TS,
+				trigger_ts: TRIGGER_TS,
+			});
+			expect(result.turn).toEqual([
+				{
+					type: "text",
+					text: `<slack_thread_context>
+  <message>
+    <author>U1</author>
+    <timestamp>${TRIGGER_TS}</timestamp>
+    <content>
+${event.payload.text}
+File: IMG_4421.png — downloaded
+    </content>`,
+				},
+				{
+					type: "local_image",
+					path: imagePart.path,
+					mediaType: "image/png",
+				},
+				{
+					type: "text",
+					text: "  </message>\n</slack_thread_context>",
+				},
+			]);
+			expect(await readFile(imagePart.path)).toEqual(png);
+			await result.cleanup?.();
+			await expect(access(imagePart.path)).rejects.toThrow();
+		} finally {
+			await rm(cyrusHome, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps an image attached to the triggering follow-up without duplicating its text", async () => {
 		const cyrusHome = await mkdtemp(
 			join(tmpdir(), "cyrus-slack-followup-image-"),
