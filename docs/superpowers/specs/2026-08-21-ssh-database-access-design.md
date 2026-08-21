@@ -332,11 +332,17 @@ stream, enables MySQL `--binary-mode` while disabling named/system commands and
 reconnect, disables client startup files, and passes model SQL only as a single
 no-shell argument to the native client.
 
-Supported statement families are `SELECT`, read-only `WITH ... SELECT`,
-`EXPLAIN` of a supported statement, and metadata reads needed for each engine.
-The validator is intentionally conservative: an unfamiliar construct is
-rejected rather than guessed safe. The validator is not presented as a
-replacement for database permissions.
+Supported statement families in version 1 are `SELECT` and read-only
+`WITH ... SELECT`. Schema and metadata inspection uses ordinary selects against
+the engines' catalog/information-schema views. `EXPLAIN`, `SHOW`, procedures,
+and client commands are intentionally excluded. The validator is conservative:
+an unfamiliar construct is rejected rather than guessed safe. The validator is
+not presented as a replacement for database permissions.
+
+The gateway wraps the validated statement as a derived table with
+`LIMIT maxRows + 1`. It uses the extra complete row only to determine
+truncation and never returns it. The AST policy rejects clauses such as locking
+reads that cannot safely appear in the bounded wrapper.
 
 The remote client receives a read-only transaction batch:
 
@@ -579,7 +585,7 @@ Tests must be written and observed failing before production changes.
 
 ### SQL policy tests
 
-- supported `SELECT`, CTE, metadata, and `EXPLAIN` queries for both engines;
+- supported `SELECT`, CTE, and catalog/metadata queries for both engines;
 - comments, escaped strings, identifiers, and PostgreSQL dollar quotes;
 - multiple statements;
 - DML, DDL, privileges, transaction control, file operations, writable CTEs,
