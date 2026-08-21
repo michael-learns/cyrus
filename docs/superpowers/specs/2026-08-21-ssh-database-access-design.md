@@ -126,6 +126,7 @@ type SshDatabaseConnection = {
   limits?: {
     connectTimeoutMs?: number;
     queryTimeoutMs?: number;
+    maxSqlBytes?: number;
     maxRows?: number;
     maxOutputBytes?: number;
   };
@@ -138,8 +139,18 @@ Defaults are:
 - `ssh.port`: `22`;
 - `connectTimeoutMs`: `10_000`;
 - `queryTimeoutMs`: `15_000`;
+- `maxSqlBytes`: `16_384`;
 - `maxRows`: `100`; and
 - `maxOutputBytes`: `32_768`.
+
+Schema maxima are 60 seconds for each timeout, 65,536 SQL bytes, 1,000 rows,
+and 1 MiB returned output. The complete JSON request is capped at 96 KiB and
+the complete JSON response at `maxOutputBytes` after accounting for base64/JSON
+framing, with an absolute 1.5 MiB ceiling. SQL bytes are checked before local
+tokenization/AST parsing, before SSH invocation, and again before gateway JSON
+or SQL parsing. After the byte check, each validator also caps lexical tokens
+at 8,192, AST depth at 64, CTE count at 32, and projected columns at 512; the
+same constants are protocol-versioned and enforced locally and remotely.
 
 Example:
 
@@ -238,6 +249,14 @@ enter or influence that child session, even when it names the generated issue.
 Restart recovery reconstructs this restriction from the persisted receipt and
 work-item metadata.
 
+This invariant is enforced centrally, not only at Slack MCP call sites.
+`startGitHubIssueWorkItem`, `promptGitHubIssueWorkItem`, stop, resume,
+subscriber attachment, controller HTTP/RPC operations, and GitHub webhook or
+comment handlers must detect a receipt-backed work item and require the exact
+verified receipt capability. Only `SlackEngineeringOrchestrator` can hold that
+capability. Generic MCP, controller, GitHub webhook, and unrelated Slack paths
+cannot create, steer, stop, resume, or subscribe to a receipt-backed child.
+
 Standalone Linear sessions, GitHub webhook sessions, and engineering work not
 originating from Slack receive no database callbacks in this release. Missing
 or unverifiable session context fails closed and exposes neither connection
@@ -288,12 +307,15 @@ PostgreSQL provisioning requires:
 
 - a dedicated `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
   NOBYPASSRLS` role;
-- no inherited privileged role memberships;
+- no direct or transitive membership in any other role, including membership
+  that is not inherited but can be activated with `SET ROLE`;
 - `CONNECT` only on the selected database, `USAGE` only on selected schemas,
   and `SELECT` only on intended tables/views;
 - no `TEMP` database privilege and no sequence mutation privileges;
 - no executable user-defined routines through direct, role, or `PUBLIC`
-  grants, with safe default privileges for future routines; and
+  grants, with safe default privileges for future routines;
+- ownership of no database, schema, table, view, sequence, routine, or other
+  mutable database object; and
 - row-level security policies that apply to the role when table rows require
   tenant or subject restrictions.
 
@@ -304,9 +326,11 @@ role inheritance beyond the reviewed read-only role, `EXECUTE`, `FILE`,
 schema mutation, or data mutation privileges.
 
 The gateway preflight checks the current identity, dangerous role/account
-attributes, inherited roles, effective routine execution, database/schema/table
-grants, temporary-object privileges, and engine support for a server-side
-statement deadline. A failed or indeterminate check rejects the connection.
+attributes, direct and transitive memberships including `SET ROLE`
+availability, catalog ownership, effective routine execution,
+database/schema/table grants, temporary-object privileges, and engine support
+for a server-side statement deadline. A failed or indeterminate check rejects
+the connection.
 Documentation includes exact creation, revoke, default-privilege, inspection,
 and teardown commands and explicitly forbids application-owner or
 administrative credentials.
@@ -338,6 +362,18 @@ the engines' catalog/information-schema views. `EXPLAIN`, `SHOW`, procedures,
 and client commands are intentionally excluded. The validator is conservative:
 an unfamiliar construct is rejected rather than guessed safe. The validator is
 not presented as a replacement for database permissions.
+
+The AST policy also canonicalizes every function call and applies a
+dialect-specific side-effect policy. PostgreSQL rejects advisory-lock functions,
+`pg_notify`, `pg_sleep`, server-file functions such as `pg_read_file`, large-
+object import/export, sequence mutation such as `nextval`/`setval`, `dblink`
+functions, and every user-defined or extension routine. MySQL rejects named-
+lock functions, `SLEEP`, `BENCHMARK`, `LOAD_FILE`, system-command UDFs such as
+`sys_exec`/`sys_eval`, and every non-reviewed user-defined function. The
+allowlist is versioned with the gateway and is tested against all supported
+server versions; an unknown function category fails closed. Database routine,
+file, locking, and mutation privileges remain denied even for calls that the
+parser rejects locally.
 
 The gateway wraps the validated statement as a derived table with
 `LIMIT maxRows + 1`. It uses the extra complete row only to determine
@@ -454,13 +490,14 @@ The Slack system prompt tells Claude to:
   description, commit, repository file, or durable activity.
 
 Engineering system prompts repeat the no-copy rule, but prompts are not treated
-as a data-loss-prevention boundary. The implementation marks
-`database_query` as a sensitive tool at the normalized runner-message boundary
-and suppresses its SQL input and row output from activities, generic tool
+as a data-loss-prevention boundary. The implementation marks every database MCP
+tool, including `database_connections_list` and `database_query`, as sensitive
+at the normalized runner-message boundary. Cyrus-owned transports suppress
+connection metadata, SQL input, and row output from activities, generic tool
 formatters, telemetry, errors, Slack activity/status updates, summaries,
-receipts, GitHub issue bodies, and remote Cyrus session mirroring. Suppression
-is tested for Claude, Gemini, Codex, and Cursor message shapes even though
-Slack-originated engineering remains Claude-locked.
+receipts, automatically assembled GitHub issue bodies, and remote Cyrus session
+mirroring. Suppression is tested for Claude, Gemini, Codex, and Cursor message
+shapes even though Slack-originated engineering remains Claude-locked.
 
 Some persistence is inherent and is stated plainly:
 
@@ -606,8 +643,15 @@ Tests must be written and observed failing before production changes.
 - incremental complete-row truncation for multiline CSV, escaped MySQL batch
   rows, very large fields, NULL, binary, and invalid UTF-8;
 - mandatory PostgreSQL/MySQL privilege preflight, routine execution grants,
-  inherited roles, temporary-object privileges, row-level-security posture,
-  and unsupported statement deadlines;
+  direct and transitive role memberships, `SET ROLE` reachability, catalog
+  ownership, temporary-object privileges, row-level-security posture, and
+  unsupported statement deadlines;
+- rejection of PostgreSQL advisory locks, notifications, sleeps, file and
+  large-object functions, sequence mutation, `dblink`, and unreviewed routines;
+- rejection of MySQL named locks, sleeps, benchmarks, file functions,
+  system-command UDFs, and unreviewed routines;
+- pre-parse rejection of oversized and pathologically nested SQL at both local
+  and gateway boundaries;
 - stable error classification and secret-safe logs; and
 - concurrent queries without shared mutable credentials or output.
 
@@ -620,12 +664,17 @@ Tests must be written and observed failing before production changes.
   stale, cross-session, and post-config-revocation access;
 - cross-channel prompt/start/stop/subscriber attempts against a DB-capable work
   item;
+- non-Slack controller, RPC, GitHub webhook, GitHub comment, and generic MCP
+  attempts to start, prompt, stop, resume, or subscribe to a receipt-backed
+  DB-capable work item without its exact Slack receipt capability;
 - rejection for standalone Linear/GitHub sessions and missing context;
 - exact MCP schemas and payloads;
 - database content treated as untrusted context; and
-- sensitive-tool suppression across all normalized runner message shapes;
-- no SQL/results in receipts, issue bodies, activities, remote session
-  mirroring, telemetry, summaries, or logs; and
+- sensitive-tool suppression for both `database_connections_list` metadata and
+  `database_query` payloads across all normalized runner message shapes;
+- Cyrus does not automatically copy connection metadata, SQL, or results into
+  receipts, issue bodies, activities, remote session mirroring, telemetry,
+  summaries, or logs; and
 - explicit evidence for the documented remaining provider/local/Slack
   retention.
 
@@ -678,8 +727,9 @@ cannot discover or influence the capability. No model-controlled value can
 alter the SSH destination, local credential paths, forced command, remote
 profile, or native executable. Write and shell-escape attempts fail at the
 local policy, remote gateway policy, forced-command boundary, and database
-privilege boundary. Queries, results, credentials, and secret paths do not
-appear in activities, remote Cyrus session mirroring, receipts, GitHub issue/PR
-metadata, telemetry, summaries, or logs; documented provider/local-runner/Slack
-retention remains explicit. All required tests and validation gates pass
-without contacting external infrastructure.
+privilege boundary. Cyrus does not automatically copy connection metadata,
+queries, results, credentials, or secret paths into activities, remote Cyrus
+session mirroring, receipts, GitHub issue/PR metadata, telemetry, summaries, or
+logs. The model may reproduce data in authored text, and provider, local-runner,
+and Slack retention remains explicit. All required tests and validation gates
+pass without contacting external infrastructure.
