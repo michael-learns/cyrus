@@ -57,6 +57,19 @@ export type GatewayFailure = z.infer<typeof FailureSchema>;
 export type GatewayResponse = GatewaySuccess | GatewayFailure;
 export type DecodedGatewayResult = Omit<GatewaySuccess, "version" | "success">;
 
+export function encodeGatewayRequest(request: GatewayRequest): Buffer {
+	const parsed = RequestSchema.safeParse(request);
+	if (
+		!parsed.success ||
+		Buffer.byteLength(parsed.data.sql, "utf8") > parsed.data.limits.maxSqlBytes
+	) {
+		throw queryRejected();
+	}
+	const frame = Buffer.from(JSON.stringify(parsed.data), "utf8");
+	if (frame.byteLength > MAX_GATEWAY_REQUEST_BYTES) throw queryRejected();
+	return frame;
+}
+
 export function decodeGatewayRequest(
 	frame: Uint8Array,
 	expected: { expectedProfile: string; expectedEngine: "postgres" | "mysql" },

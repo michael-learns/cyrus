@@ -12,10 +12,24 @@ export {
 	MAX_SQL_TOKENS,
 } from "./constants.js";
 export {
+	DatabaseGateway,
+	type DatabaseGatewayExecutor,
+} from "./DatabaseGateway.js";
+export {
 	DATABASE_ACCESS_ERROR_CODES,
 	DatabaseAccessError,
 	type DatabaseAccessErrorCode,
 } from "./errors.js";
+export {
+	type GatewayProfile,
+	type GatewayProfileFileDependencies,
+	loadGatewayProfile,
+	parseGatewayProfileFile,
+} from "./gateway-profile.js";
+export {
+	NativeDatabaseExecutor,
+	type NativeDatabaseExecutorDependencies,
+} from "./NativeDatabaseExecutor.js";
 export {
 	buildNativeClientInvocation,
 	type NativeClientInput,
@@ -35,15 +49,28 @@ export {
 	type PostgresPrivilegePreflight,
 } from "./privilege-preflight.js";
 export {
+	type ProcessInvocation,
+	type ProcessResult,
+	type ProcessRunner,
+	runBoundedProcess,
+} from "./process-runner.js";
+export {
 	type DecodedGatewayResult,
 	decodeGatewayRequest,
 	decodeGatewayResponse,
+	encodeGatewayRequest,
 	encodeGatewayResponse,
 	type GatewayFailure,
 	type GatewayRequest,
 	type GatewayResponse,
 	type GatewaySuccess,
 } from "./protocol.js";
+export {
+	type InspectedFile,
+	type SshDatabaseQueryResult,
+	SshDatabaseQueryService,
+	type SshDatabaseQueryServiceDependencies,
+} from "./SshDatabaseQueryService.js";
 export {
 	type ValidatedSql,
 	type ValidateSqlInput,
