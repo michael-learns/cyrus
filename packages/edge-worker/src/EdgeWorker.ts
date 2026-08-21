@@ -84,6 +84,7 @@ import {
 	PersistenceManager,
 	requireLinearWorkspaceId,
 	resolvePath,
+	SensitiveToolMessageFilter,
 	WebhookIpValidator,
 } from "cyrus-core";
 import { CursorRunner } from "cyrus-cursor-runner";
@@ -316,6 +317,8 @@ export class EdgeWorker extends EventEmitter {
 	private toolPermissionResolver: ToolPermissionResolver;
 	private mcpConfigService: McpConfigService;
 	private databaseAccessController: DatabaseAccessController;
+	private readonly sensitiveToolMessageFilter =
+		new SensitiveToolMessageFilter();
 	private runnerConfigBuilder: RunnerConfigBuilder;
 	private activityPoster: ActivityPoster;
 	private configManager: ConfigManager;
@@ -1672,6 +1675,7 @@ export class EdgeWorker extends EventEmitter {
 			if (!(await this.persistSlackWorkItemTerminalReceipt(workItem, status)))
 				return;
 			this.mcpConfigService?.revokeContextsForParentSession(workItem.sessionId);
+			this.sensitiveToolMessageFilter?.clearSession(workItem.sessionId);
 			try {
 				await this.cleanupSlackContextDirectories(receipt);
 				this.chatSessionHandler?.setDelegatedWorkActive(
@@ -2549,8 +2553,12 @@ export class EdgeWorker extends EventEmitter {
 		}
 		const baseOnMessage = config.onMessage;
 		config.onMessage = async (message) => {
-			await baseOnMessage?.(message);
-			await this.updateSlackWorkItemActivity(workItem, message);
+			const filtered = this.sensitiveToolMessageFilter.filter(
+				workItem.sessionId,
+				message,
+			);
+			await baseOnMessage?.(filtered);
+			await this.updateSlackWorkItemActivity(workItem, filtered);
 		};
 		// Claude and Gemini forward `additionalEnv` to the child process. Codex
 		// and Cursor do not yet (see AgentRunnerConfig.additionalEnv), so those
@@ -7100,7 +7108,8 @@ ${taskSection}`;
 		message: SDKMessage,
 		_repositoryId: string,
 	): Promise<void> {
-		await this.agentSessionManager.handleClaudeMessage(sessionId, message);
+		const filtered = this.sensitiveToolMessageFilter.filter(sessionId, message);
+		await this.agentSessionManager.handleClaudeMessage(sessionId, filtered);
 	}
 
 	/**
@@ -7219,9 +7228,10 @@ ${taskSection}`;
 			case "claude": {
 				// Inject the hosted SessionStore at the last moment so it only
 				// attaches to Claude runners (the field is Claude-specific).
-				const claudeConfig = this.claudeSessionStore
-					? { ...config, sessionStore: this.claudeSessionStore }
-					: config;
+				const claudeConfig =
+					this.claudeSessionStore && !config.disableRemoteSessionStore
+						? { ...config, sessionStore: this.claudeSessionStore }
+						: config;
 				return new ClaudeRunner(claudeConfig, this.isWarmSessionsEnabled());
 			}
 			case "gemini":

@@ -15,13 +15,22 @@ const silentLogger: ILogger = {
 	error: () => {},
 } as unknown as ILogger;
 
-function makeBuilder(): RunnerConfigBuilder {
+function makeBuilder(databaseAuthorized = false): RunnerConfigBuilder {
 	const chatToolResolver: IChatToolResolver = {
 		buildChatAllowedTools: () => ["Read(**)"],
 	};
 	const mcpConfigProvider: IMcpConfigProvider = {
-		buildMcpConfig: () => ({}),
+		buildMcpConfig: () =>
+			databaseAuthorized
+				? {
+						"cyrus-tools": {
+							type: "http" as const,
+							url: "http://localhost/mcp",
+						},
+					}
+				: {},
 		buildMergedMcpConfigPath: () => undefined,
+		hasDatabaseAuthorizationForConfig: () => databaseAuthorized,
 	};
 	const runnerSelector: IRunnerSelector = {
 		determineRunnerSelection: () => ({ runnerType: "claude" as const }),
@@ -54,8 +63,11 @@ function makeSession(
 	} as unknown as CyrusAgentSession;
 }
 
-function buildIssueConfig(session: CyrusAgentSession) {
-	return makeBuilder().buildIssueConfig({
+function buildIssueConfig(
+	session: CyrusAgentSession,
+	databaseAuthorized = false,
+) {
+	return makeBuilder(databaseAuthorized).buildIssueConfig({
 		session,
 		repository: makeRepository(),
 		sessionId: "sess-1",
@@ -119,6 +131,17 @@ describe("RunnerConfigBuilder additionalDirectories (multi-repo skill discovery)
 		const { config } = buildIssueConfig(session);
 
 		expect(config.additionalDirectories).toEqual(["/ws/root/repo-b"]);
+	});
+
+	it("disables remote transcript mirroring for database-capable issue sessions", () => {
+		const session = makeSession({
+			path: "/ws/repo-a-worktree",
+			isGitWorktree: true,
+		} as unknown as CyrusAgentSession["workspace"]);
+
+		const { config } = buildIssueConfig(session, true);
+
+		expect(config.disableRemoteSessionStore).toBe(true);
 	});
 });
 

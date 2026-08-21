@@ -1,4 +1,9 @@
-import type { IMessageFormatter } from "cyrus-core";
+import {
+	DATABASE_TOOL_ACTIVITY_LABEL,
+	DATABASE_TOOL_PAYLOAD_REDACTION,
+	type IMessageFormatter,
+	isSensitiveDatabaseToolName,
+} from "cyrus-core";
 
 type ToolInput = Record<string, unknown>;
 
@@ -122,6 +127,9 @@ export class CodexMessageFormatter implements IMessageFormatter {
 	}
 
 	formatToolParameter(toolName: string, toolInput: any): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		if (typeof toolInput === "string") {
 			return toolInput;
 		}
@@ -166,6 +174,9 @@ export class CodexMessageFormatter implements IMessageFormatter {
 		toolInput: any,
 		_isError: boolean,
 	): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_ACTIVITY_LABEL;
+		}
 		const input = asObject(toolInput);
 		const description =
 			input && typeof input.description === "string"
@@ -178,11 +189,14 @@ export class CodexMessageFormatter implements IMessageFormatter {
 	}
 
 	formatToolResult(
-		_toolName: string,
+		toolName: string,
 		_toolInput: any,
 		result: string,
 		isError: boolean,
 	): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		const normalized = truncateResult(result || "No output");
 		if (isError) {
 			return `\`\`\`\n${normalized}\n\`\`\``;

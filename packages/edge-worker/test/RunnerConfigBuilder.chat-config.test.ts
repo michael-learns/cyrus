@@ -15,13 +15,17 @@ const silentLogger: ILogger = {
 	error: () => {},
 } as unknown as ILogger;
 
-function makeBuilder(buildMcpConfig = () => ({})): RunnerConfigBuilder {
+function makeBuilder(
+	buildMcpConfig = () => ({}),
+	hasDatabaseAuthorizationForConfig?: () => boolean,
+): RunnerConfigBuilder {
 	const chatToolResolver: IChatToolResolver = {
 		buildChatAllowedTools: () => ["Read(**)"],
 	};
 	const mcpConfigProvider: IMcpConfigProvider = {
 		buildMcpConfig,
 		buildMergedMcpConfigPath: () => undefined,
+		hasDatabaseAuthorizationForConfig,
 	};
 	const runnerSelector: IRunnerSelector = {
 		determineRunnerSelection: () => ({ runnerType: "claude" as const }),
@@ -95,6 +99,35 @@ describe("RunnerConfigBuilder.buildChatConfig", () => {
 			expectedAutoMemoryDir,
 			...repositoryPaths,
 		]);
+	});
+
+	it("marks database-capable chat sessions to disable remote transcript mirroring", () => {
+		const builder = makeBuilder(
+			() => ({
+				"cyrus-tools": { type: "http" as const, url: "http://localhost/mcp" },
+			}),
+			() => true,
+		);
+		const config = builder.buildChatConfig({
+			workspacePath: "/tmp/slack-workspace",
+			workspaceName: "slack-thread-x",
+			systemPrompt: "test",
+			sessionId: "sess-1",
+			cyrusHome: "/tmp/cyrus-home-test",
+			platformName: "slack",
+			repository: {
+				id: "repo-1",
+				name: "repo",
+				repositoryPath: "/repo",
+				workspaceBaseDir: "/worktrees",
+				baseBranch: "main",
+			},
+			logger: silentLogger,
+			onMessage: () => {},
+			onError: () => {},
+		});
+
+		expect(config.disableRemoteSessionStore).toBe(true);
 	});
 
 	it("passes managed skill plugins and scoped skill names to chat runner configs", () => {

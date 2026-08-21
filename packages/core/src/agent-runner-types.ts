@@ -524,6 +524,8 @@ export interface AgentRunnerConfig {
 	mcpConfigPath?: string | string[];
 	/** MCP server configurations (inline) */
 	mcpConfig?: Record<string, McpServerConfig>;
+	/** Prevent external transcript mirroring for sessions with sensitive data access. */
+	disableRemoteSessionStore?: boolean;
 	/** AI model to use (e.g., "opus", "sonnet", "haiku") */
 	model?: string;
 	/** Fallback model if primary is unavailable */

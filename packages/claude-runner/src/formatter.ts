@@ -1,3 +1,9 @@
+import {
+	DATABASE_TOOL_ACTIVITY_LABEL,
+	DATABASE_TOOL_PAYLOAD_REDACTION,
+	isSensitiveDatabaseToolName,
+} from "cyrus-core";
+
 /**
  * Message Formatter Interface
  *
@@ -195,6 +201,9 @@ export class ClaudeMessageFormatter implements IMessageFormatter {
 	 * Converts raw tool inputs into user-friendly parameter strings
 	 */
 	formatToolParameter(toolName: string, toolInput: any): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		// If input is already a string, return it
 		if (typeof toolInput === "string") {
 			return toolInput;
@@ -388,6 +397,9 @@ export class ClaudeMessageFormatter implements IMessageFormatter {
 		toolInput: any,
 		isError: boolean,
 	): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_ACTIVITY_LABEL;
+		}
 		// Handle Bash tool with description
 		if (toolName === "Bash" || toolName === "↪ Bash") {
 			// Check if toolInput has a description field
@@ -416,6 +428,9 @@ export class ClaudeMessageFormatter implements IMessageFormatter {
 		result: string,
 		isError: boolean,
 	): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		// If there's an error, wrap in error formatting
 		if (isError) {
 			return `\`\`\`\n${result}\n\`\`\``;

@@ -276,6 +276,18 @@ export class McpConfigService {
 		);
 	}
 
+	hasDatabaseAuthorizationForConfig(
+		mcpConfig: Record<string, McpServerConfig>,
+	): boolean {
+		const cyrusTools = mcpConfig["cyrus-tools"] as
+			| { headers?: Record<string, string> }
+			| undefined;
+		const capabilityId = cyrusTools?.headers?.["x-cyrus-mcp-context-id"];
+		return Boolean(
+			capabilityId && this.databaseAuthorizationContexts.get(capabilityId),
+		);
+	}
+
 	/**
 	 * Clear the prebuilt server from a context entry (after first use).
 	 */

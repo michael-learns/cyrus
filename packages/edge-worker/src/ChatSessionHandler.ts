@@ -10,7 +10,7 @@ import type {
 	ILogger,
 	RepositoryConfig,
 } from "cyrus-core";
-import { createLogger } from "cyrus-core";
+import { createLogger, SensitiveToolMessageFilter } from "cyrus-core";
 import { AgentSessionManager } from "./AgentSessionManager.js";
 import type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import type { RunnerConfigBuilder } from "./RunnerConfigBuilder.js";
@@ -164,6 +164,8 @@ export class ChatSessionHandler<TEvent> {
 	private threadSessions: Map<string, string> = new Map();
 	private deps: ChatSessionHandlerDeps;
 	private logger: ILogger;
+	private readonly sensitiveToolMessageFilter =
+		new SensitiveToolMessageFilter();
 	// Queue of events awaiting a reply, keyed by sessionId. Each entry is
 	// enqueued when a new prompt (initial/resume/follow-up-inject) is sent to
 	// the runner, and the queue is drained when a `result` message arrives on
@@ -702,13 +704,14 @@ export class ChatSessionHandler<TEvent> {
 		sessionId: string,
 		message: SDKMessage,
 	): Promise<void> {
-		await this.sessionManager.handleClaudeMessage(sessionId, message);
+		const filtered = this.sensitiveToolMessageFilter.filter(sessionId, message);
+		await this.sessionManager.handleClaudeMessage(sessionId, filtered);
 
 		const statusEvent =
 			this.pendingReplyEvents.get(sessionId)?.[0] ??
 			this.lastReplyEvent.get(sessionId);
-		if (statusEvent && message.type !== "result") {
-			void this.updateActivityStatus(statusEvent, message);
+		if (statusEvent && filtered.type !== "result") {
+			void this.updateActivityStatus(statusEvent, filtered);
 		}
 
 		if (message.type === "result") {

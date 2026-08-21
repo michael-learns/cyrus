@@ -36,6 +36,9 @@ export interface IMcpConfigProvider {
 	buildMergedMcpConfigPath(
 		repositories: RepositoryConfig | RepositoryConfig[],
 	): string | string[] | undefined;
+	hasDatabaseAuthorizationForConfig?(
+		mcpConfig: Record<string, McpServerConfig>,
+	): boolean;
 }
 
 /**
@@ -281,6 +284,12 @@ export class RunnerConfigBuilder {
 				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
 			),
 			...(mcpConfig ? { mcpConfig } : {}),
+			...(mcpConfig &&
+				this.mcpConfigProvider.hasDatabaseAuthorizationForConfig?.(
+					mcpConfig,
+				) && {
+					disableRemoteSessionStore: true,
+				}),
 			...(mcpConfigPath ? { mcpConfigPath } : {}),
 			...(input.resumeSessionId
 				? { resumeSessionId: input.resumeSessionId }
@@ -413,6 +422,9 @@ export class RunnerConfigBuilder {
 			cyrusHome: input.cyrusHome,
 			mcpConfigPath,
 			mcpConfig,
+			...(this.mcpConfigProvider.hasDatabaseAuthorizationForConfig?.(
+				mcpConfig,
+			) && { disableRemoteSessionStore: true }),
 			appendSystemPrompt: appendCloudRuntimeAddendum(
 				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
 			),

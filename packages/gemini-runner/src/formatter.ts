@@ -15,7 +15,12 @@
  * - replace: Edit/replace content in files
  */
 
-import type { IMessageFormatter } from "cyrus-core";
+import {
+	DATABASE_TOOL_ACTIVITY_LABEL,
+	DATABASE_TOOL_PAYLOAD_REDACTION,
+	type IMessageFormatter,
+	isSensitiveDatabaseToolName,
+} from "cyrus-core";
 import type { FormatterToolInput } from "./schemas.js";
 
 /**
@@ -185,6 +190,9 @@ export class GeminiMessageFormatter implements IMessageFormatter {
 	 * Converts raw tool inputs into user-friendly parameter strings
 	 */
 	formatToolParameter(toolName: string, toolInput: FormatterToolInput): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		// If input is already a string, return it
 		if (typeof toolInput === "string") {
 			return toolInput;
@@ -325,6 +333,9 @@ export class GeminiMessageFormatter implements IMessageFormatter {
 		toolInput: FormatterToolInput,
 		isError: boolean,
 	): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_ACTIVITY_LABEL;
+		}
 		// Handle run_shell_command tool with description
 		if (toolName === "run_shell_command") {
 			const description = getString(toolInput, "description");
@@ -348,6 +359,9 @@ export class GeminiMessageFormatter implements IMessageFormatter {
 		result: string,
 		isError: boolean,
 	): string {
+		if (isSensitiveDatabaseToolName(toolName)) {
+			return DATABASE_TOOL_PAYLOAD_REDACTION;
+		}
 		// If there's an error, wrap in error formatting
 		if (isError) {
 			return `\`\`\`\n${result}\n\`\`\``;

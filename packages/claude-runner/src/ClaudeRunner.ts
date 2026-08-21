@@ -34,6 +34,7 @@ import {
 	createLogger,
 	type IAgentRunner,
 	type ILogger,
+	isSensitiveDatabaseToolName,
 	LogLevel,
 	StreamingPrompt,
 } from "cyrus-core";
@@ -1481,8 +1482,11 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 							.filter((block: any) => block.type === "tool_use")
 							.filter(
 								(block: any) =>
-									(block as { name: string }).name !== "TodoWrite",
-							); // Filter out TodoWrite as it's noisy
+									(block as { name: string }).name !== "TodoWrite" &&
+									!isSensitiveDatabaseToolName(
+										(block as { name: string }).name,
+									),
+							); // Filter noisy or sensitive tool payloads from readable logs.
 
 						if (toolBlocks.length > 0) {
 							for (const tool of toolBlocks) {

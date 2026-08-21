@@ -262,6 +262,12 @@ export {
 	PERSISTENCE_VERSION,
 	PersistenceManager,
 } from "./PersistenceManager.js";
+export {
+	DATABASE_TOOL_ACTIVITY_LABEL,
+	DATABASE_TOOL_PAYLOAD_REDACTION,
+	isSensitiveDatabaseToolName,
+	SensitiveToolMessageFilter,
+} from "./SensitiveToolMessageFilter.js";
 export { StreamingPrompt } from "./StreamingPrompt.js";
 export type {
 	WebhookIpValidatorOptions,
