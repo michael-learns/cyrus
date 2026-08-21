@@ -584,7 +584,8 @@ credentials are never logged.
 
 ### `cyrus-edge-worker`
 
-- Adds `SshDatabaseQueryService` and a small SQL policy module.
+- Constructs the focused package's `SshDatabaseQueryService`; SQL policy and
+  SSH/gateway execution remain owned by that package.
 - Normalizes configured paths and hot reloads connections.
 - Resolves verified Slack chat and Slack-engineering authorization context.
 - Supplies database callbacks to `CyrusToolsOptions` only for eligible
