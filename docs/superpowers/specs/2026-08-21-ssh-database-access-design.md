@@ -146,11 +146,12 @@ Defaults are:
 Schema maxima are 60 seconds for each timeout, 65,536 SQL bytes, 1,000 rows,
 and 1 MiB returned output. The complete JSON request is capped at 96 KiB and
 the complete JSON response at `maxOutputBytes` after accounting for base64/JSON
-framing, with an absolute 1.5 MiB ceiling. SQL bytes are checked before local
-tokenization/AST parsing, before SSH invocation, and again before gateway JSON
-or SQL parsing. After the byte check, each validator also caps lexical tokens
-at 8,192, AST depth at 64, CTE count at 32, and projected columns at 512; the
-same constants are protocol-versioned and enforced locally and remotely.
+framing, with an absolute 1.5 MiB ceiling. Locally, SQL bytes are checked before
+tokenization/AST parsing and before SSH invocation. The gateway caps the raw
+96-KiB request frame before JSON parsing, then checks the extracted SQL bytes
+before SQL tokenization. After the byte check, each validator also caps lexical
+tokens at 8,192, AST depth at 64, CTE count at 32, and projected columns at 512;
+the same constants are protocol-versioned and enforced locally and remotely.
 
 Example:
 
@@ -438,11 +439,13 @@ UTF-8 settings. This forced command is mandatory, not optional hardening.
 
 The local subprocess uses piped stdin/stdout/stderr, a scrubbed environment,
 and no local shell. It sends one bounded JSON request containing the SQL and
-expected profile/engine. The gateway returns one bounded JSON response and no
-other stdout. Interactive password or host-key prompts cannot appear. The
-process group is terminated on timeout, abort, or excessive protocol output.
-A bounded stderr tail is held only in memory to classify failures and is never
-returned verbatim or logged.
+expected profile/engine. The gateway returns one bounded JSON response with
+database output in an `outputBase64` field and no other stdout. The local
+service validates and decodes that field to the tool's UTF-8 `output` string
+only after enforcing the framed response limit. Interactive password or host-
+key prompts cannot appear. The process group is terminated on timeout, abort,
+or excessive protocol output. A bounded stderr tail is held only in memory to
+classify failures and is never returned verbatim or logged.
 
 PostgreSQL `statement_timeout` and MySQL's verified session deadline are the
 database-side termination guarantee. The remote gateway also wraps the native
@@ -497,7 +500,9 @@ connection metadata, SQL input, and row output from activities, generic tool
 formatters, telemetry, errors, Slack activity/status updates, summaries,
 receipts, automatically assembled GitHub issue bodies, and remote Cyrus session
 mirroring. Suppression is tested for Claude, Gemini, Codex, and Cursor message
-shapes even though Slack-originated engineering remains Claude-locked.
+shapes even though Slack-originated engineering remains Claude-locked. The only
+logging exception is the fixed metadata-only audit record enumerated under
+Errors and Auditing; no tool response or connection-list payload is logged.
 
 Some persistence is inherent and is stated plainly:
 
@@ -672,9 +677,10 @@ Tests must be written and observed failing before production changes.
 - database content treated as untrusted context; and
 - sensitive-tool suppression for both `database_connections_list` metadata and
   `database_query` payloads across all normalized runner message shapes;
-- Cyrus does not automatically copy connection metadata, SQL, or results into
-  receipts, issue bodies, activities, remote session mirroring, telemetry,
-  summaries, or logs; and
+- Cyrus does not automatically copy connection-list payloads, SQL, or results
+  into receipts, issue bodies, activities, remote session mirroring, telemetry,
+  summaries, or logs; only the fixed metadata-only audit fields enumerated in
+  this design may enter logs; and
 - explicit evidence for the documented remaining provider/local/Slack
   retention.
 
@@ -727,9 +733,11 @@ cannot discover or influence the capability. No model-controlled value can
 alter the SSH destination, local credential paths, forced command, remote
 profile, or native executable. Write and shell-escape attempts fail at the
 local policy, remote gateway policy, forced-command boundary, and database
-privilege boundary. Cyrus does not automatically copy connection metadata,
-queries, results, credentials, or secret paths into activities, remote Cyrus
-session mirroring, receipts, GitHub issue/PR metadata, telemetry, summaries, or
-logs. The model may reproduce data in authored text, and provider, local-runner,
-and Slack retention remains explicit. All required tests and validation gates
-pass without contacting external infrastructure.
+privilege boundary. Cyrus does not automatically copy connection-list payloads,
+queries, results, credentials, hosts, usernames, or secret paths into
+activities, remote Cyrus session mirroring, receipts, GitHub issue/PR metadata,
+telemetry, summaries, or logs. Logs contain only the fixed metadata-only audit
+fields enumerated under Errors and Auditing. The model may reproduce data in
+authored text, and provider, local-runner, and Slack retention remains explicit.
+All required tests and validation gates pass without contacting external
+infrastructure.
