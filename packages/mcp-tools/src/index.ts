@@ -5,6 +5,8 @@ export {
 export {
 	type CyrusToolsOptions,
 	createCyrusToolsServer,
+	type DatabaseQueryToolInput,
+	SENSITIVE_DATABASE_TOOL_NAMES,
 } from "./tools/cyrus-tools/index.js";
 export {
 	type FailureModesHttpClient,
