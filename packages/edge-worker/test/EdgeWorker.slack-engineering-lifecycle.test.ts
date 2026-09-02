@@ -93,6 +93,9 @@ function setupSlackEngineeringCreateWorker(
 			targets: ["acme/api"],
 		}),
 		current: vi.fn().mockReturnValue(options.currentReceipt),
+		allReceipts: vi
+			.fn()
+			.mockReturnValue(options.currentReceipt ? [options.currentReceipt] : []),
 		createAndStart,
 	};
 	worker.chatSessionHandler = {
@@ -907,6 +910,40 @@ Readable files:
 			});
 
 			expect(worker.listSlackEngineeringIssues).not.toHaveBeenCalled();
+			expect(createAndStart).toHaveBeenCalledOnce();
+		});
+
+		it(`preserves ${status} receipt recovery after the Slack parent session is replaced`, async () => {
+			const currentReceipt = {
+				parentSessionId: "parent-before-replacement",
+				teamId: "T1",
+				channelId: "C1",
+				threadTs: "100.0",
+				kickoffTs: "101.0",
+				status,
+			};
+			const { worker, createAndStart } = setupSlackEngineeringCreateWorker();
+			worker.slackEngineeringOrchestrator.current.mockImplementation(
+				(parentSessionId: string) =>
+					parentSessionId === currentReceipt.parentSessionId
+						? currentReceipt
+						: undefined,
+			);
+			worker.slackEngineeringOrchestrator.allReceipts = vi
+				.fn()
+				.mockReturnValue([currentReceipt]);
+
+			await worker.createAndStartSlackEngineering("parent-after-replacement", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			});
+
+			expect(worker.slackEngineeringOrchestrator.current).toHaveBeenCalledWith(
+				"parent-before-replacement",
+			);
+			expect(worker.listSlackEngineeringIssues).not.toHaveBeenCalled();
+			expect(worker.captureSlackEngineeringSource).toHaveBeenCalledOnce();
 			expect(createAndStart).toHaveBeenCalledOnce();
 		});
 	}

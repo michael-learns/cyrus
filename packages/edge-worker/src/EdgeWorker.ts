@@ -8384,8 +8384,12 @@ ${taskSection}`;
 		const issueRepository = validated.primary.fullName;
 		const event =
 			this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
-		const current =
-			this.slackEngineeringOrchestrator.current?.(parentSessionId);
+		const engineeringParentSessionId = event
+			? this.resolveSlackEngineeringParentSessionId(parentSessionId, event)
+			: parentSessionId;
+		const current = this.slackEngineeringOrchestrator.current?.(
+			engineeringParentSessionId,
+		);
 		const recoveringLatestReceipt = Boolean(
 			current &&
 				event &&
