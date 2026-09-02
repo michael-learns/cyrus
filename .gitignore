@@ -21,6 +21,7 @@ npm-debug.log*
 
 # Workspace directories
 workspaces/
+.worktrees/
 
 # Runtime data
 pids
