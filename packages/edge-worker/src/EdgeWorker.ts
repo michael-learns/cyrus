@@ -4,7 +4,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import {
+	lstat,
 	mkdir,
+	mkdtemp,
 	readdir,
 	readFile,
 	realpath,
@@ -225,6 +227,15 @@ export declare interface EdgeWorker {
 
 type CyrusToolsMcpContext = {
 	contextId?: string;
+};
+
+type SlackEngineeringFollowupDirectoryOwnership = {
+	contextRoot: string;
+	directory: string;
+	contextRootDevice: number;
+	contextRootInode: number;
+	directoryDevice: number;
+	directoryInode: number;
 };
 
 type GitHubIssueWorkItemSession = {
@@ -2057,13 +2068,10 @@ export class EdgeWorker extends EventEmitter {
 	}
 
 	private async cleanupSlackEngineeringFollowupDirectory(
-		contextRoot: string,
-		directory: string,
+		ownership: SlackEngineeringFollowupDirectoryOwnership,
 	): Promise<void> {
-		const candidate = await this.containedSlackContextDescendant(
-			contextRoot,
-			directory,
-		);
+		const candidate =
+			await this.ownedSlackEngineeringFollowupDirectory(ownership);
 		if (!candidate) {
 			this.logger.warn(
 				"Ignored Slack follow-up cleanup outside receipt context",
@@ -2075,6 +2083,37 @@ export class EdgeWorker extends EventEmitter {
 			return;
 		}
 		await rm(candidate, { recursive: true, force: true });
+	}
+
+	private async ownedSlackEngineeringFollowupDirectory(
+		ownership: SlackEngineeringFollowupDirectoryOwnership,
+	): Promise<string | undefined> {
+		try {
+			const [contextRootStats, directoryStats] = await Promise.all([
+				lstat(ownership.contextRoot),
+				lstat(ownership.directory),
+			]);
+			if (
+				contextRootStats.isSymbolicLink() ||
+				!contextRootStats.isDirectory() ||
+				contextRootStats.dev !== ownership.contextRootDevice ||
+				contextRootStats.ino !== ownership.contextRootInode ||
+				directoryStats.isSymbolicLink() ||
+				!directoryStats.isDirectory() ||
+				directoryStats.dev !== ownership.directoryDevice ||
+				directoryStats.ino !== ownership.directoryInode
+			)
+				return undefined;
+			const candidate = await this.containedSlackContextDescendant(
+				ownership.contextRoot,
+				ownership.directory,
+			);
+			if (!candidate || candidate !== resolve(ownership.directory))
+				return undefined;
+			return candidate;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private githubWorkItemFinalSummary(
@@ -8178,6 +8217,7 @@ ${taskSection}`;
 	): Promise<{
 		source: Parameters<SlackEngineeringOrchestrator["createAndStart"]>[0];
 		manifest: Awaited<ReturnType<SlackConversationContextService["capture"]>>;
+		followupOwnership?: SlackEngineeringFollowupDirectoryOwnership;
 	}> {
 		const event =
 			this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
@@ -8188,6 +8228,9 @@ ${taskSection}`;
 		const threadTs = event.payload.thread_ts || event.payload.ts;
 		let captureRoot: string | undefined;
 		let canonicalContextRoot: string | undefined;
+		let followupOwnership:
+			| SlackEngineeringFollowupDirectoryOwnership
+			| undefined;
 		if (contextRoot) {
 			canonicalContextRoot =
 				await this.containedSlackContextDirectory(contextRoot);
@@ -8205,18 +8248,50 @@ ${taskSection}`;
 				)
 				.digest("hex")
 				.slice(0, 24);
-			captureRoot = join(canonicalContextRoot, "followups", eventKey);
+			const contextRootStats = await lstat(canonicalContextRoot);
+			if (contextRootStats.isSymbolicLink() || !contextRootStats.isDirectory())
+				throw new Error("Slack engineering context root is unavailable");
+			const followupsRoot = join(canonicalContextRoot, "followups");
+			await mkdir(followupsRoot, { recursive: true, mode: 0o700 });
+			const followupsStats = await lstat(followupsRoot);
+			const canonicalFollowupsRoot = await this.containedSlackContextDescendant(
+				canonicalContextRoot,
+				followupsRoot,
+			);
+			if (
+				followupsStats.isSymbolicLink() ||
+				!followupsStats.isDirectory() ||
+				canonicalFollowupsRoot !== resolve(followupsRoot)
+			)
+				throw new Error("Slack engineering follow-up root is unavailable");
+			captureRoot = await mkdtemp(join(canonicalFollowupsRoot, `${eventKey}-`));
+			const directoryStats = await lstat(captureRoot);
+			followupOwnership = {
+				contextRoot: canonicalContextRoot,
+				directory: captureRoot,
+				contextRootDevice: contextRootStats.dev,
+				contextRootInode: contextRootStats.ino,
+				directoryDevice: directoryStats.dev,
+				directoryInode: directoryStats.ino,
+			};
+			if (
+				!(await this.ownedSlackEngineeringFollowupDirectory(followupOwnership))
+			)
+				throw new Error("Slack engineering follow-up root is unavailable");
 		}
-		const snapshot = await new SlackMessageService().fetchThreadThrough({
-			token,
-			channel: event.payload.channel,
-			thread_ts: threadTs,
-			trigger_ts: event.payload.ts,
-		});
+		let snapshot: Awaited<
+			ReturnType<SlackMessageService["fetchThreadThrough"]>
+		>;
 		let manifest: Awaited<
 			ReturnType<SlackConversationContextService["capture"]>
 		>;
 		try {
+			snapshot = await new SlackMessageService().fetchThreadThrough({
+				token,
+				channel: event.payload.channel,
+				thread_ts: threadTs,
+				trigger_ts: event.payload.ts,
+			});
 			manifest = await new SlackConversationContextService({
 				cyrusHome: this.cyrusHome,
 				logger: this.logger,
@@ -8232,11 +8307,8 @@ ${taskSection}`;
 				messages: snapshot.messages,
 			});
 		} catch (error) {
-			if (captureRoot && canonicalContextRoot)
-				await this.cleanupSlackEngineeringFollowupDirectory(
-					canonicalContextRoot,
-					captureRoot,
-				);
+			if (followupOwnership)
+				await this.cleanupSlackEngineeringFollowupDirectory(followupOwnership);
 			throw error;
 		}
 		return {
@@ -8253,6 +8325,7 @@ ${taskSection}`;
 				contextTranscriptPath: manifest.transcriptPath,
 			},
 			manifest,
+			...(followupOwnership ? { followupOwnership } : {}),
 		};
 	}
 
@@ -8394,21 +8467,36 @@ ${paths.join("\n")}
 			: undefined;
 		if (stableContextRoot && !canonicalStableContextRoot)
 			throw new Error("Slack engineering context root is unavailable");
-		const { manifest } = await this.captureSlackEngineeringSource(
-			parentSessionId,
-			canonicalStableContextRoot,
-		);
+		const { manifest, followupOwnership } =
+			await this.captureSlackEngineeringSource(
+				parentSessionId,
+				canonicalStableContextRoot,
+			);
 		let imageDirectoryLease: { release(): void } | undefined;
 		let captureRetained = Boolean(canonicalStableContextRoot);
 		let cleanupDirectory: string | undefined;
 		let turnAccepted = false;
 		try {
-			const canonicalCapture = canonicalStableContextRoot
-				? await this.containedSlackContextDescendant(
-						canonicalStableContextRoot,
-						manifest.directory,
-					)
-				: await this.containedSlackContextDirectory(manifest.directory);
+			let canonicalCapture: string | undefined;
+			if (canonicalStableContextRoot) {
+				const ownedCapture = followupOwnership
+					? await this.ownedSlackEngineeringFollowupDirectory(followupOwnership)
+					: undefined;
+				let canonicalManifestDirectory: string | undefined;
+				try {
+					canonicalManifestDirectory = await realpath(
+						resolve(manifest.directory),
+					);
+				} catch {
+					canonicalManifestDirectory = undefined;
+				}
+				if (ownedCapture && canonicalManifestDirectory === ownedCapture)
+					canonicalCapture = ownedCapture;
+			} else {
+				canonicalCapture = await this.containedSlackContextDirectory(
+					manifest.directory,
+				);
+			}
 			if (!canonicalCapture)
 				throw new Error(
 					canonicalStableContextRoot
@@ -8545,13 +8633,12 @@ ${paths.join("\n")}
 			return prompted;
 		} finally {
 			imageDirectoryLease?.release();
-			if ((!turnAccepted || !captureRetained) && cleanupDirectory) {
-				if (canonicalStableContextRoot)
+			if (!turnAccepted || !captureRetained) {
+				if (canonicalStableContextRoot && followupOwnership)
 					await this.cleanupSlackEngineeringFollowupDirectory(
-						canonicalStableContextRoot,
-						cleanupDirectory,
+						followupOwnership,
 					);
-				else
+				else if (cleanupDirectory)
 					await this.cleanupSlackContextDirectories(undefined, [
 						cleanupDirectory,
 					]);

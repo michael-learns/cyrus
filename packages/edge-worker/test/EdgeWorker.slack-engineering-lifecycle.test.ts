@@ -1,9 +1,11 @@
 import {
+	lstat,
 	mkdir,
 	mkdtemp,
 	readdir,
 	readFile,
 	realpath,
+	rename,
 	rm,
 	symlink,
 	writeFile,
@@ -15,6 +17,66 @@ import { SlackMessageService } from "cyrus-slack-event-transport";
 import { describe, expect, it, vi } from "vitest";
 import { EdgeWorker } from "../src/EdgeWorker.js";
 import { SlackConversationContextService } from "../src/SlackConversationContextService.js";
+
+async function slackFollowupOwnership(directory: string, contextRoot: string) {
+	const [canonicalDirectory, canonicalContextRoot] = await Promise.all([
+		realpath(directory),
+		realpath(contextRoot),
+	]);
+	const [directoryStats, contextRootStats] = await Promise.all([
+		lstat(canonicalDirectory),
+		lstat(canonicalContextRoot),
+	]);
+	return {
+		contextRoot: canonicalContextRoot,
+		directory: canonicalDirectory,
+		contextRootDevice: contextRootStats.dev,
+		contextRootInode: contextRootStats.ino,
+		directoryDevice: directoryStats.dev,
+		directoryInode: directoryStats.ino,
+	};
+}
+
+function setupSlackFollowupCaptureWorker(
+	cyrusHome: string,
+	contextRoot: string,
+): { worker: any; addStreamTurn: ReturnType<typeof vi.fn> } {
+	const addStreamTurn = vi.fn();
+	const worker: any = Object.create(EdgeWorker.prototype);
+	worker.cyrusHome = cyrusHome;
+	worker.logger = { warn: vi.fn() };
+	worker.slackEngineeringOrchestrator = {
+		isActive: vi.fn().mockReturnValue(true),
+		current: vi.fn().mockReturnValue({
+			workItemId: "work",
+			contextDirectory: contextRoot,
+			contextDirectories: [contextRoot],
+		}),
+		auditDecision: vi.fn(),
+	};
+	worker.chatSessionHandler = {
+		getLatestEventForSession: vi.fn().mockReturnValue({
+			eventId: "Ev-retry-1",
+			teamId: "T1",
+			slackBotToken: "xoxb-token",
+			payload: {
+				channel: "C1",
+				thread_ts: "100.0",
+				ts: "101.0",
+				user: "U1",
+			},
+		}),
+	};
+	worker.getGitHubIssueWorkItemSession = vi
+		.fn()
+		.mockReturnValue({ sessionId: "child", runnerType: "claude" });
+	worker.agentSessionManager = {
+		getSession: vi.fn().mockReturnValue({
+			agentRunner: { isRunning: () => true, addStreamTurn },
+		}),
+	};
+	return { worker, addStreamTurn };
+}
 
 describe("EdgeWorker Slack engineering lifecycle", () => {
 	it("recovers by paginated repository issue listing and an exact hidden marker line", async () => {
@@ -301,7 +363,9 @@ Readable files:
 			).rejects.toThrow("download failed");
 			const canonicalInitialContext = await realpath(initialContext);
 			expect(failedCaptureRoot).toMatch(
-				new RegExp(`^${canonicalInitialContext}/followups/[a-f0-9]{24}$`),
+				new RegExp(
+					`^${canonicalInitialContext}/followups/[a-f0-9]{24}-[A-Za-z0-9]{6}$`,
+				),
 			);
 			await expect(
 				readFile(join(failedCaptureRoot!, "partial"), "utf8"),
@@ -312,6 +376,172 @@ Readable files:
 		} finally {
 			fetchThread.mockRestore();
 			capture.mockRestore();
+		}
+	});
+
+	it("allocates a fresh directory for a same-event retry and preserves the successful attempt", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-retry-"));
+		const initialContext = join(cyrusHome, "slack-context", "initial");
+		await mkdir(initialContext, { recursive: true });
+		const { worker, addStreamTurn } = setupSlackFollowupCaptureWorker(
+			cyrusHome,
+			initialContext,
+		);
+		const captureRoots: string[] = [];
+		let retainedFile: string | undefined;
+		let failedFile: string | undefined;
+		const fetchThread = vi
+			.spyOn(SlackMessageService.prototype, "fetchThreadThrough")
+			.mockResolvedValue({
+				messages: [],
+				permalink: "https://slack.example/thread",
+			});
+		const capture = vi
+			.spyOn(SlackConversationContextService.prototype, "capture")
+			.mockImplementation(async (input) => {
+				const directory = input.captureRoot!;
+				captureRoots.push(directory);
+				await mkdir(directory, { recursive: true });
+				if (captureRoots.length === 1) {
+					retainedFile = join(directory, "retained.pdf");
+					await writeFile(retainedFile, "prior successful bytes");
+					return {
+						directory,
+						manifestPath: join(directory, "manifest.json"),
+						transcriptPath: join(directory, "transcript.md"),
+						manifest: { messages: [] },
+					} as any;
+				}
+				failedFile = join(directory, "partial");
+				await writeFile(failedFile, "failed attempt bytes");
+				throw new Error("retry capture failed");
+			});
+
+		try {
+			await worker.captureSlackEngineeringSource("parent", initialContext);
+			await expect(
+				worker.promptSlackEngineering("parent", "untrusted"),
+			).rejects.toThrow("retry capture failed");
+			expect(captureRoots).toHaveLength(2);
+			expect(captureRoots[1]).not.toBe(captureRoots[0]);
+			await expect(readFile(retainedFile!, "utf8")).resolves.toBe(
+				"prior successful bytes",
+			);
+			await expect(readFile(failedFile!, "utf8")).rejects.toThrow();
+			expect(addStreamTurn).not.toHaveBeenCalled();
+		} finally {
+			fetchThread.mockRestore();
+			capture.mockRestore();
+		}
+	});
+
+	it("does not delete a prior successful sibling when the allocated leaf becomes its symlink", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-leaf-link-"));
+		const initialContext = join(cyrusHome, "slack-context", "initial");
+		const priorCapture = join(initialContext, "followups", "prior-success");
+		const priorFile = join(priorCapture, "retained.pdf");
+		await mkdir(priorCapture, { recursive: true });
+		await writeFile(priorFile, "prior successful bytes");
+		const { worker, addStreamTurn } = setupSlackFollowupCaptureWorker(
+			cyrusHome,
+			initialContext,
+		);
+		const fetchThread = vi
+			.spyOn(SlackMessageService.prototype, "fetchThreadThrough")
+			.mockResolvedValue({
+				messages: [],
+				permalink: "https://slack.example/thread",
+			});
+		const capture = vi
+			.spyOn(SlackConversationContextService.prototype, "capture")
+			.mockImplementation(async (input) => {
+				await rm(input.captureRoot!, { recursive: true, force: true });
+				await symlink(priorCapture, input.captureRoot!);
+				throw new Error("capture failed after leaf substitution");
+			});
+
+		try {
+			await expect(
+				worker.promptSlackEngineering("parent", "untrusted"),
+			).rejects.toThrow("capture failed after leaf substitution");
+			await expect(readFile(priorFile, "utf8")).resolves.toBe(
+				"prior successful bytes",
+			);
+			expect(addStreamTurn).not.toHaveBeenCalled();
+		} finally {
+			fetchThread.mockRestore();
+			capture.mockRestore();
+		}
+	});
+
+	it("fails closed when the allocated directory identity is replaced", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-identity-"));
+		const initialContext = join(cyrusHome, "slack-context", "initial");
+		await mkdir(initialContext, { recursive: true });
+		const { worker, addStreamTurn } = setupSlackFollowupCaptureWorker(
+			cyrusHome,
+			initialContext,
+		);
+		let movedOwnedFile: string | undefined;
+		let replacementFile: string | undefined;
+		const fetchThread = vi
+			.spyOn(SlackMessageService.prototype, "fetchThreadThrough")
+			.mockResolvedValue({
+				messages: [],
+				permalink: "https://slack.example/thread",
+			});
+		const capture = vi
+			.spyOn(SlackConversationContextService.prototype, "capture")
+			.mockImplementation(async (input) => {
+				const allocated = input.captureRoot!;
+				await mkdir(allocated, { recursive: true });
+				await writeFile(join(allocated, "owned"), "owned failed bytes");
+				const movedOwned = `${allocated}-moved`;
+				await rename(allocated, movedOwned);
+				movedOwnedFile = join(movedOwned, "owned");
+				await mkdir(allocated);
+				replacementFile = join(allocated, "replacement");
+				await writeFile(replacementFile, "replacement bytes");
+				throw new Error("capture failed after identity replacement");
+			});
+
+		try {
+			await expect(
+				worker.promptSlackEngineering("parent", "untrusted"),
+			).rejects.toThrow("capture failed after identity replacement");
+			await expect(readFile(movedOwnedFile!, "utf8")).resolves.toBe(
+				"owned failed bytes",
+			);
+			await expect(readFile(replacementFile!, "utf8")).resolves.toBe(
+				"replacement bytes",
+			);
+			expect(addStreamTurn).not.toHaveBeenCalled();
+		} finally {
+			fetchThread.mockRestore();
+			capture.mockRestore();
+		}
+	});
+
+	it("removes the owned allocation when Slack thread fetch fails", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-fetch-fail-"));
+		const initialContext = join(cyrusHome, "slack-context", "initial");
+		await mkdir(initialContext, { recursive: true });
+		const { worker, addStreamTurn } = setupSlackFollowupCaptureWorker(
+			cyrusHome,
+			initialContext,
+		);
+		const fetchThread = vi
+			.spyOn(SlackMessageService.prototype, "fetchThreadThrough")
+			.mockRejectedValue(new Error("thread fetch failed"));
+
+		try {
+			await expect(
+				worker.promptSlackEngineering("parent", "untrusted"),
+			).rejects.toThrow("thread fetch failed");
+			expect(await readdir(join(initialContext, "followups"))).toEqual([]);
+			expect(addStreamTurn).not.toHaveBeenCalled();
+		} finally {
+			fetchThread.mockRestore();
 		}
 	});
 
@@ -364,7 +594,12 @@ Readable files:
 			isActive: vi.fn().mockReturnValue(true),
 			current: vi.fn().mockReturnValue(receipt),
 		};
+		const followupOwnership = await slackFollowupOwnership(
+			followupContext,
+			initialContext,
+		);
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+			followupOwnership,
 			manifest: {
 				directory: followupContext,
 				manifest: {
@@ -472,7 +707,12 @@ Readable files:
 			current: vi.fn().mockReturnValue(receipt),
 			addContextDirectory: vi.fn(),
 		};
+		const followupOwnership = await slackFollowupOwnership(
+			followupContext,
+			initialContext,
+		);
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+			followupOwnership,
 			manifest: {
 				directory: followupContext,
 				manifest: {
@@ -657,7 +897,9 @@ Readable files:
 				worker.captureSlackEngineeringSource("parent", rootLink),
 			).rejects.toThrow("capture failed after substitution");
 			expect(requestedCaptureRoot).toMatch(
-				new RegExp(`^${pinnedCanonicalRoot}/followups/[a-f0-9]{24}$`),
+				new RegExp(
+					`^${pinnedCanonicalRoot}/followups/[a-f0-9]{24}-[A-Za-z0-9]{6}$`,
+				),
 			);
 			await expect(readFile(siblingPartial!, "utf8")).resolves.toBe(
 				"sibling must survive",
@@ -901,7 +1143,12 @@ Readable files:
 				contextDirectory: initialContext,
 			}),
 		};
+		const followupOwnership = await slackFollowupOwnership(
+			followupContext,
+			initialContext,
+		);
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+			followupOwnership,
 			manifest: {
 				directory: followupContext,
 				manifest: {

@@ -241,3 +241,111 @@ Output: empty; exit status 0.
 - The global `slack-context` canonical containment check remains as defense in depth and now handles macOS `/var` → `/private/var` aliases without relying on a mismatching lexical precheck.
 
 Concerns: none known.
+
+## Fix Round 2: Fresh Attempt Ownership and Safe Cleanup
+
+### Finding
+
+The event-derived follow-up directory was deterministic. A retry could reuse a successful directory, and failure cleanup resolved the leaf before recursively deleting it. A leaf symlink or replacement inode could therefore redirect cleanup into prior retained context.
+
+### RED: retry, leaf symlink, and inode replacement
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker test:run -- EdgeWorker.slack-engineering-lifecycle
+```
+
+Output summary:
+
+```text
+Test Files  1 failed | 81 passed (82)
+Tests       3 failed | 952 passed (955)
+```
+
+Expected failures:
+
+- `allocates a fresh directory for a same-event retry and preserves the successful attempt` received the same deterministic path for both attempts.
+- `does not delete a prior successful sibling when the allocated leaf becomes its symlink` lost the prior retained PDF because cleanup followed the substituted symlink.
+- `fails closed when the allocated directory identity is replaced` lost the replacement marker because cleanup deleted an inode it did not create.
+
+### RED: fetch failure after allocation
+
+During self-review, allocation was found to occur before Slack thread fetching, while the cleanup guard began after fetching. A focused regression test produced:
+
+```text
+Test Files  1 failed | 81 passed (82)
+Tests       1 failed | 955 passed (956)
+Expected: []
+Received: ["<event-prefix>-<unique-suffix>"]
+```
+
+This proved a newly owned empty attempt directory leaked when thread fetching failed.
+
+### GREEN: focused lifecycle suite
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker test:run -- EdgeWorker.slack-engineering-lifecycle
+```
+
+Output:
+
+```text
+Test Files  82 passed (82)
+Tests       956 passed (956)
+Duration    6.93s
+```
+
+### Full verification
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker test:run
+```
+
+Output:
+
+```text
+Test Files  82 passed (82)
+Tests       956 passed (956)
+Duration    6.98s
+```
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker typecheck
+```
+
+Output:
+
+```text
+> tsc --noEmit
+```
+
+Exit status: 0.
+
+Formatting and diff checks:
+
+```bash
+corepack pnpm exec biome check --write --unsafe packages/edge-worker/src/EdgeWorker.ts packages/edge-worker/test/EdgeWorker.slack-engineering-lifecycle.test.ts
+git diff --check
+```
+
+Biome checked both files; `git diff --check` produced no output and exited 0.
+
+### Fix and self-review
+
+- Each follow-up attempt uses `mkdtemp` below a trusted event-derived prefix, so same-event retries cannot reuse a retained directory.
+- The canonical receipt root and newly allocated leaf are recorded with device/inode identity before any Slack fetch or capture work.
+- Delivery requires the manifest directory to be the exact still-owned allocation, not merely another descendant of the receipt root.
+- Failure cleanup checks root and leaf type, device, inode, exact canonical path, and strict receipt-root descent before deleting the raw owned path.
+- A symlink leaf, replaced inode, moved owned directory, changed receipt root, or malformed manifest fails closed without deleting its target.
+- Thread-fetch and capture failures clean a genuinely owned allocation; prior successful attempts remain untouched.
+- Successful attempts remain under the receipt root for existing terminal cleanup.
+- Legacy receipts without a stable context root keep the prior global-root fallback and active-runner fail-closed behavior.
+
+Concerns: none known.
