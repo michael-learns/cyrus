@@ -242,7 +242,7 @@ describe("SlackMessageService", () => {
 			],
 		};
 
-		it("requests URLs, transfers the exact bytes, and completes one verified thread batch", async () => {
+		it("requests URLs, transfers exact binary bytes, and completes one verified thread batch", async () => {
 			mockFetch
 				.mockResolvedValueOnce({
 					ok: true,
@@ -285,7 +285,7 @@ describe("SlackMessageService", () => {
 				"https://files.slack.com/upload/F1?ticket=private-one",
 				{
 					method: "POST",
-					headers: {},
+					headers: { "Content-Type": "application/octet-stream" },
 					body: new Uint8Array([0, 1, 2, 255]),
 					redirect: "manual",
 					signal: expect.any(AbortSignal),

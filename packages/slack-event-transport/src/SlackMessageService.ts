@@ -237,7 +237,7 @@ export class SlackMessageService {
 		try {
 			const response = await fetch(uploadUrl, {
 				method: "POST",
-				headers: {},
+				headers: { "Content-Type": "application/octet-stream" },
 				body: bytes,
 				redirect: "manual",
 				signal: AbortSignal.timeout(SLACK_UPLOAD_TIMEOUT_MS),
