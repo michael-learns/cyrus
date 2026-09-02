@@ -1,4 +1,5 @@
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type {
 	SlackMessageService,
@@ -41,6 +42,29 @@ function contained(root: string, candidate: string): boolean {
 			pathFromRoot !== ".." &&
 			!isAbsolute(pathFromRoot))
 	);
+}
+
+function sameFile(
+	left: { dev: number | bigint; ino: number | bigint },
+	right: { dev: number | bigint; ino: number | bigint },
+): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readBounded(handle: FileHandle): Promise<Buffer> {
+	const chunks: Buffer[] = [];
+	let total = 0;
+	while (total <= MAX_OTHER_FILE_BYTES) {
+		const buffer = Buffer.allocUnsafe(
+			Math.min(64 * 1024, MAX_OTHER_FILE_BYTES + 1 - total),
+		);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+		if (bytesRead === 0) break;
+		total += bytesRead;
+		if (total > MAX_OTHER_FILE_BYTES) throw new Error("file grew too large");
+		chunks.push(buffer.subarray(0, bytesRead));
+	}
+	return Buffer.concat(chunks, total);
 }
 
 /** Validates model-selected files before handing any bytes to Slack transport. */
@@ -119,8 +143,36 @@ export class SlackFileUploadService {
 
 				const canonicalPath = await realpath(lexicalPath);
 				if (!contained(workspace, canonicalPath)) throw new Error("outside");
+				const canonicalInfo = await lstat(canonicalPath);
+				if (!canonicalInfo.isFile() || !sameFile(info, canonicalInfo))
+					throw new Error("file identity changed");
 
-				const bytes = await readFile(canonicalPath);
+				// Node has no openat-style API. O_NOFOLLOW closes the leaf race; the
+				// descriptor identity check below closes intermediate-component races.
+				// Platforms without O_NOFOLLOW fail closed instead of reopening a path.
+				if (
+					!Number.isInteger(constants.O_NOFOLLOW) ||
+					constants.O_NOFOLLOW <= 0
+				)
+					throw new Error("secure file open unavailable");
+				let handle: FileHandle | undefined;
+				let bytes: Buffer;
+				try {
+					handle = await open(
+						canonicalPath,
+						constants.O_RDONLY | constants.O_NOFOLLOW,
+					);
+					const openedInfo = await handle.stat();
+					if (
+						!openedInfo.isFile() ||
+						openedInfo.size > MAX_OTHER_FILE_BYTES ||
+						!sameFile(canonicalInfo, openedInfo)
+					)
+						throw new Error("opened file failed validation");
+					bytes = await readBounded(handle);
+				} finally {
+					await handle?.close();
+				}
 				const filename = basename(canonicalPath);
 				const classification = await classifySlackFile({
 					name: filename,

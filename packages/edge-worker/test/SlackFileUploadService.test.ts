@@ -1,6 +1,9 @@
+import type { Mode, PathLike } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import {
 	mkdir,
 	mkdtemp,
+	rename,
 	rm,
 	symlink,
 	truncate,
@@ -11,6 +14,43 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SlackFileUploadService } from "../src/SlackFileUploadService.js";
 
+const fileRace = vi.hoisted(() => ({
+	beforeOpen: undefined as undefined | (() => Promise<void>),
+	afterStat: undefined as undefined | (() => Promise<void>),
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return {
+		...actual,
+		open: async (
+			path: PathLike,
+			flags: string | number,
+			mode?: Mode,
+		): Promise<FileHandle> => {
+			const beforeOpen = fileRace.beforeOpen;
+			fileRace.beforeOpen = undefined;
+			await beforeOpen?.();
+			const handle = await actual.open(path, flags, mode);
+			return new Proxy(handle, {
+				get(target, property) {
+					if (property === "stat") {
+						return async (...args: Parameters<FileHandle["stat"]>) => {
+							const stats = await target.stat(...args);
+							const afterStat = fileRace.afterStat;
+							fileRace.afterStat = undefined;
+							await afterStat?.();
+							return stats;
+						};
+					}
+					const value = Reflect.get(target, property, target);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			});
+		},
+	};
+});
+
 describe("SlackFileUploadService", () => {
 	let root: string;
 	let workspace: string;
@@ -18,6 +58,8 @@ describe("SlackFileUploadService", () => {
 	let uploadFilesToThread: ReturnType<typeof vi.fn>;
 
 	beforeEach(async () => {
+		fileRace.beforeOpen = undefined;
+		fileRace.afterStat = undefined;
 		root = await mkdtemp(join(tmpdir(), "cyrus-slack-upload-"));
 		workspace = join(root, "thread-a");
 		otherWorkspace = join(root, "thread-b");
@@ -218,6 +260,53 @@ describe("SlackFileUploadService", () => {
 				{ files: [{ filePath: valid }, { filePath: invalid }] },
 				destination(),
 			),
+		).rejects.toMatchObject({ code: "FILE_VALIDATION_FAILED" });
+		expect(uploadFilesToThread).not.toHaveBeenCalled();
+	});
+
+	it("rejects leaf substitution between validation and descriptor open", async () => {
+		const filePath = join(workspace, "report.txt");
+		const outside = join(root, "outside-secret.txt");
+		await writeFile(filePath, "authorized");
+		await writeFile(outside, "outside secret");
+		fileRace.beforeOpen = async () => {
+			await rm(filePath);
+			await symlink(outside, filePath);
+		};
+
+		await expect(
+			service().upload({ files: [{ filePath }] }, destination()),
+		).rejects.toMatchObject({ code: "FILE_VALIDATION_FAILED" });
+		expect(uploadFilesToThread).not.toHaveBeenCalled();
+	});
+
+	it("rejects intermediate directory substitution before descriptor open", async () => {
+		const directory = join(workspace, "reports");
+		const parkedDirectory = join(workspace, "reports-original");
+		const outsideDirectory = join(root, "outside-reports");
+		const filePath = join(directory, "report.txt");
+		await mkdir(directory);
+		await mkdir(outsideDirectory);
+		await writeFile(filePath, "authorized");
+		await writeFile(join(outsideDirectory, "report.txt"), "outside secret");
+		fileRace.beforeOpen = async () => {
+			await rename(directory, parkedDirectory);
+			await symlink(outsideDirectory, directory);
+		};
+
+		await expect(
+			service().upload({ files: [{ filePath }] }, destination()),
+		).rejects.toMatchObject({ code: "FILE_VALIDATION_FAILED" });
+		expect(uploadFilesToThread).not.toHaveBeenCalled();
+	});
+
+	it("rejects actual descriptor bytes that grow past 25 MiB after fstat", async () => {
+		const filePath = join(workspace, "growing.bin");
+		await writeFile(filePath, "small");
+		fileRace.afterStat = () => truncate(filePath, 25 * 1024 * 1024 + 1);
+
+		await expect(
+			service().upload({ files: [{ filePath }] }, destination()),
 		).rejects.toMatchObject({ code: "FILE_VALIDATION_FAILED" });
 		expect(uploadFilesToThread).not.toHaveBeenCalled();
 	});
