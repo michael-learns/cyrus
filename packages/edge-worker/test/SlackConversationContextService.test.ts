@@ -332,6 +332,249 @@ describe("SlackConversationContextService", () => {
 		);
 	});
 
+	it("captures regular non-media files into a caller-owned safe attachment directory", async () => {
+		const files = [
+			["report.pdf", "application/pdf", Buffer.from("%PDF-1.7")],
+			["notes.txt", "text/plain", Buffer.from("hello")],
+			["table.csv", "text/csv", Buffer.from("name,value\na,1\n")],
+			["page.html", "text/html", Buffer.from("<h1>hello</h1>")],
+			[
+				"sheet.xlsx",
+				"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+				Buffer.from("PK\x03\x04"),
+			],
+			[
+				"deck.pptx",
+				"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+				Buffer.from("PK\x03\x04"),
+			],
+			["archive.zip", "application/zip", Buffer.from("PK\x03\x04")],
+			["tool.exe", "application/octet-stream", Buffer.from("MZ\x90\x00")],
+			[
+				"unknown.bin",
+				"application/octet-stream",
+				Buffer.from([0xde, 0xad, 0xbe, 0xef]),
+			],
+		] as const;
+		fetchMock.mockImplementation(async (url) => {
+			const index = Number(
+				new URL(String(url)).pathname.match(/\/(\d+)$/)?.[1],
+			);
+			const [_name, mime, bytes] = files[index]!;
+			return new Response(bytes, {
+				headers: {
+					"content-type": mime,
+					"content-length": String(bytes.length),
+				},
+			});
+		});
+		const destinationRoot = join(cyrusHome, "caller-owned");
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			captureRoot: destinationRoot,
+			eventId: "event/../capture",
+			messages: [
+				{
+					user: "U1",
+					text: "files",
+					ts: "1",
+					files: files.map(([name, mimetype], index) => ({
+						id: `F${index}`,
+						name,
+						mimetype,
+						url_private: `https://files.slack.com/${index}`,
+					})),
+				},
+			],
+		});
+
+		expect(
+			result.manifest.messages[0].files.map(({ status, localPath }) => ({
+				status,
+				localPath,
+			})),
+		).toEqual([
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-001.pdf",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-002.txt",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-003.csv",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-004.html",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-005.xlsx",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-006.pptx",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-007.zip",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-008.exe",
+			},
+			{
+				status: "downloaded",
+				localPath: "attachments/event-capture/file-009.bin",
+			},
+		]);
+		expect(
+			await readFile(
+				join(destinationRoot, "attachments/event-capture/file-001.pdf"),
+			),
+		).toEqual(files[0][2]);
+		const manifest = await readFile(result.manifestPath, "utf8");
+		expect(manifest).not.toContain("xoxb-secret");
+	});
+
+	it("rejects media before it can be staged when any capture signal identifies it", async () => {
+		fetchMock
+			.mockResolvedValueOnce(
+				new Response(Buffer.from("hello"), {
+					headers: { "content-type": "audio/mpeg" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(Buffer.from([0x49, 0x44, 0x33, 0x04]), {
+					headers: { "content-type": "application/octet-stream" },
+				}),
+			);
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "media",
+					ts: "1",
+					files: [
+						{
+							id: "declared",
+							name: "one.bin",
+							mimetype: "audio/mpeg",
+							url_private: "https://files.slack.com/declared",
+						},
+						{
+							id: "extension",
+							name: "voice.ogg",
+							mimetype: "application/octet-stream",
+							url_private: "https://files.slack.com/extension",
+						},
+						{
+							id: "header",
+							name: "three.bin",
+							mimetype: "application/octet-stream",
+							url_private: "https://files.slack.com/header",
+						},
+						{
+							id: "bytes",
+							name: "four.bin",
+							mimetype: "application/octet-stream",
+							url_private: "https://files.slack.com/bytes",
+						},
+					],
+				},
+			],
+		});
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(
+			result.manifest.messages[0].files.map((file) => file.reason),
+		).toEqual(["media_type", "media_type", "media_type", "media_type"]);
+		expect(
+			result.manifest.messages[0].files.every((file) => !file.localPath),
+		).toBe(true);
+	});
+
+	it("stops regular attachment capture after the twentieth file", async () => {
+		fetchMock.mockImplementation(
+			async () =>
+				new Response(Buffer.from("hello"), {
+					headers: { "content-type": "text/plain" },
+				}),
+		);
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "files",
+					ts: "1",
+					files: Array.from({ length: 21 }, (_, index) => ({
+						id: `F${index}`,
+						name: `${index}.txt`,
+						mimetype: "text/plain",
+						url_private: `https://files.slack.com/${index}`,
+					})),
+				},
+			],
+		});
+
+		expect(fetchMock).toHaveBeenCalledTimes(20);
+		expect(result.manifest.messages[0].files[20]).toEqual(
+			expect.objectContaining({ reason: "file_limit" }),
+		);
+	});
+
+	it("applies the 25 MiB non-image limit before downloading", async () => {
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "big",
+					ts: "1",
+					files: [
+						{
+							id: "big",
+							name: "archive.zip",
+							mimetype: "application/zip",
+							size: 25 * 1024 * 1024 + 1,
+							url_private: "https://files.slack.com/big",
+						},
+					],
+				},
+			],
+		});
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.manifest.messages[0].files[0]).toEqual(
+			expect.objectContaining({ reason: "file_too_large" }),
+		);
+	});
+
 	it("rejects non-Slack hosts and non-Slack redirects without leaking authorization", async () => {
 		fetchMock.mockResolvedValueOnce(
 			new Response(null, {
@@ -638,7 +881,7 @@ describe("SlackConversationContextService", () => {
 		);
 	});
 
-	it("charges repeated signature-invalid images against the 50 MiB receive budget", async () => {
+	it("charges repeated signature-invalid images against the 100 MiB receive budget", async () => {
 		const invalidTenMiB = Buffer.alloc(10 * 1024 * 1024);
 		fetchMock.mockImplementation(
 			async () =>
@@ -659,7 +902,7 @@ describe("SlackConversationContextService", () => {
 					user: "U1",
 					text: "files",
 					ts: "1",
-					files: Array.from({ length: 6 }, (_, index) => ({
+					files: Array.from({ length: 11 }, (_, index) => ({
 						id: `F${index}`,
 						name: `${index}.png`,
 						mimetype: "image/png",
@@ -669,13 +912,13 @@ describe("SlackConversationContextService", () => {
 			],
 		});
 
-		expect(fetchMock).toHaveBeenCalledTimes(5);
+		expect(fetchMock).toHaveBeenCalledTimes(10);
 		expect(
 			result.manifest.messages[0].files
-				.slice(0, 5)
+				.slice(0, 10)
 				.every((file) => file.reason === "mime_mismatch"),
 		).toBe(true);
-		expect(result.manifest.messages[0].files[5]).toEqual(
+		expect(result.manifest.messages[0].files[10]).toEqual(
 			expect.objectContaining({
 				status: "skipped",
 				reason: "total_download_limit",
@@ -683,7 +926,7 @@ describe("SlackConversationContextService", () => {
 		);
 	});
 
-	it("charges partial failed streams against the 50 MiB receive budget", async () => {
+	it("charges partial failed streams against the 100 MiB receive budget", async () => {
 		fetchMock.mockImplementation(async () => {
 			let reads = 0;
 			return {
@@ -714,7 +957,7 @@ describe("SlackConversationContextService", () => {
 					user: "U1",
 					text: "files",
 					ts: "1",
-					files: Array.from({ length: 6 }, (_, index) => ({
+					files: Array.from({ length: 11 }, (_, index) => ({
 						id: `F${index}`,
 						name: `${index}.png`,
 						mimetype: "image/png",
@@ -724,13 +967,13 @@ describe("SlackConversationContextService", () => {
 			],
 		});
 
-		expect(fetchMock).toHaveBeenCalledTimes(5);
+		expect(fetchMock).toHaveBeenCalledTimes(10);
 		expect(
 			result.manifest.messages[0].files
-				.slice(0, 5)
+				.slice(0, 10)
 				.every((file) => file.reason === "download_failed"),
 		).toBe(true);
-		expect(result.manifest.messages[0].files[5]).toEqual(
+		expect(result.manifest.messages[0].files[10]).toEqual(
 			expect.objectContaining({
 				status: "skipped",
 				reason: "total_download_limit",
@@ -779,30 +1022,26 @@ describe("SlackConversationContextService", () => {
 
 		const captured = result.manifest.messages[0].files;
 		expect(captured[0]).toEqual(
-			expect.objectContaining({
-				status: "skipped",
-				reason: "unsupported_type",
-			}),
+			expect.objectContaining({ status: "downloaded" }),
 		);
 		expect(captured[1]).toEqual(
 			expect.objectContaining({ status: "skipped", reason: "file_too_large" }),
 		);
 		expect(
 			captured.filter((file) => file.reason === "mime_mismatch"),
-		).toHaveLength(20);
-		expect(captured.at(-1)).toEqual(
-			expect.objectContaining({ status: "skipped", reason: "image_limit" }),
-		);
+		).toHaveLength(18);
+		expect(
+			captured.slice(-2).every((file) => file.reason === "file_limit"),
+		).toBe(true);
 		expect(result.manifest.truncations).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ kind: "unsupported_file" }),
 				expect.objectContaining({ kind: "image_size" }),
-				expect.objectContaining({ kind: "images" }),
+				expect.objectContaining({ kind: "files" }),
 			]),
 		);
 	});
 
-	it("stops before the 50 MiB total download boundary", async () => {
+	it("stops before the 100 MiB total download boundary", async () => {
 		const tenMiBPng = Buffer.alloc(10 * 1024 * 1024);
 		PNG.copy(tenMiBPng);
 		fetchMock.mockImplementation(
@@ -827,7 +1066,7 @@ describe("SlackConversationContextService", () => {
 					user: "U1",
 					text: "files",
 					ts: "1",
-					files: Array.from({ length: 6 }, (_, index) => ({
+					files: Array.from({ length: 11 }, (_, index) => ({
 						id: `F${index}`,
 						name: `${index}.png`,
 						mimetype: "image/png",
@@ -840,16 +1079,16 @@ describe("SlackConversationContextService", () => {
 
 		expect(
 			result.manifest.messages[0].files
-				.slice(0, 5)
+				.slice(0, 10)
 				.every((file) => file.status === "downloaded"),
 		).toBe(true);
-		expect(result.manifest.messages[0].files[5]).toEqual(
+		expect(result.manifest.messages[0].files[10]).toEqual(
 			expect.objectContaining({
 				status: "skipped",
 				reason: "total_download_limit",
 			}),
 		);
-		expect(fetchMock).toHaveBeenCalledTimes(5);
+		expect(fetchMock).toHaveBeenCalledTimes(10);
 		expect(result.manifest.truncations).toContainEqual(
 			expect.objectContaining({ kind: "total_downloads" }),
 		);
