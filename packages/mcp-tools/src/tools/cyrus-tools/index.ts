@@ -23,6 +23,32 @@ export interface DatabaseQueryToolInput {
 	sql: string;
 }
 
+export interface SlackFileUploadToolInput {
+	files: Array<{ filePath: string; title?: string }>;
+	initialComment?: string;
+}
+
+function safeSlackFileError(error: unknown): { code: string; message: string } {
+	const code =
+		typeof error === "object" && error !== null && "code" in error
+			? (error as { code?: unknown }).code
+			: undefined;
+	if (code === "INVALID_BATCH")
+		return {
+			code,
+			message: "Upload between 1 and 20 files",
+		};
+	if (code === "FILE_VALIDATION_FAILED")
+		return {
+			code,
+			message: "One or more files failed upload validation",
+		};
+	return {
+		code: "UPLOAD_FAILED",
+		message: "The Slack file upload could not be completed",
+	};
+}
+
 /**
  * Detect MIME type based on file extension
  */
@@ -90,6 +116,11 @@ function getMimeType(filename: string): string {
  * Options for creating Cyrus tools with session management capabilities
  */
 export interface CyrusToolsOptions {
+	/** File delivery available only to a server-verified Slack chat session. */
+	slackFiles?: {
+		upload: (input: SlackFileUploadToolInput) => Promise<unknown>;
+	};
+
 	/** Read-only database operations for a server-verified Slack context. */
 	database?: {
 		connectionsList: () => Promise<unknown>;
@@ -216,6 +247,55 @@ export function createCyrusToolsServer(
 				}),
 			},
 			async (input) => result(() => options.database!.query(input)),
+		);
+	}
+
+	if (options.slackFiles) {
+		server.registerTool(
+			"slack_file_upload",
+			{
+				description:
+					"Upload files created inside this Slack chat's exact workspace to its verified thread.",
+				inputSchema: z.strictObject({
+					files: z
+						.array(
+							z.strictObject({
+								filePath: z.string().min(1),
+								title: z.string().min(1).optional(),
+							}),
+						)
+						.min(1)
+						.max(20),
+					initialComment: z.string().min(1).optional(),
+				}),
+			},
+			async (input) => {
+				try {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({
+									success: true,
+									result: await options.slackFiles!.upload(input),
+								}),
+							},
+						],
+					};
+				} catch (error) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({
+									success: false,
+									error: safeSlackFileError(error),
+								}),
+							},
+						],
+					};
+				}
+			},
 		);
 	}
 

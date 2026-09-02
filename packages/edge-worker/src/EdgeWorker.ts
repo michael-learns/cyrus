@@ -205,6 +205,7 @@ import {
 	SlackEngineeringOrchestrator,
 	type SlackEngineeringReceipt,
 } from "./SlackEngineeringOrchestrator.js";
+import { SlackFileUploadService } from "./SlackFileUploadService.js";
 import type { IActivitySink } from "./sinks/IActivitySink.js";
 import { LinearActivitySink } from "./sinks/LinearActivitySink.js";
 import { ToolPermissionResolver } from "./ToolPermissionResolver.js";
@@ -280,6 +281,9 @@ export class EdgeWorker extends EventEmitter {
 	private chatSessionHandler: ChatSessionHandler<SlackWebhookEvent> | null =
 		null;
 	private slackChatAdapter: SlackChatAdapter | null = null;
+	private slackFileUploadService = new SlackFileUploadService(
+		new SlackMessageService(),
+	);
 	private slackWorkItemEvents = new Map<
 		string,
 		Map<string, SlackWebhookEvent>
@@ -7898,9 +7902,27 @@ ${taskSection}`;
 		const slackEvent = parentSessionId
 			? this.chatSessionHandler?.getLatestEventForSession(parentSessionId)
 			: undefined;
+		const slackSession = parentSessionId
+			? this.chatSessionHandler
+					?.getAllChatSessions?.()
+					.find((session) => session.id === parentSessionId)
+			: undefined;
 		// Possession of a parent id is not proof of Slack origin. Only expose these
 		// tools when the server can resolve that id to a verified Slack event.
 		if (parentSessionId && slackEvent) {
+			const token = slackEvent.slackBotToken;
+			const threadTs = slackEvent.payload.thread_ts ?? slackEvent.payload.ts;
+			if (token && slackSession?.workspace.path) {
+				options.slackFiles = {
+					upload: (input) =>
+						this.slackFileUploadService.upload(input, {
+							token,
+							channelId: slackEvent.payload.channel,
+							threadTs,
+							workspacePath: slackSession.workspace.path,
+						}),
+				};
+			}
 			const engineeringParentSessionId = () =>
 				this.resolveSlackEngineeringParentSessionId(
 					parentSessionId,

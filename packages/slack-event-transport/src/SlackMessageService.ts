@@ -116,6 +116,8 @@ export interface SlackUploadFilesToThreadParams {
 	thread_ts: string;
 	/** In-memory files; this transport never reads paths. */
 	files: SlackFileUploadRequest[];
+	/** Optional caller-validated comment posted with the completed file batch. */
+	initialComment?: string;
 }
 
 /** Safe metadata returned after Slack completes an upload. */
@@ -176,6 +178,9 @@ export class SlackMessageService {
 				files: uploadedFiles,
 				channel_id: params.channel_id,
 				thread_ts: params.thread_ts,
+				...(params.initialComment !== undefined && {
+					initial_comment: params.initialComment,
+				}),
 			},
 			"file upload completion",
 		);

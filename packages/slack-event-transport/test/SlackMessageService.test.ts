@@ -311,6 +311,33 @@ describe("SlackMessageService", () => {
 			]);
 		});
 
+		it("includes a validated initial comment only when the caller supplies one", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url: "https://files.slack.com/upload/F1?ticket=private-one",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true }) });
+
+			await service.uploadFilesToThread({
+				...uploadParams,
+				files: [uploadParams.files[0]],
+				initialComment: "Here is the requested report.",
+			});
+
+			expect(JSON.parse(String(mockFetch.mock.calls[2]?.[1]?.body))).toEqual({
+				files: [{ id: "F1", title: "Run report" }],
+				channel_id: "C123",
+				thread_ts: "1704110400.000100",
+				initial_comment: "Here is the requested report.",
+			});
+		});
+
 		it.each([
 			[
 				"URL endpoint HTTP failure",
