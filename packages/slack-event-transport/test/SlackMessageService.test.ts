@@ -5,6 +5,14 @@ import { SlackMessageService } from "../src/SlackMessageService.js";
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
 
+function createConnectTimeout(): TypeError {
+	return new TypeError("fetch failed", {
+		cause: Object.assign(new Error("Connect Timeout Error"), {
+			code: "UND_ERR_CONNECT_TIMEOUT",
+		}),
+	});
+}
+
 describe("SlackMessageService", () => {
 	let service: SlackMessageService;
 
@@ -18,6 +26,73 @@ describe("SlackMessageService", () => {
 	});
 
 	describe("postMessage", () => {
+		it("retries when Slack times out before establishing a connection", async () => {
+			vi.useFakeTimers();
+			try {
+				mockFetch
+					.mockRejectedValueOnce(createConnectTimeout())
+					.mockResolvedValueOnce({
+						ok: true,
+						json: async () => ({ ok: true }),
+					});
+
+				const posting = expect(
+					service.postMessage({
+						token: "xoxb-test-token",
+						channel: "C9876543210",
+						text: "Hello after a brief outage",
+						thread_ts: "1704110400.000100",
+					}),
+				).resolves.toBeUndefined();
+
+				await vi.runAllTimersAsync();
+				await posting;
+				expect(mockFetch).toHaveBeenCalledTimes(2);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("stops after three Slack connection timeout attempts", async () => {
+			vi.useFakeTimers();
+			try {
+				mockFetch.mockRejectedValue(createConnectTimeout());
+
+				const posting = expect(
+					service.postMessage({
+						token: "xoxb-test-token",
+						channel: "C9876543210",
+						text: "Hello during an outage",
+					}),
+				).rejects.toThrow("fetch failed");
+
+				await vi.runAllTimersAsync();
+				await posting;
+				expect(mockFetch).toHaveBeenCalledTimes(3);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not retry a failure after Slack may have received the request", async () => {
+			mockFetch.mockRejectedValueOnce(
+				new TypeError("fetch failed", {
+					cause: Object.assign(new Error("Socket Error"), {
+						code: "UND_ERR_SOCKET",
+					}),
+				}),
+			);
+
+			await expect(
+				service.postMessage({
+					token: "xoxb-test-token",
+					channel: "C9876543210",
+					text: "Do not duplicate this message",
+				}),
+			).rejects.toThrow("fetch failed");
+			expect(mockFetch).toHaveBeenCalledTimes(1);
+		});
+
 		it("posts a message to a Slack channel with thread_ts", async () => {
 			mockFetch.mockResolvedValueOnce({
 				ok: true,

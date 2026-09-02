@@ -137,6 +137,20 @@ interface SlackUploadUrlResponse extends SlackApiResponse {
 }
 
 const SLACK_UPLOAD_TIMEOUT_MS = 15_000;
+const SLACK_POST_CONNECT_RETRY_DELAYS_MS = [250, 1_000] as const;
+
+function isSlackConnectTimeout(error: unknown): boolean {
+	// This Undici error happens before a socket is established, so retrying
+	// cannot duplicate a message. Do not broaden this to ambiguous failures.
+	let current = error;
+	for (let depth = 0; depth < 3; depth += 1) {
+		if (typeof current !== "object" || current === null) return false;
+		const candidate = current as { cause?: unknown; code?: unknown };
+		if (candidate.code === "UND_ERR_CONNECT_TIMEOUT") return true;
+		current = candidate.cause;
+	}
+	return false;
+}
 
 export class SlackMessageService {
 	private apiBaseUrl: string;
@@ -275,14 +289,24 @@ export class SlackMessageService {
 			body.thread_ts = thread_ts;
 		}
 
-		const response = await fetch(url, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${token}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify(body),
-		});
+		let response: Response;
+		for (let attempt = 0; ; attempt += 1) {
+			try {
+				response = await fetch(url, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(body),
+				});
+				break;
+			} catch (error) {
+				const delayMs = SLACK_POST_CONNECT_RETRY_DELAYS_MS[attempt];
+				if (delayMs === undefined || !isSlackConnectTimeout(error)) throw error;
+				await new Promise((resolve) => setTimeout(resolve, delayMs));
+			}
+		}
 
 		if (!response.ok) {
 			const errorBody = await response.text();
