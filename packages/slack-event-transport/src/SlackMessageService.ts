@@ -99,11 +99,159 @@ export interface SlackSetAssistantThreadStatusParams {
 	status: string;
 }
 
+/** A caller-authorized in-memory file to upload to a verified Slack thread. */
+export interface SlackFileUploadRequest {
+	bytes: Uint8Array;
+	filename: string;
+	title: string;
+}
+
+/** Parameters for uploading an already-authorized batch to one Slack thread. */
+export interface SlackUploadFilesToThreadParams {
+	/** Slack Bot OAuth token. */
+	token: string;
+	/** Verified Slack channel ID. */
+	channel_id: string;
+	/** Verified Slack thread timestamp. */
+	thread_ts: string;
+	/** In-memory files; this transport never reads paths. */
+	files: SlackFileUploadRequest[];
+}
+
+/** Safe metadata returned after Slack completes an upload. */
+export interface SlackUploadedFile {
+	id: string;
+	title: string;
+}
+
+interface SlackApiResponse {
+	ok: boolean;
+	error?: string;
+}
+
+interface SlackUploadUrlResponse extends SlackApiResponse {
+	file_id?: string;
+	upload_url?: string;
+}
+
+const SLACK_UPLOAD_TIMEOUT_MS = 15_000;
+
 export class SlackMessageService {
 	private apiBaseUrl: string;
 
 	constructor(apiBaseUrl?: string) {
 		this.apiBaseUrl = apiBaseUrl ?? "https://slack.com/api";
+	}
+
+	/**
+	 * Upload already-authorized in-memory files to one verified Slack thread.
+	 * The upload URL is a one-time capability and is never included in errors.
+	 */
+	async uploadFilesToThread(
+		params: SlackUploadFilesToThreadParams,
+	): Promise<SlackUploadedFile[]> {
+		const uploadedFiles: SlackUploadedFile[] = [];
+
+		for (const file of params.files) {
+			const ticket = await this.callSlackApi<SlackUploadUrlResponse>(
+				params.token,
+				"files.getUploadURLExternal",
+				{ filename: file.filename, length: file.bytes.byteLength },
+				"file upload URL request",
+			);
+			if (!ticket.file_id || !ticket.upload_url) {
+				throw new Error(
+					"[SlackMessageService] Slack file upload URL request returned an invalid response",
+				);
+			}
+
+			await this.transferSlackUpload(ticket.upload_url, file.bytes);
+			uploadedFiles.push({ id: ticket.file_id, title: file.title });
+		}
+
+		await this.callSlackApi<SlackApiResponse>(
+			params.token,
+			"files.completeUploadExternal",
+			{
+				files: uploadedFiles,
+				channel_id: params.channel_id,
+				thread_ts: params.thread_ts,
+			},
+			"file upload completion",
+		);
+
+		return uploadedFiles;
+	}
+
+	private async callSlackApi<T extends SlackApiResponse>(
+		token: string,
+		method: string,
+		body: Record<string, unknown>,
+		stage: string,
+	): Promise<T> {
+		let response: Response;
+		try {
+			response = await fetch(`${this.apiBaseUrl}/${method}`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(body),
+			});
+		} catch {
+			throw new Error(`[SlackMessageService] ${stage} failed`);
+		}
+
+		if (!response.ok) {
+			throw new Error(`[SlackMessageService] ${stage} failed`);
+		}
+
+		let responseBody: T;
+		try {
+			responseBody = (await response.json()) as T;
+		} catch {
+			throw new Error(
+				`[SlackMessageService] ${stage} returned an invalid response`,
+			);
+		}
+		if (!responseBody.ok) {
+			throw new Error(
+				`[SlackMessageService] Slack API error during ${stage}: ${responseBody.error ?? "unknown"}`,
+			);
+		}
+		return responseBody;
+	}
+
+	private async transferSlackUpload(
+		uploadUrl: string,
+		bytes: Uint8Array,
+	): Promise<void> {
+		if (!isSlackUploadUrl(uploadUrl)) {
+			throw new Error("[SlackMessageService] Unsafe Slack file upload URL");
+		}
+
+		try {
+			const response = await fetch(uploadUrl, {
+				method: "POST",
+				headers: {},
+				body: bytes,
+				redirect: "manual",
+				signal: AbortSignal.timeout(SLACK_UPLOAD_TIMEOUT_MS),
+			});
+			if (!response.ok || (response.status >= 300 && response.status < 400)) {
+				throw new Error("transfer failed");
+			}
+		} catch (error) {
+			if (error instanceof Error && error.name === "AbortError") {
+				throw new Error(
+					"[SlackMessageService] Slack file upload transfer timed out",
+				);
+			}
+			throw new Error(
+				"[SlackMessageService] Slack file upload transfer failed",
+			);
+		}
 	}
 
 	/**
@@ -381,5 +529,20 @@ export class SlackMessageService {
 				.sort((a, b) => a.ts.localeCompare(b.ts)),
 			permalink: permalinkBody.permalink,
 		};
+	}
+}
+
+function isSlackUploadUrl(value: string): boolean {
+	try {
+		const url = new URL(value);
+		return (
+			url.protocol === "https:" &&
+			url.hostname === "files.slack.com" &&
+			url.port === "" &&
+			url.username === "" &&
+			url.password === ""
+		);
+	} catch {
+		return false;
 	}
 }
