@@ -158,7 +158,10 @@ export class SlackMessageService {
 			const ticket = await this.callSlackApi<SlackUploadUrlResponse>(
 				params.token,
 				"files.getUploadURLExternal",
-				{ filename: file.filename, length: file.bytes.byteLength },
+				new URLSearchParams({
+					filename: file.filename,
+					length: String(file.bytes.byteLength),
+				}),
 				"file upload URL request",
 			);
 			if (!ticket.file_id || !ticket.upload_url) {
@@ -174,14 +177,14 @@ export class SlackMessageService {
 		await this.callSlackApi<SlackApiResponse>(
 			params.token,
 			"files.completeUploadExternal",
-			{
-				files: uploadedFiles,
+			new URLSearchParams({
+				files: JSON.stringify(uploadedFiles),
 				channel_id: params.channel_id,
 				thread_ts: params.thread_ts,
 				...(params.initialComment !== undefined && {
 					initial_comment: params.initialComment,
 				}),
-			},
+			}),
 			"file upload completion",
 		);
 
@@ -191,7 +194,7 @@ export class SlackMessageService {
 	private async callSlackApi<T extends SlackApiResponse>(
 		token: string,
 		method: string,
-		body: Record<string, unknown>,
+		body: URLSearchParams,
 		stage: string,
 	): Promise<T> {
 		let response: Response;
@@ -200,9 +203,9 @@ export class SlackMessageService {
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${token}`,
-					"Content-Type": "application/json",
+					"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
 				},
-				body: JSON.stringify(body),
+				body: body.toString(),
 			});
 		} catch {
 			throw new Error(`[SlackMessageService] ${stage} failed`);

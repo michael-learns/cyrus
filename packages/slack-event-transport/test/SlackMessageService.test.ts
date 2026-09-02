@@ -276,9 +276,9 @@ describe("SlackMessageService", () => {
 					method: "POST",
 					headers: {
 						Authorization: "Bearer xoxb-secret-token",
-						"Content-Type": "application/json",
+						"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
 					},
-					body: JSON.stringify({ filename: "report.txt", length: 4 }),
+					body: "filename=report.txt&length=4",
 				},
 			]);
 			expect(mockFetch.mock.calls[1]).toEqual([
@@ -291,24 +291,30 @@ describe("SlackMessageService", () => {
 					signal: expect.any(AbortSignal),
 				},
 			]);
-			expect(mockFetch.mock.calls[4]).toEqual([
+			const completionCall = mockFetch.mock.calls[4];
+			expect(completionCall?.[0]).toBe(
 				"https://slack.com/api/files.completeUploadExternal",
-				{
-					method: "POST",
-					headers: {
-						Authorization: "Bearer xoxb-secret-token",
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify({
-						files: [
-							{ id: "F1", title: "Run report" },
-							{ id: "F2", title: "Run notes" },
-						],
-						channel_id: "C123",
-						thread_ts: "1704110400.000100",
-					}),
+			);
+			expect(completionCall?.[1]).toEqual({
+				method: "POST",
+				headers: {
+					Authorization: "Bearer xoxb-secret-token",
+					"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
 				},
-			]);
+				body: expect.any(String),
+			});
+			expect(
+				Object.fromEntries(
+					new URLSearchParams(String(completionCall?.[1]?.body)),
+				),
+			).toEqual({
+				files: JSON.stringify([
+					{ id: "F1", title: "Run report" },
+					{ id: "F2", title: "Run notes" },
+				]),
+				channel_id: "C123",
+				thread_ts: "1704110400.000100",
+			});
 		});
 
 		it("includes a validated initial comment only when the caller supplies one", async () => {
@@ -330,8 +336,12 @@ describe("SlackMessageService", () => {
 				initialComment: "Here is the requested report.",
 			});
 
-			expect(JSON.parse(String(mockFetch.mock.calls[2]?.[1]?.body))).toEqual({
-				files: [{ id: "F1", title: "Run report" }],
+			expect(
+				Object.fromEntries(
+					new URLSearchParams(String(mockFetch.mock.calls[2]?.[1]?.body)),
+				),
+			).toEqual({
+				files: JSON.stringify([{ id: "F1", title: "Run report" }]),
 				channel_id: "C123",
 				thread_ts: "1704110400.000100",
 				initial_comment: "Here is the requested report.",
