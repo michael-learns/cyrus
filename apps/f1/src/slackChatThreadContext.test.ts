@@ -8,12 +8,11 @@ import type { AgentTurn } from "cyrus-core";
 import {
 	type ChatRepositoryProvider,
 	ChatSessionHandler,
+	EdgeWorker,
 	SlackChatAdapter,
 } from "cyrus-edge-worker";
 import { createCyrusToolsServer } from "cyrus-mcp-tools";
-import { SlackMessageService } from "cyrus-slack-event-transport";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SlackFileUploadService } from "../../../packages/edge-worker/src/SlackFileUploadService.js";
 import {
 	normalizeSlackEngineeringFixture,
 	type SlackEngineeringFixture,
@@ -319,6 +318,7 @@ describe("F1 Slack chat thread context", () => {
 		let workspacePath = "";
 		let turnText = "";
 		let toolText = "";
+		let worker: EdgeWorker;
 		const runner = {
 			supportsStreamingInput: true,
 			start: vi.fn(),
@@ -334,9 +334,19 @@ describe("F1 Slack chat thread context", () => {
 				}));
 				expect(captured.some(({ bytes }) => bytes.equals(inputPdf))).toBe(true);
 				expect(captured.some(({ bytes }) => bytes.equals(inputCsv))).toBe(true);
+				const imageRoot = join(
+					workspacePath,
+					"images",
+					"f1-slack-C_FILE_REPORTS-1800000001-000200",
+				);
 				expect(turn.filter((part) => part.type === "local_image")).toEqual([
-					expect.objectContaining({ mediaType: "image/png" }),
+					{
+						type: "local_image",
+						path: join(imageRoot, "image-001.png"),
+						mediaType: "image/png",
+					},
 				]);
+				expect(readFileSync(join(imageRoot, "image-001.png"))).toEqual(PNG);
 				expect(turnText).toContain("meeting.mp3 — skipped (media_type)");
 				expect(turnText).toContain("demo.mp4 — skipped (media_type)");
 
@@ -346,20 +356,16 @@ describe("F1 Slack chat thread context", () => {
 				writeFileSync(htmlPath, outputHtml);
 				writeFileSync(csvPath, outputCsv);
 				writeFileSync(pdfPath, outputPdf);
-				const uploadService = new SlackFileUploadService(
-					new SlackMessageService(),
-				);
-				const server = createCyrusToolsServer(undefined, {
-					slackFiles: {
-						upload: (input) =>
-							uploadService.upload(input, {
-								token: "xoxb-f1-synthetic",
-								channelId: fixture.channel,
-								threadTs: fixture.threadTs!,
-								workspacePath,
-							}),
-					},
-				});
+				const parentSessionId = `slack-${normalized.event.eventId}`;
+				const options = (
+					worker as never as {
+						createCyrusToolsOptions: (
+							sessionId: string,
+						) => Parameters<typeof createCyrusToolsServer>[1];
+					}
+				).createCyrusToolsOptions(parentSessionId);
+				expect(options?.slackFiles).toBeDefined();
+				const server = createCyrusToolsServer(undefined, options);
 				const client = new Client({ name: "f1-slack-files", version: "1.0" });
 				const [clientTransport, serverTransport] =
 					InMemoryTransport.createLinkedPair();
@@ -403,6 +409,10 @@ describe("F1 Slack chat thread context", () => {
 			onStateChange: vi.fn().mockResolvedValue(undefined),
 			onClaudeError: vi.fn(),
 		});
+		worker = new EdgeWorker({ cyrusHome, repositories: [] });
+		(
+			worker as never as { chatSessionHandler: typeof handler }
+		).chatSessionHandler = handler;
 
 		try {
 			await handler.handleEvent(normalized.event);
@@ -414,9 +424,24 @@ describe("F1 Slack chat thread context", () => {
 					threadTs: fixture.threadTs,
 					initialComment: "Requested summaries",
 					files: [
-						expect.objectContaining({ filename: "summary.html" }),
-						expect.objectContaining({ filename: "summary.csv" }),
-						expect.objectContaining({ filename: "summary.pdf" }),
+						{
+							id: "F_F1_UPLOAD_1",
+							filename: "summary.html",
+							title: "HTML summary",
+							byteLength: outputHtml.byteLength,
+						},
+						{
+							id: "F_F1_UPLOAD_2",
+							filename: "summary.csv",
+							title: "CSV summary",
+							byteLength: outputCsv.byteLength,
+						},
+						{
+							id: "F_F1_UPLOAD_3",
+							filename: "summary.pdf",
+							title: "PDF summary",
+							byteLength: outputPdf.byteLength,
+						},
 					],
 				},
 			]);

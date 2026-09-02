@@ -91,6 +91,25 @@ describe("SyntheticSlackEngineeringBackend", () => {
 			Buffer.from("exact input"),
 		);
 
+		for (const authorization of [undefined, "Bearer xoxb-wrong"]) {
+			const response = await backend.fetch(
+				"https://slack.com/api/files.getUploadURLExternal",
+				{
+					method: "POST",
+					headers: {
+						...(authorization && { Authorization: authorization }),
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({ filename: "forbidden.csv", length: 7 }),
+				},
+			);
+			expect(response.status).toBe(401);
+			expect(await response.json()).toEqual({
+				ok: false,
+				error: "not_authed",
+			});
+		}
+
 		const ticketResponse = await backend.fetch(
 			"https://slack.com/api/files.getUploadURLExternal",
 			{
@@ -107,6 +126,14 @@ describe("SyntheticSlackEngineeringBackend", () => {
 			upload_url: string;
 		};
 		const bytes = Buffer.from("a,b\n1,2");
+		const credentialLeak = await backend.fetch(ticket.upload_url, {
+			method: "POST",
+			headers: { Authorization: "Bearer xoxb-f1-synthetic" },
+			body: bytes,
+			redirect: "manual",
+		});
+		expect(credentialLeak.status).toBe(400);
+		expect(backend.activeUploadTicketCount).toBe(1);
 		const redirectingClient = await backend.fetch(ticket.upload_url, {
 			method: "POST",
 			headers: {},
