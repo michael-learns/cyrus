@@ -579,15 +579,19 @@ describe("SyntheticSlackEngineeringBackend", () => {
 			};
 			const before = backend.snapshot().issues.length;
 			const confirmation = await harness.call(input);
-			expect(confirmation).toMatchObject({
+			expect(confirmation).toEqual({
 				status: "confirmation_required",
 				reason: "similar",
+				issueRepository: "f1-test/primary-repo",
 				candidates: [
-					expect.objectContaining({
+					{
 						number,
+						title: "Fix payroll export failure",
 						state: "open",
+						url: `https://github.com/f1-test/primary-repo/issues/${number}`,
 						match: "strong_similarity",
-					}),
+						score: 0.8,
+					},
 				],
 			});
 
