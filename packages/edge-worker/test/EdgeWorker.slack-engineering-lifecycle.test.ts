@@ -948,6 +948,84 @@ Readable files:
 		});
 	}
 
+	for (const status of ["creating", "starting", "in_progress"]) {
+		it(`lets an active ${status} receipt from a different kickoff preempt duplicate reuse`, async () => {
+			const activeReceipt = {
+				parentSessionId: "parent",
+				teamId: "T1",
+				channelId: "C1",
+				threadTs: "100.0",
+				kickoffTs: "100.5",
+				status,
+			};
+			const duplicate = {
+				number: 25,
+				title: "Fix checkout",
+				body: "Existing report",
+				state: "closed",
+				url: "https://github.com/acme/api/issues/25",
+			};
+			const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+				currentReceipt: activeReceipt,
+				issuesByScan: [[duplicate], [duplicate]],
+			});
+			createAndStart.mockResolvedValue(activeReceipt);
+
+			await expect(
+				worker.createAndStartSlackEngineering("parent", {
+					issueRepository: "acme/api",
+					title: "Fix checkout",
+					summary: "Checkout fails.",
+					duplicateResolution: {
+						action: "reuse_existing",
+						issueNumber: 25,
+					},
+				}),
+			).resolves.toBe(activeReceipt);
+
+			expect(worker.listSlackEngineeringIssues).not.toHaveBeenCalled();
+			expect(worker.reopenSlackEngineeringIssue).not.toHaveBeenCalled();
+			expect(worker.captureSlackEngineeringSource).toHaveBeenCalledOnce();
+			expect(createAndStart).toHaveBeenCalledOnce();
+			expect(createAndStart.mock.calls[0]![1]).not.toHaveProperty(
+				"existingIssue",
+			);
+		});
+	}
+
+	for (const status of ["failed", "awaiting_review", "stopped"]) {
+		it(`allows a new kickoff to reuse a duplicate after a ${status} receipt`, async () => {
+			const terminalReceipt = { status, kickoffTs: "100.5" };
+			const duplicate = {
+				number: 26,
+				title: "Fix checkout",
+				body: "Existing report",
+				state: "closed",
+				url: "https://github.com/acme/api/issues/26",
+			};
+			const { worker } = setupSlackEngineeringCreateWorker({
+				currentReceipt: terminalReceipt,
+				issuesByScan: [[duplicate], [duplicate]],
+			});
+
+			await worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+				duplicateResolution: {
+					action: "reuse_existing",
+					issueNumber: 26,
+				},
+			});
+
+			expect(worker.listSlackEngineeringIssues).toHaveBeenCalledTimes(2);
+			expect(worker.reopenSlackEngineeringIssue).toHaveBeenCalledWith(
+				"acme/api",
+				26,
+			);
+		});
+	}
+
 	it("removes only the new event subdirectory when a follow-up capture fails", async () => {
 		const cyrusHome = await mkdtemp(
 			join(tmpdir(), "cyrus-slack-capture-fail-"),

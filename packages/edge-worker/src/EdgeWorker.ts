@@ -8390,16 +8390,15 @@ ${taskSection}`;
 		const current = this.slackEngineeringOrchestrator.current?.(
 			engineeringParentSessionId,
 		);
-		const recoveringLatestReceipt = Boolean(
+		const existingReceiptPreemptsDuplicatePreflight = Boolean(
 			current &&
 				event &&
-				current.kickoffTs === event.payload.ts &&
-				["creating", "starting", "in_progress", "failed"].includes(
-					current.status,
-				),
+				(["creating", "starting", "in_progress"].includes(current.status) ||
+					(current.kickoffTs === event.payload.ts &&
+						current.status === "failed")),
 		);
 		let selectedIssue: SlackEngineeringDuplicateCandidate | undefined;
-		if (!recoveringLatestReceipt) {
+		if (!existingReceiptPreemptsDuplicatePreflight) {
 			const firstMatch = findSlackEngineeringDuplicates(
 				{ title: input.title, summary: input.summary },
 				await this.listSlackEngineeringIssues(issueRepository),
@@ -8437,7 +8436,7 @@ ${taskSection}`;
 			await this.captureSlackEngineeringSource(parentSessionId);
 		let receipt: SlackEngineeringReceipt;
 		try {
-			if (!recoveringLatestReceipt) {
+			if (!existingReceiptPreemptsDuplicatePreflight) {
 				const secondMatch = findSlackEngineeringDuplicates(
 					{ title: input.title, summary: input.summary },
 					await this.listSlackEngineeringIssues(issueRepository),
