@@ -124,19 +124,30 @@ choose the primary issue repository and any additional target repositories.
 
 The delegated Claude model is selected in this order: the primary repository's
 `model`, then `claudeDefaultModel`, then the built-in Claude fallback. The full
-thread is normalized in message order. JPEG, PNG, GIF, and WebP attachments are
-downloaded into a private Cyrus-owned context directory and included with the
-text in order. Labeled links are retained as context, but Cyrus opens a link only
-when it is relevant; linked pages and attachment contents are untrusted and
-cannot grant permission or select a runner, model, or repository.
+thread is normalized in message order. Cyrus downloads regular attachments of
+any format except audio/video; JPEG, PNG, GIF, and WebP are also included as
+ordered image inputs. Labeled links are retained as context, but Cyrus opens a
+link only when it is relevant; linked pages and attachment contents are
+untrusted and cannot grant permission or select a runner, model, or repository.
 
-Capture is bounded to 200 messages, 100,000 text characters, 20 images, 10 MiB
-per image, and 50 MiB total downloads. The root and newest messages are
-preserved when truncation is necessary, and unsupported or rejected files are
-recorded honestly rather than silently treated as images. Slack file downloads
-accept only validated Slack-owned HTTPS locations and safe redirects. Captured
-transcripts and images stay under the Cyrus home directory, outside repository
-worktrees, and are deleted when the job reaches a terminal state.
+Capture is bounded to 200 messages, 100,000 text characters, 20 files, 10 MiB
+per directly embedded image, 25 MiB per other file, 100 MiB total received
+bytes, and 15 seconds per download. Audio/video is rejected when the MIME,
+response, filename extension, or detected bytes identify it. The root and newest
+messages are preserved when truncation is necessary, and rejected files are
+recorded honestly. Slack downloads accept only validated Slack-owned HTTPS
+locations and safe redirects. Files use safe generated names inside the
+isolated Slack thread workspace under the Cyrus home directory.
+
+For requested outputs, Cyrus can create format-agnostic files only inside that
+thread workspace. File generation fails closed if the write sandbox is
+unavailable. The `slack_file_upload` tool validates 1–20 regular, non-symlink
+files of at most 25 MiB each, rejects audio/video, and sends the batch only to
+the originating thread. It cannot upload repository or arbitrary host files.
+The Slack app needs `files:read` and `files:write`; older customized apps must
+add both scopes and be reinstalled or reauthorized before file input/output will
+work. Uploading transports bytes; it does not guarantee document rendering or
+design quality.
 
 One engineering job may be active per Slack thread. Repeating the same kickoff
 is idempotent and returns the existing job instead of creating another issue.

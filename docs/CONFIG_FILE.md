@@ -422,11 +422,14 @@ In addition to repository-specific settings, you can configure global defaults:
 ### `slackAllowedTools` (array of strings)
 
 Controls the tools available to conversational Slack sessions. The built-in
-default is read-only for files, permits configured-repository refreshes with
-`Bash(git -C * pull)`, and permits all pull-request operations with
-`Bash(gh pr:*)`. It does not grant general shell access or other GitHub CLI
-command families. Supplying this field replaces the built-in list, so include
-every tool the Slack session should retain.
+default permits file creation only inside that Slack thread's transient
+workspace, configured-repository refreshes with `Bash(git -C * pull)`, and all
+pull-request operations with `Bash(gh pr:*)`. General commands run only in a
+fail-closed filesystem sandbox whose writes are limited to the thread workspace;
+unsandboxed commands and other GitHub CLI command families remain unavailable.
+Supplying this field replaces the built-in list, so include every tool the Slack
+session should retain. Bare custom `Write` and `Edit` entries are still scoped to
+the thread workspace.
 
 Slack engineering kickoffs are available when an active repository has a
 `githubUrl` and GitHub authentication can create issues and pull requests.
@@ -436,13 +439,31 @@ to Claude. For delegated work, model precedence is the primary repository's
 Slack text and generated issue labels or `[agent=...]` / `[model=...]` selectors
 cannot override this selection.
 
-Thread capture is stored beneath `<cyrusHome>/slack-context`, never inside a
-repository. It includes up to 200 messages, 100,000 text characters, 20 JPEG,
-PNG, GIF, or WebP images, 10 MiB per image, and 50 MiB total downloads. Only
-validated Slack-owned private-file URLs are authenticated. Context directories
-are granted to the delegated Claude session for that job and removed at terminal
-cleanup. Configure `cyrusHome` and `workspaceBaseDir` on storage with enough
-space for these temporary limits.
+Thread capture uses the isolated workspace beneath
+`<cyrusHome>/slack-workspaces`. Cyrus accepts regular files of any format except
+audio and video; JPEG, PNG, GIF, and WebP are additionally passed as ordered
+image inputs. A declared MIME type, download response MIME type, filename
+extension, or detected byte signature that identifies audio/video causes a
+rejection. Capture is limited to 200 messages, 100,000 text characters, 20
+files, 10 MiB per directly embedded image, 25 MiB per other file, 100 MiB total
+received bytes, and 15 seconds per download. Only validated Slack-owned HTTPS
+private-file URLs receive the bot token. Safe generated local names are used,
+and attachment content remains untrusted.
+
+Slack chat can create output files only when that workspace sandbox is
+available; setup fails closed if it cannot be enforced. The
+`mcp__cyrus-tools__slack_file_upload` tool accepts 1–20 regular, non-symlink
+workspace files of at most 25 MiB each, validates the entire batch before any
+Slack request, and rejects audio/video. It derives the destination from the
+verified Slack session and posts the batch to the original thread. It cannot
+upload repository or arbitrary host paths. Upload uses Slack's external upload
+flow and does not expose tokens, private download URLs, one-time upload URLs, or
+destination identifiers to the model. This is format-agnostic file transport;
+Cyrus does not promise format-specific rendering quality.
+
+The Slack app needs `files:read` for inbound attachments and `files:write` for
+outbound files. Operators using an older or customized Slack app must add both
+scopes and reinstall or reauthorize the app so its bot token receives them.
 
 ### `promptDefaults` (object)
 

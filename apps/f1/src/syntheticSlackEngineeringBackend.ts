@@ -17,6 +17,18 @@ interface SyntheticDelivery {
 	ok: boolean;
 }
 
+interface SyntheticFileDelivery {
+	channelId: string;
+	threadTs: string;
+	initialComment?: string;
+	files: Array<{
+		id: string;
+		filename: string;
+		title: string;
+		byteLength: number;
+	}>;
+}
+
 export interface SyntheticDatabaseAudit {
 	event: string;
 	fields: Record<string, unknown>;
@@ -41,9 +53,23 @@ export class SyntheticSlackEngineeringBackend {
 	readonly files = new Map<string, { bytes: Buffer; mimeType: string }>();
 	readonly issues: SyntheticIssue[] = [];
 	readonly deliveries: SyntheticDelivery[] = [];
+	readonly fileDeliveries: SyntheticFileDelivery[] = [];
 	readonly externalRequests: string[] = [];
 	readonly databaseAudits: SyntheticDatabaseAudit[] = [];
 	failSlackDelivery = false;
+	private nextUploadId = 1;
+	private readonly uploadTickets = new Map<
+		string,
+		{ id: string; filename: string; length: number }
+	>();
+	private readonly uploadedFiles = new Map<
+		string,
+		{ filename: string; bytes: Buffer }
+	>();
+
+	get activeUploadTicketCount(): number {
+		return this.uploadTickets.size;
+	}
 
 	constructor(private readonly statePath?: string) {
 		if (!statePath) return;
@@ -71,6 +97,11 @@ export class SyntheticSlackEngineeringBackend {
 		this.files.set(id, { bytes: Buffer.from(bytes), mimeType });
 	}
 
+	getUploadedFile(id: string): { filename: string; bytes: Buffer } | undefined {
+		const file = this.uploadedFiles.get(id);
+		return file && { filename: file.filename, bytes: Buffer.from(file.bytes) };
+	}
+
 	recordDatabaseAudit(event: string, fields: Record<string, unknown>): void {
 		this.databaseAudits.push({ event, fields: structuredClone(fields) });
 	}
@@ -80,12 +111,14 @@ export class SyntheticSlackEngineeringBackend {
 		deliveries: SyntheticDelivery[];
 		externalRequests: string[];
 		databaseAudits: SyntheticDatabaseAudit[];
+		fileDeliveries: SyntheticFileDelivery[];
 	} {
 		return {
 			issues: structuredClone(this.issues),
 			deliveries: structuredClone(this.deliveries),
 			externalRequests: [...this.externalRequests],
 			databaseAudits: structuredClone(this.databaseAudits),
+			fileDeliveries: structuredClone(this.fileDeliveries),
 		};
 	}
 
@@ -112,6 +145,70 @@ export class SyntheticSlackEngineeringBackend {
 		const method = (init?.method ?? "GET").toUpperCase();
 
 		if (url.origin === "https://slack.com") {
+			if (url.pathname === "/api/files.getUploadURLExternal") {
+				if (requestHeader(init, "Authorization") !== "Bearer xoxb-f1-synthetic")
+					return json({ ok: false, error: "not_authed" }, 401);
+				const body = JSON.parse(String(init?.body ?? "{}")) as {
+					filename?: string;
+					length?: number;
+				};
+				if (
+					method !== "POST" ||
+					!body.filename ||
+					!Number.isSafeInteger(body.length) ||
+					(body.length ?? -1) < 0
+				)
+					return json({ ok: false, error: "invalid_arguments" });
+				const id = `F_F1_UPLOAD_${this.nextUploadId}`;
+				const ticket = `f1-one-time-${this.nextUploadId}`;
+				this.nextUploadId += 1;
+				this.uploadTickets.set(ticket, {
+					id,
+					filename: body.filename,
+					length: body.length!,
+				});
+				return json({
+					ok: true,
+					file_id: id,
+					upload_url: `https://files.slack.com/upload/${id}?ticket=${ticket}`,
+				});
+			}
+			if (url.pathname === "/api/files.completeUploadExternal") {
+				if (requestHeader(init, "Authorization") !== "Bearer xoxb-f1-synthetic")
+					return json({ ok: false, error: "not_authed" }, 401);
+				const body = JSON.parse(String(init?.body ?? "{}")) as {
+					files?: Array<{ id: string; title: string }>;
+					channel_id?: string;
+					thread_ts?: string;
+					initial_comment?: string;
+				};
+				if (
+					method !== "POST" ||
+					!body.channel_id ||
+					!body.thread_ts ||
+					!body.files?.length
+				)
+					return json({ ok: false, error: "invalid_arguments" });
+				const completed = body.files.map(({ id, title }) => {
+					const file = this.uploadedFiles.get(id);
+					if (!file) throw new Error(`synthetic upload ${id} is incomplete`);
+					return {
+						id,
+						filename: file.filename,
+						title,
+						byteLength: file.bytes.byteLength,
+					};
+				});
+				this.fileDeliveries.push({
+					channelId: body.channel_id,
+					threadTs: body.thread_ts,
+					...(body.initial_comment !== undefined && {
+						initialComment: body.initial_comment,
+					}),
+					files: completed,
+				});
+				return json({ ok: true });
+			}
 			if (url.pathname === "/api/conversations.replies") {
 				const key = `${url.searchParams.get("channel")}:${url.searchParams.get("ts")}`;
 				return json({
@@ -151,6 +248,28 @@ export class SyntheticSlackEngineeringBackend {
 		}
 
 		if (url.origin === "https://files.slack.com") {
+			if (url.pathname.startsWith("/upload/")) {
+				const ticketKey = url.searchParams.get("ticket") ?? "";
+				const ticket = this.uploadTickets.get(ticketKey);
+				if (!ticket) return new Response("expired", { status: 410 });
+				if (
+					method !== "POST" ||
+					init?.redirect !== "manual" ||
+					requestHeader(init, "Authorization") !== null
+				)
+					return new Response("invalid upload", { status: 400 });
+				const bytes = Buffer.from(
+					init?.body instanceof Uint8Array ? init.body : [],
+				);
+				if (bytes.byteLength !== ticket.length)
+					return new Response("length mismatch", { status: 400 });
+				this.uploadTickets.delete(ticketKey);
+				this.uploadedFiles.set(ticket.id, {
+					filename: ticket.filename,
+					bytes,
+				});
+				return new Response("ok", { status: 200 });
+			}
 			if (requestHeader(init, "Authorization") !== "Bearer xoxb-f1-synthetic") {
 				return new Response("unauthorized", { status: 401 });
 			}
