@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Slack-started engineering now checks every GitHub issue in the selected repository before creating one, automatically reuses exact open matches, and asks before reusing closed or similar issues.
 - Slack conversations can now securely read non-audio/video attachments, create files in an isolated thread workspace, and return validated files to the original Slack thread.
 - Self-hosted Cyrus can now use operator-configured, strictly read-only PostgreSQL or MySQL connections from approved Slack channels and Slack-started engineering work. Access is routed by channel and repository through a restricted SSH gateway, with bounded queries, pinned host keys, privilege checks, sensitive-payload redaction, and no general SSH capability.
 - Slack threads can now start new engineering work directly: Cyrus securely captures ordered text, supported images, and relevant links, asks for a repository when routing is ambiguous, creates exactly one GitHub Issue, accepts follow-up guidance, and reliably returns pull-request or terminal status after retries and restarts.
