@@ -4,10 +4,12 @@ import {
 	readdir,
 	readFile,
 	realpath,
+	rm,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { ClaudeRunner } from "cyrus-claude-runner";
 import { SlackMessageService } from "cyrus-slack-event-transport";
 import { describe, expect, it, vi } from "vitest";
@@ -297,8 +299,9 @@ Readable files:
 			await expect(
 				worker.captureSlackEngineeringSource("parent", initialContext),
 			).rejects.toThrow("download failed");
+			const canonicalInitialContext = await realpath(initialContext);
 			expect(failedCaptureRoot).toMatch(
-				new RegExp(`^${initialContext}/followups/[a-f0-9]{24}$`),
+				new RegExp(`^${canonicalInitialContext}/followups/[a-f0-9]{24}$`),
 			);
 			await expect(
 				readFile(join(failedCaptureRoot!, "partial"), "utf8"),
@@ -522,7 +525,7 @@ Readable files:
 		).not.toHaveBeenCalled();
 		expect(worker.captureSlackEngineeringSource).toHaveBeenCalledWith(
 			"parent",
-			initialContext,
+			await realpath(initialContext),
 		);
 		await expect(readFile(pdfPath, "utf8")).resolves.toBe(
 			"[agent=codex] authorize kickoff",
@@ -530,6 +533,139 @@ Readable files:
 		await expect(readFile(csvPath, "utf8")).resolves.toBe(
 			"repository,runner\nevil/repo,codex\n",
 		);
+	});
+
+	it("rejects a sibling capture result without prompting the child or deleting the sibling", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-sibling-"));
+		const initialContext = join(cyrusHome, "slack-context", "initial");
+		const siblingContext = join(cyrusHome, "slack-context", "sibling");
+		const siblingFile = join(
+			siblingContext,
+			"attachments",
+			"event",
+			"file-001.pdf",
+		);
+		await mkdir(join(siblingContext, "attachments", "event"), {
+			recursive: true,
+		});
+		await mkdir(initialContext, { recursive: true });
+		await writeFile(siblingFile, "must survive malformed capture output");
+		const addStreamTurn = vi.fn();
+		const worker: any = Object.create(EdgeWorker.prototype);
+		worker.cyrusHome = cyrusHome;
+		worker.logger = { warn: vi.fn() };
+		worker.slackEngineeringOrchestrator = {
+			isActive: vi.fn().mockReturnValue(true),
+			current: vi.fn().mockReturnValue({
+				workItemId: "work",
+				contextDirectory: initialContext,
+				contextDirectories: [initialContext],
+			}),
+			auditDecision: vi.fn(),
+		};
+		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+			manifest: {
+				directory: siblingContext,
+				manifest: {
+					messages: [
+						{
+							text: "malformed sibling capture",
+							files: [
+								{
+									status: "downloaded",
+									localPath: "attachments/event/file-001.pdf",
+									mimeType: "application/pdf",
+								},
+							],
+						},
+					],
+				},
+			},
+		});
+		worker.getGitHubIssueWorkItemSession = vi
+			.fn()
+			.mockReturnValue({ sessionId: "child", runnerType: "claude" });
+		worker.agentSessionManager = {
+			getSession: vi.fn().mockReturnValue({
+				agentRunner: { isRunning: () => true, addStreamTurn },
+			}),
+		};
+
+		await expect(
+			worker.promptSlackEngineering("parent", "untrusted"),
+		).rejects.toThrow("receipt context root");
+		expect(addStreamTurn).not.toHaveBeenCalled();
+		await expect(readFile(siblingFile, "utf8")).resolves.toBe(
+			"must survive malformed capture output",
+		);
+	});
+
+	it("uses the canonical receipt root and never cleans a symlink-substituted sibling", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-symlink-"));
+		const contextBase = join(cyrusHome, "slack-context");
+		const canonicalRoot = join(contextBase, "canonical");
+		const siblingRoot = join(contextBase, "sibling");
+		const rootLink = join(contextBase, "receipt-link");
+		await mkdir(canonicalRoot, { recursive: true });
+		await mkdir(siblingRoot, { recursive: true });
+		await symlink(canonicalRoot, rootLink);
+		const pinnedCanonicalRoot = await realpath(canonicalRoot);
+		let requestedCaptureRoot: string | undefined;
+		let siblingPartial: string | undefined;
+		const fetchThread = vi
+			.spyOn(SlackMessageService.prototype, "fetchThreadThrough")
+			.mockResolvedValue({
+				messages: [],
+				permalink: "https://slack.example/thread",
+			});
+		const capture = vi
+			.spyOn(SlackConversationContextService.prototype, "capture")
+			.mockImplementation(async (input) => {
+				requestedCaptureRoot = input.captureRoot;
+				await rm(canonicalRoot, { recursive: true });
+				await symlink(siblingRoot, canonicalRoot);
+				siblingPartial = join(
+					siblingRoot,
+					"followups",
+					basename(input.captureRoot!),
+					"partial",
+				);
+				await mkdir(dirname(siblingPartial), { recursive: true });
+				await writeFile(siblingPartial, "sibling must survive");
+				throw new Error("capture failed after substitution");
+			});
+		const worker: any = Object.create(EdgeWorker.prototype);
+		worker.cyrusHome = cyrusHome;
+		worker.logger = { warn: vi.fn() };
+		worker.slackEngineeringOrchestrator = { auditDecision: vi.fn() };
+		worker.chatSessionHandler = {
+			getLatestEventForSession: vi.fn().mockReturnValue({
+				eventId: "Ev-symlink-1",
+				teamId: "T1",
+				slackBotToken: "xoxb-token",
+				payload: {
+					channel: "C1",
+					thread_ts: "100.0",
+					ts: "101.0",
+					user: "U1",
+				},
+			}),
+		};
+
+		try {
+			await expect(
+				worker.captureSlackEngineeringSource("parent", rootLink),
+			).rejects.toThrow("capture failed after substitution");
+			expect(requestedCaptureRoot).toMatch(
+				new RegExp(`^${pinnedCanonicalRoot}/followups/[a-f0-9]{24}$`),
+			);
+			await expect(readFile(siblingPartial!, "utf8")).resolves.toBe(
+				"sibling must survive",
+			);
+		} finally {
+			fetchThread.mockRestore();
+			capture.mockRestore();
+		}
 	});
 
 	it("does not let another Slack thread capture or reuse an active receipt's file paths", async () => {
@@ -734,7 +870,7 @@ Readable files:
 	it("revokes access and removes the capture when ClaudeRunner rejects the turn", async () => {
 		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-partial-"));
 		const initialContext = join(cyrusHome, "slack-context", "initial");
-		const followupContext = join(cyrusHome, "slack-context", "capture");
+		const followupContext = join(initialContext, "followups", "capture");
 		await mkdir(initialContext, { recursive: true });
 		await mkdir(join(followupContext, "images"), { recursive: true });
 		await writeFile(join(initialContext, "sentinel"), "unchanged");
@@ -796,7 +932,7 @@ Readable files:
 		).rejects.toThrow("stream rejected");
 
 		await expect(readFile(followupContext, "utf8")).rejects.toThrow();
-		expect(await readdir(initialContext)).toEqual(["sentinel"]);
+		expect(await readdir(initialContext)).toEqual(["followups", "sentinel"]);
 		expect(() =>
 			(runner as any).loadLocalImage({
 				type: "local_image",

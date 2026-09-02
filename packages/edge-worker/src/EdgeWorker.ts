@@ -2012,18 +2012,10 @@ export class EdgeWorker extends EventEmitter {
 		directory: string,
 	): Promise<string | undefined> {
 		const root = resolve(join(this.cyrusHome, "slack-context"));
-		const candidate = resolve(directory);
-		const lexicalRelative = relative(root, candidate);
-		if (
-			!lexicalRelative ||
-			lexicalRelative.startsWith("..") ||
-			isAbsolute(lexicalRelative)
-		)
-			return undefined;
 		try {
 			const [canonicalRoot, canonicalCandidate] = await Promise.all([
 				realpath(root),
-				realpath(candidate),
+				realpath(resolve(directory)),
 			]);
 			const canonicalRelative = relative(canonicalRoot, canonicalCandidate);
 			if (
@@ -2036,6 +2028,53 @@ export class EdgeWorker extends EventEmitter {
 		} catch {
 			return undefined;
 		}
+	}
+
+	private async containedSlackContextDescendant(
+		contextRoot: string,
+		directory: string,
+	): Promise<string | undefined> {
+		const canonicalContextRoot =
+			await this.containedSlackContextDirectory(contextRoot);
+		if (!canonicalContextRoot || canonicalContextRoot !== resolve(contextRoot))
+			return undefined;
+		try {
+			const canonicalCandidate = await realpath(resolve(directory));
+			const contextRelative = relative(
+				canonicalContextRoot,
+				canonicalCandidate,
+			);
+			if (
+				!contextRelative ||
+				contextRelative.startsWith("..") ||
+				isAbsolute(contextRelative)
+			)
+				return undefined;
+			return canonicalCandidate;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async cleanupSlackEngineeringFollowupDirectory(
+		contextRoot: string,
+		directory: string,
+	): Promise<void> {
+		const candidate = await this.containedSlackContextDescendant(
+			contextRoot,
+			directory,
+		);
+		if (!candidate) {
+			this.logger.warn(
+				"Ignored Slack follow-up cleanup outside receipt context",
+				{
+					decision: "cleanup_rejected",
+				},
+			);
+			this.slackEngineeringOrchestrator.auditDecision("cleanup_rejected");
+			return;
+		}
+		await rm(candidate, { recursive: true, force: true });
 	}
 
 	private githubWorkItemFinalSummary(
@@ -8148,10 +8187,11 @@ ${taskSection}`;
 		if (!token) throw new Error("Slack authentication is unavailable");
 		const threadTs = event.payload.thread_ts || event.payload.ts;
 		let captureRoot: string | undefined;
+		let canonicalContextRoot: string | undefined;
 		if (contextRoot) {
-			const canonicalRoot =
+			canonicalContextRoot =
 				await this.containedSlackContextDirectory(contextRoot);
-			if (!canonicalRoot)
+			if (!canonicalContextRoot)
 				throw new Error("Slack engineering context root is unavailable");
 			const eventKey = createHash("sha256")
 				.update(
@@ -8165,7 +8205,7 @@ ${taskSection}`;
 				)
 				.digest("hex")
 				.slice(0, 24);
-			captureRoot = join(resolve(contextRoot), "followups", eventKey);
+			captureRoot = join(canonicalContextRoot, "followups", eventKey);
 		}
 		const snapshot = await new SlackMessageService().fetchThreadThrough({
 			token,
@@ -8192,8 +8232,11 @@ ${taskSection}`;
 				messages: snapshot.messages,
 			});
 		} catch (error) {
-			if (captureRoot)
-				await this.cleanupSlackContextDirectories(undefined, [captureRoot]);
+			if (captureRoot && canonicalContextRoot)
+				await this.cleanupSlackEngineeringFollowupDirectory(
+					canonicalContextRoot,
+					captureRoot,
+				);
 			throw error;
 		}
 		return {
@@ -8346,14 +8389,33 @@ ${paths.join("\n")}
 			throw new Error("No active engineering job exists for this Slack thread");
 		const stableContextRoot =
 			receipt.contextDirectory ?? receipt.contextDirectories?.[0];
+		const canonicalStableContextRoot = stableContextRoot
+			? await this.containedSlackContextDirectory(stableContextRoot)
+			: undefined;
+		if (stableContextRoot && !canonicalStableContextRoot)
+			throw new Error("Slack engineering context root is unavailable");
 		const { manifest } = await this.captureSlackEngineeringSource(
 			parentSessionId,
-			stableContextRoot,
+			canonicalStableContextRoot,
 		);
 		let imageDirectoryLease: { release(): void } | undefined;
-		let captureRetained = Boolean(stableContextRoot);
+		let captureRetained = Boolean(canonicalStableContextRoot);
+		let cleanupDirectory: string | undefined;
 		let turnAccepted = false;
 		try {
+			const canonicalCapture = canonicalStableContextRoot
+				? await this.containedSlackContextDescendant(
+						canonicalStableContextRoot,
+						manifest.directory,
+					)
+				: await this.containedSlackContextDirectory(manifest.directory);
+			if (!canonicalCapture)
+				throw new Error(
+					canonicalStableContextRoot
+						? "Follow-up capture escaped its receipt context root"
+						: "Follow-up capture escaped Slack context",
+				);
+			cleanupDirectory = canonicalCapture;
 			const latest = manifest.manifest.messages.at(-1);
 			const authoritativeText = latest?.text?.trim() || modelSummary;
 			const downloadedFiles =
@@ -8371,12 +8433,7 @@ ${paths.join("\n")}
 				workItem && this.agentSessionManager.getSession(workItem.sessionId);
 			const runner = session?.agentRunner;
 			if (downloadedFiles.length) {
-				const canonicalCapture = await this.containedSlackContextDirectory(
-					manifest.directory,
-				);
-				if (!canonicalCapture)
-					throw new Error("Follow-up capture escaped Slack context");
-				if (!stableContextRoot) {
+				if (!canonicalStableContextRoot) {
 					if (runner?.isRunning())
 						throw new Error(
 							"Active Claude runner has no authorized Slack context root",
@@ -8488,10 +8545,17 @@ ${paths.join("\n")}
 			return prompted;
 		} finally {
 			imageDirectoryLease?.release();
-			if (!turnAccepted || !captureRetained)
-				await this.cleanupSlackContextDirectories(undefined, [
-					manifest.directory,
-				]);
+			if ((!turnAccepted || !captureRetained) && cleanupDirectory) {
+				if (canonicalStableContextRoot)
+					await this.cleanupSlackEngineeringFollowupDirectory(
+						canonicalStableContextRoot,
+						cleanupDirectory,
+					);
+				else
+					await this.cleanupSlackContextDirectories(undefined, [
+						cleanupDirectory,
+					]);
+			}
 		}
 	}
 

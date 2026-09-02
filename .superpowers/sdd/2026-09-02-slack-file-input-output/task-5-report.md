@@ -137,3 +137,107 @@ Output: empty; exit status 0.
 ## Concerns
 
 None known. The fallback for old receipts intentionally refuses file-bearing follow-ups while their runner is active because that runner never received a read grant for the newly captured directory.
+
+## Fix Round 1: Exact Receipt-Root Containment
+
+### Finding
+
+Follow-up results were checked only against the global `slack-context` directory. A malformed capture result could point at a sibling receipt directory, and the follow-up destination was constructed through the original receipt path rather than its pinned canonical target. Cleanup could consequently follow a substituted symlink into a sibling context.
+
+### RED: sibling result and original-path construction
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker test:run -- EdgeWorker.slack-engineering-lifecycle
+```
+
+Output summary:
+
+```text
+Test Files  1 failed | 81 passed (82)
+Tests       2 failed | 950 passed (952)
+```
+
+Expected failures:
+
+- `rejects a sibling capture result without prompting the child or deleting the sibling` resolved with the active receipt instead of rejecting, proving the sibling PDF path reached the child turn.
+- `uses the canonical receipt root and never cleans a symlink-substituted sibling` received `<receipt-link>/followups/<event>` instead of `<canonical-root>/followups/<event>`.
+
+### RED: canonical-root substitution cleanup
+
+After strengthening the race fixture to replace the canonical root itself with a sibling symlink, the same focused command produced:
+
+```text
+Test Files  1 failed | 81 passed (82)
+Tests       1 failed | 951 passed (952)
+Error: ENOENT ... sibling/followups/<event>/partial
+```
+
+The sibling partial file was deleted, proving cleanup re-resolved the substituted root rather than honoring the pinned canonical identity.
+
+### GREEN: focused lifecycle suite
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker test:run -- EdgeWorker.slack-engineering-lifecycle
+```
+
+Output:
+
+```text
+Test Files  82 passed (82)
+Tests       952 passed (952)
+Duration    7.40s
+```
+
+### Full verification
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker test:run
+```
+
+Output:
+
+```text
+Test Files  82 passed (82)
+Tests       952 passed (952)
+Duration    7.53s
+```
+
+Command:
+
+```bash
+corepack pnpm --filter cyrus-edge-worker typecheck
+```
+
+Output:
+
+```text
+> tsc --noEmit
+```
+
+Exit status: 0.
+
+Command:
+
+```bash
+git diff --check
+```
+
+Output: empty; exit status 0.
+
+### Fix and self-review
+
+- The receipt root is canonicalized and globally contained before capture.
+- The unique event destination is constructed from that canonical root.
+- Every returned follow-up directory, including text-only captures, must be a strict canonical descendant of the exact receipt root before any child turn is built or retained.
+- The pinned canonical root string must still resolve to itself; canonical-root symlink substitution fails closed.
+- Failure cleanup uses the same strict exact-root check. An unvalidated sibling result is never deleted.
+- Legacy receipts without a stable root retain the previous global-root fallback and active-runner fail-closed behavior.
+- The global `slack-context` canonical containment check remains as defense in depth and now handles macOS `/var` → `/private/var` aliases without relying on a mismatching lexical precheck.
+
+Concerns: none known.
