@@ -7,6 +7,7 @@ interface SyntheticIssue {
 	number: number;
 	title: string;
 	body: string;
+	state: "open" | "closed";
 	htmlUrl: string;
 }
 
@@ -78,7 +79,12 @@ export class SyntheticSlackEngineeringBackend {
 				issues?: SyntheticIssue[];
 				deliveries?: SyntheticDelivery[];
 			};
-			this.issues.push(...(state.issues ?? []));
+			this.issues.push(
+				...(state.issues ?? []).map((issue) => ({
+					...issue,
+					state: issue.state ?? ("open" as const),
+				})),
+			);
 			this.deliveries.push(...(state.deliveries ?? []));
 		} catch {
 			// A missing or incomplete synthetic state file starts a fresh backend.
@@ -293,7 +299,8 @@ export class SyntheticSlackEngineeringBackend {
 					title: string;
 					body: string;
 				};
-				const number = this.issues.length + 1;
+				const number =
+					Math.max(0, ...this.issues.map((issue) => issue.number)) + 1;
 				const repository = issueCollection[1]!;
 				const htmlUrl = `https://github.com/${repository}/issues/${number}`;
 				this.issues.push({
@@ -301,21 +308,40 @@ export class SyntheticSlackEngineeringBackend {
 					number,
 					title: payload.title,
 					body: payload.body,
+					state: "open",
 					htmlUrl,
 				});
 				this.persist();
 				return json({ number, html_url: htmlUrl }, 201);
 			}
 			if (issueCollection && method === "GET") {
-				return json(
-					this.issues
-						.filter((issue) => issue.repository === issueCollection[1])
-						.map((issue) => ({
-							number: issue.number,
-							html_url: issue.htmlUrl,
-							body: issue.body,
-						})),
+				const requestedState = url.searchParams.get("state") ?? "open";
+				const perPage = Math.max(
+					1,
+					Math.min(100, Number(url.searchParams.get("per_page") ?? 30)),
 				);
+				const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
+				const matching = this.issues.filter(
+					(issue) =>
+						issue.repository === issueCollection[1] &&
+						(requestedState === "all" || issue.state === requestedState),
+				);
+				const offset = (page - 1) * perPage;
+				const response = json(
+					matching.slice(offset, offset + perPage).map((issue) => ({
+						number: issue.number,
+						title: issue.title,
+						body: issue.body,
+						state: issue.state,
+						html_url: issue.htmlUrl,
+					})),
+				);
+				if (offset + perPage < matching.length) {
+					const nextUrl = new URL(url);
+					nextUrl.searchParams.set("page", String(page + 1));
+					response.headers.set("Link", `<${nextUrl.toString()}>; rel="next"`);
+				}
+				return response;
 			}
 
 			if (url.pathname === "/search/issues") {
@@ -349,6 +375,24 @@ export class SyntheticSlackEngineeringBackend {
 			const issue = url.pathname.match(
 				/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)$/,
 			);
+			if (issue && method === "PATCH") {
+				const stored = this.issues.find(
+					(candidate) =>
+						candidate.repository === issue[1] &&
+						candidate.number === Number(issue[2]),
+				);
+				if (!stored) return json({ message: "Not Found" }, 404);
+				const payload = JSON.parse(String(init?.body ?? "{}")) as {
+					state?: "open" | "closed";
+				};
+				if (payload.state) stored.state = payload.state;
+				this.persist();
+				return json({
+					number: stored.number,
+					html_url: stored.htmlUrl,
+					state: stored.state,
+				});
+			}
 			if (issue && method === "GET") {
 				const stored = this.issues.find(
 					(candidate) =>
@@ -361,7 +405,7 @@ export class SyntheticSlackEngineeringBackend {
 					number: stored.number,
 					title: stored.title,
 					body: stored.body,
-					state: "open",
+					state: stored.state,
 					html_url: stored.htmlUrl,
 					url: `https://api.github.com/repos/${stored.repository}/issues/${stored.number}`,
 					user: {
