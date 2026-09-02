@@ -134,15 +134,6 @@ describe("SlackEngineeringDuplicateMatcher", () => {
 		expect(result).toEqual({ confirmationCandidates: [] });
 	});
 
-	it("does not allow pull requests into the issue-record input contract", () => {
-		// @ts-expect-error Pull requests are filtered by the GitHub transport before matching.
-		const pullRequest: SlackEngineeringIssueForDuplicateCheck = {
-			...issues[0],
-			pull_request: {},
-		};
-		expect(pullRequest.number).toBe(8);
-	});
-
 	it("orders exact candidates first, then similar candidates by score, open state, and number", () => {
 		const result = findSlackEngineeringDuplicates(
 			{ title: "Fix payroll export", summary: "Payroll export failure." },

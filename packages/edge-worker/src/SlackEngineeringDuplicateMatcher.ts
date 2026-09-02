@@ -34,7 +34,7 @@ const BODY_DICE_THRESHOLD = 0.55;
 export function normalizeSlackEngineeringIssueText(text: string): string {
 	return text
 		.normalize("NFKC")
-		.toLocaleLowerCase()
+		.toLowerCase()
 		.replace(/[\p{P}\p{S}]+/gu, " ")
 		.replace(/\s+/g, " ")
 		.trim();
