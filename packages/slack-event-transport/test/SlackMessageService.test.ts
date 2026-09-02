@@ -9,7 +9,7 @@ describe("SlackMessageService", () => {
 	let service: SlackMessageService;
 
 	beforeEach(() => {
-		vi.clearAllMocks();
+		mockFetch.mockReset();
 		service = new SlackMessageService();
 	});
 
@@ -220,6 +220,310 @@ describe("SlackMessageService", () => {
 					status: "is thinking…",
 				}),
 			).rejects.toThrow("[SlackMessageService] Slack API error: missing_scope");
+		});
+	});
+
+	describe("uploadFilesToThread", () => {
+		const uploadParams = {
+			token: "xoxb-secret-token",
+			channel_id: "C123",
+			thread_ts: "1704110400.000100",
+			files: [
+				{
+					bytes: new Uint8Array([0, 1, 2, 255]),
+					filename: "report.txt",
+					title: "Run report",
+				},
+				{
+					bytes: new Uint8Array([3, 4]),
+					filename: "notes.csv",
+					title: "Run notes",
+				},
+			],
+		};
+
+		it("requests URLs, transfers the exact bytes, and completes one verified thread batch", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url: "https://files.slack.com/upload/F1?ticket=private-one",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F2",
+						upload_url: "https://files.slack.com/upload/F2?ticket=private-two",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true }) });
+
+			await expect(service.uploadFilesToThread(uploadParams)).resolves.toEqual([
+				{ id: "F1", title: "Run report" },
+				{ id: "F2", title: "Run notes" },
+			]);
+
+			expect(mockFetch.mock.calls).toHaveLength(5);
+			expect(mockFetch.mock.calls[0]).toEqual([
+				"https://slack.com/api/files.getUploadURLExternal",
+				{
+					method: "POST",
+					headers: {
+						Authorization: "Bearer xoxb-secret-token",
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({ filename: "report.txt", length: 4 }),
+				},
+			]);
+			expect(mockFetch.mock.calls[1]).toEqual([
+				"https://files.slack.com/upload/F1?ticket=private-one",
+				{
+					method: "POST",
+					headers: {},
+					body: new Uint8Array([0, 1, 2, 255]),
+					redirect: "manual",
+					signal: expect.any(AbortSignal),
+				},
+			]);
+			expect(mockFetch.mock.calls[4]).toEqual([
+				"https://slack.com/api/files.completeUploadExternal",
+				{
+					method: "POST",
+					headers: {
+						Authorization: "Bearer xoxb-secret-token",
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						files: [
+							{ id: "F1", title: "Run report" },
+							{ id: "F2", title: "Run notes" },
+						],
+						channel_id: "C123",
+						thread_ts: "1704110400.000100",
+					}),
+				},
+			]);
+		});
+
+		it("includes a validated initial comment only when the caller supplies one", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url: "https://files.slack.com/upload/F1?ticket=private-one",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true }) });
+
+			await service.uploadFilesToThread({
+				...uploadParams,
+				files: [uploadParams.files[0]],
+				initialComment: "Here is the requested report.",
+			});
+
+			expect(JSON.parse(String(mockFetch.mock.calls[2]?.[1]?.body))).toEqual({
+				files: [{ id: "F1", title: "Run report" }],
+				channel_id: "C123",
+				thread_ts: "1704110400.000100",
+				initial_comment: "Here is the requested report.",
+			});
+		});
+
+		it.each([
+			[
+				"URL endpoint HTTP failure",
+				{
+					ok: false,
+					status: 500,
+					statusText: "Server Error",
+					text: async () => "private failure",
+				},
+			],
+			[
+				"URL endpoint body failure",
+				{ ok: true, json: async () => ({ ok: false, error: "invalid_auth" }) },
+			],
+		])("rejects a %s without exposing credentials", async (_name, response) => {
+			mockFetch.mockResolvedValueOnce(response);
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toMatch(
+				/file upload URL request failed|Slack API error during file upload URL request/,
+			);
+			expect(error).not.toMatch(/xoxb-secret-token|private failure/);
+		});
+
+		it("does not expose a secret-shaped URL-request body error", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: false, error: "xoxb-leaked-from-slack" }),
+			});
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toContain(
+				"[SlackMessageService] Slack API error during file upload URL request",
+			);
+			expect(error).not.toContain("xoxb-leaked-from-slack");
+		});
+
+		it.each([
+			"http://files.slack.com/upload/private-ticket",
+			"https://evil.example/upload/private-ticket",
+			"https://files.slack.com:444/upload/private-ticket",
+			"not a URL with private-ticket",
+		])("rejects unsafe upload URLs without calling them", async (upload_url) => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: true, file_id: "F1", upload_url }),
+			});
+
+			await expect(
+				service.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				}),
+			).rejects.toThrow("[SlackMessageService] Unsafe Slack file upload URL");
+			expect(mockFetch).toHaveBeenCalledTimes(1);
+		});
+
+		it.each([
+			["redirect", { ok: false, status: 302, statusText: "Found" }],
+			[
+				"transfer failure",
+				{ ok: false, status: 500, statusText: "Server Error" },
+			],
+		])("rejects raw upload %s without completing the batch", async (_name, rawResponse) => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url:
+							"https://files.slack.com/upload/F1?ticket=private-ticket",
+					}),
+				})
+				.mockResolvedValueOnce(rawResponse);
+
+			await expect(
+				service.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				}),
+			).rejects.toThrow(
+				"[SlackMessageService] Slack file upload transfer failed",
+			);
+			expect(mockFetch).toHaveBeenCalledTimes(2);
+		});
+
+		it("rejects raw upload timeouts without leaking the one-time URL", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url:
+							"https://files.slack.com/upload/F1?ticket=private-timeout",
+					}),
+				})
+				.mockRejectedValueOnce(new DOMException("aborted", "AbortError"));
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toContain(
+				"[SlackMessageService] Slack file upload transfer timed out",
+			);
+			expect(error).not.toMatch(/private-timeout|xoxb-secret-token/);
+		});
+
+		it.each([
+			["HTTP failure", { ok: false, status: 500, statusText: "Server Error" }],
+			[
+				"body failure",
+				{
+					ok: true,
+					json: async () => ({ ok: false, error: "channel_not_found" }),
+				},
+			],
+		])("rejects completion %s after successful transfers", async (_name, completionResponse) => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url:
+							"https://files.slack.com/upload/F1?ticket=private-ticket",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce(completionResponse);
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toMatch(
+				/file upload completion failed|Slack API error during file upload completion/,
+			);
+		});
+
+		it("does not expose a one-time URL-shaped completion body error", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url:
+							"https://files.slack.com/upload/F1?ticket=private-ticket",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: false,
+						error: "https://files.slack.com/upload/F1?ticket=leaked-from-slack",
+					}),
+				});
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toContain(
+				"[SlackMessageService] Slack API error during file upload completion",
+			);
+			expect(error).not.toContain("ticket=leaked-from-slack");
 		});
 	});
 

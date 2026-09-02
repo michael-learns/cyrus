@@ -95,13 +95,17 @@ export const LINEAR_DEFAULT_ALLOWED_TOOLS = [
  * Slack sessions are transient — no PRs opened, no worktree checkouts.
  * The default list grants read-only access to repository sources (so Cyrus
  * can answer "look at the code in repo X" questions) plus the standard
- * planning/task tools, but no Edit/Write/general Bash. Narrow Bash patterns
- * allow refreshing configured repositories and using the GitHub CLI's pull
- * request command family. Other `gh` namespaces remain unavailable.
+ * planning/task tools. Bare Write/Edit are scoped to the per-thread workspace
+ * by RunnerConfigBuilder, and bare Bash is available only behind its mandatory
+ * fail-closed sandbox. Narrow Bash patterns also allow refreshing configured
+ * repositories and using the GitHub CLI's pull request command family.
  */
 export const SLACK_DEFAULT_ALLOWED_TOOLS = [
 	// Read access to configured repository paths
 	"Read",
+	"Write",
+	"Edit",
+	"Bash",
 	"Bash(git -C * pull)",
 	"Bash(gh pr:*)",
 

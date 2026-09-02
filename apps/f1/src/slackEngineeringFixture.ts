@@ -9,11 +9,16 @@ export interface SlackEngineeringFixtureLink {
 	url: string;
 }
 
-export interface SlackEngineeringFixtureImage {
+export interface SlackEngineeringFixtureFile {
 	id: string;
 	name: string;
-	mimeType: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+	mimeType: string;
 	base64: string;
+}
+
+export interface SlackEngineeringFixtureImage
+	extends SlackEngineeringFixtureFile {
+	mimeType: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
 }
 
 export interface SlackEngineeringFixtureMessage {
@@ -21,6 +26,7 @@ export interface SlackEngineeringFixtureMessage {
 	user: string;
 	text: string;
 	links?: SlackEngineeringFixtureLink[];
+	files?: SlackEngineeringFixtureFile[];
 	images?: SlackEngineeringFixtureImage[];
 	attachments?: SlackMessageAttachment[];
 }
@@ -55,12 +61,12 @@ export function normalizeSlackEngineeringFixture(
 			throw new Error("history message timestamp must not be after kickoffTs");
 		}
 		const links = message.links ?? [];
-		const images = message.images ?? [];
+		const fixtureFiles = [...(message.files ?? []), ...(message.images ?? [])];
 		const attachments = message.attachments ?? [];
-		for (const image of images) {
-			files.set(image.id, {
-				bytes: Buffer.from(image.base64, "base64"),
-				mimeType: image.mimeType,
+		for (const file of fixtureFiles) {
+			files.set(file.id, {
+				bytes: Buffer.from(file.base64, "base64"),
+				mimeType: file.mimeType,
 			});
 		}
 		return {
@@ -84,13 +90,13 @@ export function normalizeSlackEngineeringFixture(
 					},
 				],
 			}),
-			...(images.length > 0 && {
-				files: images.map((image) => ({
-					id: image.id,
-					name: image.name,
-					mimetype: image.mimeType,
-					size: files.get(image.id)!.bytes.byteLength,
-					url_private_download: `https://files.slack.com/f1/${encodeURIComponent(image.id)}`,
+			...(fixtureFiles.length > 0 && {
+				files: fixtureFiles.map((file) => ({
+					id: file.id,
+					name: file.name,
+					mimetype: file.mimeType,
+					size: files.get(file.id)!.bytes.byteLength,
+					url_private_download: `https://files.slack.com/f1/${encodeURIComponent(file.id)}`,
 				})),
 			}),
 			...(attachments.length > 0 && { attachments }),

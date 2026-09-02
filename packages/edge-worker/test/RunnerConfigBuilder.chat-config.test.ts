@@ -18,9 +18,10 @@ const silentLogger: ILogger = {
 function makeBuilder(
 	buildMcpConfig = () => ({}),
 	hasDatabaseAuthorizationForConfig?: () => boolean,
+	chatAllowedTools: string[] = ["Read(**)"],
 ): RunnerConfigBuilder {
 	const chatToolResolver: IChatToolResolver = {
-		buildChatAllowedTools: () => ["Read(**)"],
+		buildChatAllowedTools: () => chatAllowedTools,
 	};
 	const mcpConfigProvider: IMcpConfigProvider = {
 		buildMcpConfig,
@@ -40,6 +41,113 @@ function makeBuilder(
 }
 
 describe("RunnerConfigBuilder.buildChatConfig", () => {
+	it("scopes only bare Write and Edit tools to the absolute chat workspace", () => {
+		const builder = makeBuilder(() => ({}), undefined, [
+			"Read",
+			"Write",
+			"Edit",
+			"Bash",
+			"Write(//custom/output/**)",
+			"Edit(//custom/source/**)",
+		]);
+
+		const config = builder.buildChatConfig({
+			workspacePath: "/var/cyrus/slack-workspaces/C1_1700",
+			workspaceName: "slack-thread-x",
+			systemPrompt: "test",
+			sessionId: "sess-1",
+			cyrusHome: "/var/cyrus",
+			platformName: "slack",
+			logger: silentLogger,
+			onMessage: () => {},
+			onError: () => {},
+		});
+
+		expect(config.allowedTools).toEqual([
+			"Read",
+			"Write(//var/cyrus/slack-workspaces/C1_1700/**)",
+			"Edit(//var/cyrus/slack-workspaces/C1_1700/**)",
+			"Bash",
+			"Write(//custom/output/**)",
+			"Edit(//custom/source/**)",
+		]);
+		expect(config.allowedTools).not.toContain("Write");
+		expect(config.allowedTools).not.toContain("Edit");
+	});
+
+	it("enforces a fail-closed chat sandbox while preserving egress network settings", () => {
+		const builder = makeBuilder(() => ({}), undefined, ["Read", "Bash"]);
+		const config = builder.buildChatConfig({
+			workspacePath: "/var/cyrus/slack-workspaces/C1_1700",
+			workspaceName: "slack-thread-x",
+			systemPrompt: "test",
+			sessionId: "sess-1",
+			cyrusHome: "/var/cyrus",
+			platformName: "slack",
+			repositoryPaths: ["/repos/one", "/repos/two", "/repos/one"],
+			sandboxSettings: {
+				enabled: true,
+				network: { httpProxyPort: 43110, socksProxyPort: 43111 },
+				filesystem: {
+					allowRead: ["/should/not/escape"],
+					allowWrite: ["/should/not/be/writable"],
+				},
+			} as any,
+			logger: silentLogger,
+			onMessage: () => {},
+			onError: () => {},
+		});
+
+		expect(config.sandbox).toEqual({
+			enabled: true,
+			failIfUnavailable: true,
+			autoAllowBashIfSandboxed: true,
+			allowUnsandboxedCommands: false,
+			network: { httpProxyPort: 43110, socksProxyPort: 43111 },
+			filesystem: {
+				allowRead: [
+					"/var/cyrus/slack-workspaces/C1_1700",
+					"/var/cyrus/slack-memory",
+					"/repos/one",
+					"/repos/two",
+				],
+				denyRead: ["~/"],
+				allowWrite: ["/var/cyrus/slack-workspaces/C1_1700"],
+			},
+		});
+	});
+
+	it("enables the mandatory sandbox even when no egress proxy is configured", () => {
+		const config = makeBuilder(() => ({}), undefined, ["Bash"]).buildChatConfig(
+			{
+				workspacePath: "/tmp/slack-workspace",
+				workspaceName: undefined,
+				systemPrompt: "test",
+				sessionId: "sess-1",
+				cyrusHome: "/tmp/cyrus-home-test",
+				platformName: "slack",
+				logger: silentLogger,
+				onMessage: () => {},
+				onError: () => {},
+			},
+		);
+
+		expect(config.sandbox).toEqual({
+			enabled: true,
+			failIfUnavailable: true,
+			autoAllowBashIfSandboxed: true,
+			allowUnsandboxedCommands: false,
+			filesystem: {
+				allowRead: [
+					"/tmp/slack-workspace",
+					"/tmp/cyrus-home-test/slack-memory",
+				],
+				denyRead: ["~/"],
+				allowWrite: ["/tmp/slack-workspace"],
+			},
+		});
+	});
+
 	it("loads cyrus-tools for GitHub-only chat sessions without a Linear workspace", () => {
 		const buildMcpConfig = vi.fn(() => ({
 			"cyrus-tools": { type: "http" as const, url: "http://localhost/mcp" },

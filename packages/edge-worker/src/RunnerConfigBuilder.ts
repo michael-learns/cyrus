@@ -87,6 +87,10 @@ export interface ChatRunnerConfigInput {
 	repository?: RepositoryConfig;
 	/** Repository paths the chat session can read */
 	repositoryPaths?: string[];
+	/** Live egress settings merged into the mandatory fail-closed chat sandbox. */
+	sandboxSettings?: SandboxSettings;
+	/** CA bundle used by subprocesses routed through the egress proxy. */
+	egressCaCertPath?: string;
 	/**
 	 * Filesystem paths to custom-integration `.mcp.json` files to load for
 	 * this chat session (sourced from `EdgeWorkerConfig.slackMcpConfigs` for
@@ -249,10 +253,13 @@ export class RunnerConfigBuilder {
 		);
 
 		const mcpConfigKeys = mcpConfig ? Object.keys(mcpConfig) : undefined;
-		const allowedTools = this.chatToolResolver.buildChatAllowedTools(
-			mcpConfigKeys,
-			userMcpTools,
-		);
+		const allowedTools = this.chatToolResolver
+			.buildChatAllowedTools(mcpConfigKeys, userMcpTools)
+			.map((tool) =>
+				tool === "Write" || tool === "Edit"
+					? `${tool}(/${input.workspacePath}/**)`
+					: tool,
+			);
 
 		const repositoryPaths = Array.from(
 			new Set((input.repositoryPaths ?? []).filter(Boolean)),
@@ -267,19 +274,37 @@ export class RunnerConfigBuilder {
 			input.cyrusHome,
 			`${input.platformName}-memory`,
 		);
+		const readableDirectories = [
+			input.workspacePath,
+			autoMemoryDirectory,
+			...repositoryPaths,
+		];
+		const sandbox: SandboxSettings = {
+			...input.sandboxSettings,
+			enabled: true,
+			failIfUnavailable: true,
+			autoAllowBashIfSandboxed: true,
+			allowUnsandboxedCommands: false,
+			filesystem: {
+				...input.sandboxSettings?.filesystem,
+				allowRead: readableDirectories,
+				denyRead: ["~/"],
+				allowWrite: [input.workspacePath],
+			},
+		};
 
-		return {
+		const config: AgentRunnerConfig & { sandbox: SandboxSettings } = {
 			workingDirectory: input.workspacePath,
 			allowedTools,
 			disallowedTools: [] as string[],
-			allowedDirectories: [
-				input.workspacePath,
-				autoMemoryDirectory,
-				...repositoryPaths,
-			],
+			allowedDirectories: readableDirectories,
 			workspaceName: input.workspaceName,
 			cyrusHome: input.cyrusHome,
 			autoMemoryDirectory,
+			sandbox,
+			...(input.egressCaCertPath && {
+				additionalEnv: this.buildEgressEnvironment(input.egressCaCertPath),
+			}),
 			appendSystemPrompt: appendCloudRuntimeAddendum(
 				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
 			),
@@ -301,6 +326,7 @@ export class RunnerConfigBuilder {
 			onMessage: input.onMessage,
 			onError: input.onError,
 		};
+		return config;
 	}
 
 	/**
@@ -554,28 +580,36 @@ export class RunnerConfigBuilder {
 		}
 
 		if (input.egressCaCertPath) {
-			result.additionalEnv = {
-				// Node.js (SDK, npm, etc.)
-				NODE_EXTRA_CA_CERTS: input.egressCaCertPath,
-				// OpenSSL-based tools (general fallback — also covers Ruby)
-				SSL_CERT_FILE: input.egressCaCertPath,
-				// Git HTTPS operations
-				GIT_SSL_CAINFO: input.egressCaCertPath,
-				// Python requests/pip
-				REQUESTS_CA_BUNDLE: input.egressCaCertPath,
-				PIP_CERT: input.egressCaCertPath,
-				// curl (when compiled against OpenSSL, not SecureTransport)
-				CURL_CA_BUNDLE: input.egressCaCertPath,
-				// Rust/Cargo
-				CARGO_HTTP_CAINFO: input.egressCaCertPath,
-				// AWS CLI / boto3
-				AWS_CA_BUNDLE: input.egressCaCertPath,
-				// Deno
-				DENO_CERT: input.egressCaCertPath,
-			};
+			result.additionalEnv = this.buildEgressEnvironment(
+				input.egressCaCertPath,
+			);
 		}
 
 		return result;
+	}
+
+	private buildEgressEnvironment(
+		egressCaCertPath: string,
+	): Record<string, string> {
+		return {
+			// Node.js (SDK, npm, etc.)
+			NODE_EXTRA_CA_CERTS: egressCaCertPath,
+			// OpenSSL-based tools (general fallback — also covers Ruby)
+			SSL_CERT_FILE: egressCaCertPath,
+			// Git HTTPS operations
+			GIT_SSL_CAINFO: egressCaCertPath,
+			// Python requests/pip
+			REQUESTS_CA_BUNDLE: egressCaCertPath,
+			PIP_CERT: egressCaCertPath,
+			// curl (when compiled against OpenSSL, not SecureTransport)
+			CURL_CA_BUNDLE: egressCaCertPath,
+			// Rust/Cargo
+			CARGO_HTTP_CAINFO: egressCaCertPath,
+			// AWS CLI / boto3
+			AWS_CA_BUNDLE: egressCaCertPath,
+			// Deno
+			DENO_CERT: egressCaCertPath,
+		};
 	}
 
 	/**

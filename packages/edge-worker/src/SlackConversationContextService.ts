@@ -7,20 +7,20 @@ import type {
 	SlackMessageAttachment,
 	SlackThreadMessage,
 } from "cyrus-slack-event-transport";
-import { fileTypeFromBuffer } from "file-type";
+import {
+	classifySlackFile,
+	hasSlackMediaSignal,
+	MAX_EMBEDDED_IMAGE_BYTES,
+	MAX_OTHER_FILE_BYTES,
+	MAX_RECEIVED_DOWNLOAD_BYTES,
+	MAX_SLACK_CAPTURE_FILES,
+	SLACK_DOWNLOAD_TIMEOUT_MS,
+	SUPPORTED_SLACK_IMAGES,
+} from "./SlackFilePolicy.js";
 
 const MAX_MESSAGES = 200;
 const MAX_TEXT_CHARS = 100_000;
-const MAX_IMAGES = 20;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const SUPPORTED_IMAGES = new Map([
-	["image/jpeg", "jpg"],
-	["image/png", "png"],
-	["image/gif", "gif"],
-	["image/webp", "webp"],
-]);
+const MAX_IMAGES = MAX_SLACK_CAPTURE_FILES;
 
 export interface SlackConversationLink {
 	label: string;
@@ -33,6 +33,7 @@ export interface SlackCapturedFile {
 	mimeType?: string;
 	size?: number;
 	status: "downloaded" | "skipped" | "failed";
+	directImageEligible: boolean;
 	reason?: string;
 	localPath?: string;
 }
@@ -52,6 +53,7 @@ export interface SlackConversationTruncation {
 		| "messages"
 		| "text"
 		| "images"
+		| "files"
 		| "image_size"
 		| "total_downloads"
 		| "unsupported_file";
@@ -69,11 +71,12 @@ export interface SlackConversationManifest {
 		permalink: string;
 	};
 	limits: {
-		messages: 200;
-		textCharacters: 100000;
-		images: 20;
-		imageBytes: 10485760;
-		totalDownloadBytes: 52428800;
+		messages: number;
+		textCharacters: number;
+		images: number;
+		imageBytes: number;
+		otherFileBytes: number;
+		totalDownloadBytes: number;
 	};
 	messages: SlackConversationMessage[];
 	truncations: SlackConversationTruncation[];
@@ -87,6 +90,8 @@ export interface SlackConversationCaptureInput {
 	threadPermalink: string;
 	token: string;
 	messages: SlackThreadMessage[];
+	captureRoot?: string;
+	eventId?: string;
 }
 
 interface CaptureLogger {
@@ -150,6 +155,7 @@ function messageTextFootprint(message: SlackConversationMessage): number {
 				file.name.length +
 				(file.mimeType?.length ?? 0) +
 				file.status.length +
+				String(file.directImageEligible).length +
 				(file.reason?.length ?? 0) +
 				(file.localPath?.length ?? 0),
 			0,
@@ -205,6 +211,7 @@ function fitMessageToTextBudget(
 			...(file.mimeType !== undefined && { mimeType: take(file.mimeType) }),
 			...(file.size !== undefined && { size: file.size }),
 			status: file.status,
+			directImageEligible: file.directImageEligible,
 			...(file.reason !== undefined && { reason: take(file.reason) }),
 			...(file.localPath !== undefined && { localPath: take(file.localPath) }),
 		});
@@ -234,10 +241,10 @@ async function readBodyWithinLimit(
 			const available = limit - bytesReceived;
 			if (chunk.length > available) {
 				if (available > 0) chunks.push(chunk.subarray(0, available));
-				bytesReceived = limit;
+				bytesReceived += chunk.length;
 				await reader.cancel().catch(() => undefined);
 				return {
-					buffer: Buffer.concat(chunks, bytesReceived),
+					buffer: Buffer.concat(chunks),
 					bytesReceived,
 					exceeded: true,
 				};
@@ -432,7 +439,7 @@ export class SlackConversationContextService {
 		this.fetchImpl = options.fetch ?? fetch;
 		this.logger = options.logger;
 		this.requestTimeoutMs =
-			options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+			options.requestTimeoutMs ?? SLACK_DOWNLOAD_TIMEOUT_MS;
 	}
 
 	async capture(input: SlackConversationCaptureInput): Promise<{
@@ -466,28 +473,49 @@ export class SlackConversationContextService {
 			)
 			.digest("hex")
 			.slice(0, 24);
-		const directory = join(this.cyrusHome, "slack-context", key);
-		const imagesDirectory = join(directory, "images");
+		const directory =
+			input.captureRoot ?? join(this.cyrusHome, "slack-context", key);
+		const safeEvent =
+			redact(input.eventId ?? key, input.token)
+				.replace(/[^a-zA-Z0-9_-]+/g, "-")
+				.replace(/^-+|-+$/g, "") || "event";
+		const imagesRelativeDirectory = input.captureRoot
+			? `images/${safeEvent}`
+			: "images";
+		const imagesDirectory = join(directory, imagesRelativeDirectory);
+		const attachmentsDirectory = join(directory, "attachments", safeEvent);
 		await mkdir(imagesDirectory, { recursive: true, mode: 0o700 });
+		await mkdir(attachmentsDirectory, { recursive: true, mode: 0o700 });
 
 		let imageCount = 0;
 		let receivedBytes = 0;
+		let fileCount = 0;
 		for (const message of normalized) {
 			for (let index = 0; index < message.files.length; index++) {
 				const original = selected.find((item) => item.ts === message.ts)
 					?.files?.[index];
 				if (!original) continue;
-				const result = await this.captureFile(
-					original,
-					input.token,
-					imagesDirectory,
-					imageCount,
-					receivedBytes,
-				);
+				const result =
+					fileCount >= MAX_SLACK_CAPTURE_FILES
+						? {
+								file: { ...message.files[index]!, reason: "file_limit" },
+								bytesReceived: 0,
+							}
+						: await this.captureFile(
+								original,
+								input.token,
+								imagesDirectory,
+								imagesRelativeDirectory,
+								attachmentsDirectory,
+								imageCount,
+								receivedBytes,
+								fileCount,
+							);
+				fileCount++;
 				message.files[index] = result.file;
 				if (
 					original.mimetype &&
-					SUPPORTED_IMAGES.has(original.mimetype) &&
+					SUPPORTED_SLACK_IMAGES.has(original.mimetype) &&
 					result.file.reason !== "image_limit" &&
 					result.file.reason !== "file_too_large" &&
 					result.file.reason !== "total_download_limit"
@@ -501,17 +529,23 @@ export class SlackConversationContextService {
 						omitted: 1,
 						detail: "image omitted after 20-image limit",
 					});
+				} else if (result.file.reason === "file_limit") {
+					truncations.push({
+						kind: "files",
+						omitted: 1,
+						detail: "file omitted after 20-file limit",
+					});
 				} else if (result.file.reason === "file_too_large") {
 					truncations.push({
 						kind: "image_size",
 						omitted: 1,
-						detail: "image exceeded 10 MiB limit",
+						detail: "file exceeded its download-size limit",
 					});
 				} else if (result.file.reason === "total_download_limit") {
 					truncations.push({
 						kind: "total_downloads",
 						omitted: 1,
-						detail: "image omitted after 50 MiB total-download limit",
+						detail: "file omitted after 100 MiB total-download limit",
 					});
 				} else if (result.file.reason === "unsupported_type") {
 					truncations.push({
@@ -537,8 +571,9 @@ export class SlackConversationContextService {
 				messages: 200,
 				textCharacters: 100000,
 				images: 20,
-				imageBytes: 10485760,
-				totalDownloadBytes: 52428800,
+				imageBytes: MAX_EMBEDDED_IMAGE_BYTES,
+				otherFileBytes: MAX_OTHER_FILE_BYTES,
+				totalDownloadBytes: MAX_RECEIVED_DOWNLOAD_BYTES,
 			},
 			messages: normalized,
 			truncations,
@@ -586,6 +621,7 @@ export class SlackConversationContextService {
 				...(file.mimetype && { mimeType: redact(file.mimetype, token) }),
 				...(typeof file.size === "number" && { size: file.size }),
 				status: "skipped" as const,
+				directImageEligible: false,
 				reason: "not_processed",
 			})),
 		};
@@ -645,8 +681,11 @@ export class SlackConversationContextService {
 		file: SlackFile,
 		token: string,
 		imagesDirectory: string,
+		imagesRelativeDirectory: string,
+		attachmentsDirectory: string,
 		imageCount: number,
 		receivedBytes: number,
+		fileCount: number,
 	): Promise<{ file: SlackCapturedFile; bytesReceived: number }> {
 		const result: SlackCapturedFile = {
 			id: redact(file.id, token),
@@ -654,25 +693,37 @@ export class SlackConversationContextService {
 			...(file.mimetype && { mimeType: redact(file.mimetype, token) }),
 			...(typeof file.size === "number" && { size: file.size }),
 			status: "skipped",
+			directImageEligible: false,
 		};
-		if (!file.mimetype || !SUPPORTED_IMAGES.has(file.mimetype))
+		if (
+			hasSlackMediaSignal({
+				declaredMime: file.mimetype,
+				name: file.name || file.id,
+			})
+		)
 			return {
-				file: { ...result, reason: "unsupported_type" },
+				file: { ...result, reason: "media_type" },
 				bytesReceived: 0,
 			};
-		if (imageCount >= MAX_IMAGES)
+		const declaredImage = Boolean(
+			file.mimetype && SUPPORTED_SLACK_IMAGES.has(file.mimetype),
+		);
+		if (declaredImage && imageCount >= MAX_IMAGES)
 			return { file: { ...result, reason: "image_limit" }, bytesReceived: 0 };
-		if (file.size && file.size > MAX_IMAGE_BYTES)
+		const fileLimit = declaredImage
+			? MAX_EMBEDDED_IMAGE_BYTES
+			: MAX_OTHER_FILE_BYTES;
+		if (file.size && file.size > fileLimit)
 			return {
 				file: { ...result, reason: "file_too_large" },
 				bytesReceived: 0,
 			};
-		if (file.size && receivedBytes + file.size > MAX_DOWNLOAD_BYTES)
+		if (file.size && receivedBytes + file.size > MAX_RECEIVED_DOWNLOAD_BYTES)
 			return {
 				file: { ...result, reason: "total_download_limit" },
 				bytesReceived: 0,
 			};
-		if (receivedBytes >= MAX_DOWNLOAD_BYTES)
+		if (receivedBytes >= MAX_RECEIVED_DOWNLOAD_BYTES)
 			return {
 				file: { ...result, reason: "total_download_limit" },
 				bytesReceived: 0,
@@ -742,22 +793,22 @@ export class SlackConversationContextService {
 					bytesReceived: 0,
 				};
 			const contentLength = Number(response.headers.get("content-length") || 0);
-			if (contentLength > MAX_IMAGE_BYTES) {
+			if (contentLength > fileLimit) {
 				await response.body?.cancel().catch(() => undefined);
 				return {
 					file: { ...result, reason: "file_too_large" },
 					bytesReceived: 0,
 				};
 			}
-			if (receivedBytes + contentLength > MAX_DOWNLOAD_BYTES) {
+			if (receivedBytes + contentLength > MAX_RECEIVED_DOWNLOAD_BYTES) {
 				await response.body?.cancel().catch(() => undefined);
 				return {
 					file: { ...result, reason: "total_download_limit" },
 					bytesReceived: 0,
 				};
 			}
-			const remainingTotal = MAX_DOWNLOAD_BYTES - receivedBytes;
-			const streamLimit = Math.min(MAX_IMAGE_BYTES, remainingTotal);
+			const remainingTotal = MAX_RECEIVED_DOWNLOAD_BYTES - receivedBytes;
+			const streamLimit = Math.min(fileLimit, remainingTotal);
 			const body = await readBodyWithinLimit(response.body, streamLimit);
 			candidateBytesReceived = body.bytesReceived;
 			if (body.error)
@@ -767,7 +818,7 @@ export class SlackConversationContextService {
 				};
 			if (body.exceeded) {
 				const reason =
-					remainingTotal < MAX_IMAGE_BYTES
+					remainingTotal < fileLimit
 						? "total_download_limit"
 						: "file_too_large";
 				return {
@@ -776,31 +827,56 @@ export class SlackConversationContextService {
 				};
 			}
 			const bytes = body.buffer;
-			const detected = await fileTypeFromBuffer(bytes);
 			const headerMime = response.headers
 				.get("content-type")
 				?.split(";", 1)[0]
 				?.trim()
 				.toLowerCase();
+			const classified = await classifySlackFile({
+				declaredMime: file.mimetype,
+				responseMime: headerMime,
+				name: file.name || file.id,
+				bytes,
+			});
+			if (!classified.allowed) {
+				return {
+					file: { ...result, reason: "media_type" },
+					bytesReceived: body.bytesReceived,
+				};
+			}
 			if (
-				!detected ||
-				detected.mime !== file.mimetype ||
-				headerMime !== detected.mime ||
-				!SUPPORTED_IMAGES.has(detected.mime)
+				declaredImage &&
+				(!classified.detectedMime ||
+					classified.detectedMime !== file.mimetype ||
+					headerMime !== classified.detectedMime ||
+					!classified.isImage)
 			) {
 				return {
 					file: { ...result, reason: "mime_mismatch" },
 					bytesReceived: body.bytesReceived,
 				};
 			}
-			const localName = `image-${String(imageCount + 1).padStart(3, "0")}.${SUPPORTED_IMAGES.get(detected.mime)}`;
-			await writeFile(join(imagesDirectory, localName), bytes, { mode: 0o600 });
+			const isImage = declaredImage && classified.isImage;
+			const effectiveMime =
+				classified.detectedMime ?? headerMime ?? file.mimetype?.toLowerCase();
+			const localName = isImage
+				? `image-${String(imageCount + 1).padStart(3, "0")}.${SUPPORTED_SLACK_IMAGES.get(classified.detectedMime!)}`
+				: `file-${String(fileCount + 1).padStart(3, "0")}.${classified.extension.replace(/[^a-z0-9]/gi, "") || "bin"}`;
+			await writeFile(
+				join(isImage ? imagesDirectory : attachmentsDirectory, localName),
+				bytes,
+				{ mode: 0o600 },
+			);
 			return {
 				file: {
 					...result,
+					...(effectiveMime && { mimeType: effectiveMime }),
 					status: "downloaded",
+					directImageEligible: isImage,
 					reason: undefined,
-					localPath: `images/${localName}`,
+					localPath: isImage
+						? `${imagesRelativeDirectory}/${localName}`
+						: `attachments/${attachmentsDirectory.split("/").at(-1)}/${localName}`,
 				},
 				bytesReceived: body.bytesReceived,
 			};

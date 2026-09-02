@@ -103,4 +103,55 @@ describe("normalizeSlackEngineeringFixture", () => {
 			}),
 		).toThrow("history message timestamp must not be after kickoffTs");
 	});
+
+	it("turns generic files into production-shaped metadata without changing image fixtures", () => {
+		const pdf = Buffer.from("%PDF-1.4\n% F1 exact PDF bytes\n%%EOF\n");
+		const csv = Buffer.from("name,value\nalpha,7\n", "utf8");
+		const normalized = normalizeSlackEngineeringFixture({
+			channel: "C_FILES",
+			user: "U_REQUESTER",
+			kickoffTs: "1755660002.000300",
+			text: "Read these files",
+			history: [
+				{
+					ts: "1755660002.000300",
+					user: "U_REQUESTER",
+					text: "Read these files",
+					files: [
+						{
+							id: "F_PDF",
+							name: "requirements.pdf",
+							mimeType: "application/pdf",
+							base64: pdf.toString("base64"),
+						},
+						{
+							id: "F_CSV",
+							name: "records.csv",
+							mimeType: "text/csv",
+							base64: csv.toString("base64"),
+						},
+					],
+				},
+			],
+		});
+
+		expect(normalized.event.payload.files).toEqual([
+			{
+				id: "F_PDF",
+				name: "requirements.pdf",
+				mimetype: "application/pdf",
+				size: pdf.byteLength,
+				url_private_download: "https://files.slack.com/f1/F_PDF",
+			},
+			{
+				id: "F_CSV",
+				name: "records.csv",
+				mimetype: "text/csv",
+				size: csv.byteLength,
+				url_private_download: "https://files.slack.com/f1/F_CSV",
+			},
+		]);
+		expect(normalized.files.get("F_PDF")?.bytes).toEqual(pdf);
+		expect(normalized.files.get("F_CSV")?.bytes).toEqual(csv);
+	});
 });

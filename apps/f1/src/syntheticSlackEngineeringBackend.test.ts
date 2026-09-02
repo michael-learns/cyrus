@@ -77,6 +77,125 @@ describe("SyntheticSlackEngineeringBackend", () => {
 		]);
 	});
 
+	it("emulates authenticated private downloads and one-use external upload tickets", async () => {
+		const backend = new SyntheticSlackEngineeringBackend();
+		backend.setFile("F_INPUT", Buffer.from("exact input"), "text/plain");
+
+		const denied = await backend.fetch("https://files.slack.com/f1/F_INPUT");
+		expect(denied.status).toBe(401);
+		const downloaded = await backend.fetch(
+			"https://files.slack.com/f1/F_INPUT",
+			{ headers: { Authorization: "Bearer xoxb-f1-synthetic" } },
+		);
+		expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(
+			Buffer.from("exact input"),
+		);
+
+		for (const authorization of [undefined, "Bearer xoxb-wrong"]) {
+			const response = await backend.fetch(
+				"https://slack.com/api/files.getUploadURLExternal",
+				{
+					method: "POST",
+					headers: {
+						...(authorization && { Authorization: authorization }),
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({ filename: "forbidden.csv", length: 7 }),
+				},
+			);
+			expect(response.status).toBe(401);
+			expect(await response.json()).toEqual({
+				ok: false,
+				error: "not_authed",
+			});
+		}
+
+		const ticketResponse = await backend.fetch(
+			"https://slack.com/api/files.getUploadURLExternal",
+			{
+				method: "POST",
+				headers: {
+					Authorization: "Bearer xoxb-f1-synthetic",
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ filename: "result.csv", length: 7 }),
+			},
+		);
+		const ticket = (await ticketResponse.json()) as {
+			file_id: string;
+			upload_url: string;
+		};
+		const bytes = Buffer.from("a,b\n1,2");
+		const credentialLeak = await backend.fetch(ticket.upload_url, {
+			method: "POST",
+			headers: { Authorization: "Bearer xoxb-f1-synthetic" },
+			body: bytes,
+			redirect: "manual",
+		});
+		expect(credentialLeak.status).toBe(400);
+		expect(backend.activeUploadTicketCount).toBe(1);
+		const redirectingClient = await backend.fetch(ticket.upload_url, {
+			method: "POST",
+			headers: {},
+			body: bytes,
+		});
+		expect(redirectingClient.status).toBe(400);
+		expect(backend.activeUploadTicketCount).toBe(1);
+		const uploaded = await backend.fetch(ticket.upload_url, {
+			method: "POST",
+			headers: {},
+			body: bytes,
+			redirect: "manual",
+		});
+		expect(uploaded.status).toBe(200);
+		expect(
+			await backend.fetch(ticket.upload_url, {
+				method: "POST",
+				headers: {},
+				body: bytes,
+				redirect: "manual",
+			}),
+		).toMatchObject({ status: 410 });
+
+		const completion = await backend.fetch(
+			"https://slack.com/api/files.completeUploadExternal",
+			{
+				method: "POST",
+				headers: {
+					Authorization: "Bearer xoxb-f1-synthetic",
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					files: [{ id: ticket.file_id, title: "Result" }],
+					channel_id: "C_ORIGINAL",
+					thread_ts: "100.1",
+				}),
+			},
+		);
+		expect(await completion.json()).toEqual({ ok: true });
+		expect(backend.getUploadedFile(ticket.file_id)).toEqual({
+			filename: "result.csv",
+			bytes,
+		});
+		expect(backend.snapshot().fileDeliveries).toEqual([
+			{
+				channelId: "C_ORIGINAL",
+				threadTs: "100.1",
+				files: [
+					{
+						id: ticket.file_id,
+						filename: "result.csv",
+						title: "Result",
+						byteLength: 7,
+					},
+				],
+			},
+		]);
+		expect(backend.activeUploadTicketCount).toBe(0);
+		expect(JSON.stringify(backend.snapshot())).not.toContain("upload_url");
+		expect(JSON.stringify(backend.snapshot())).not.toContain("xoxb-");
+	});
+
 	it.each([
 		{
 			name: "marker only",
