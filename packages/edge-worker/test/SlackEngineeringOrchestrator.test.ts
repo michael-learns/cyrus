@@ -98,6 +98,90 @@ describe("SlackEngineeringOrchestrator", () => {
 		);
 	});
 
+	it("persists and starts work from a selected existing issue without posting a new issue", async () => {
+		const { service, saves, createIssue, startWorkItem } = setup();
+		startWorkItem.mockImplementation(async () => {
+			expect(saves.at(-1)?.[0]).toMatchObject({
+				status: "starting",
+				issueNumber: 17,
+				issueUrl: "https://github.com/acme/api/issues/17",
+				issueCreationState: "created",
+				issueReused: true,
+			});
+			return {
+				workItemId: "work-17",
+				sessionId: "session-17",
+				status: "starting",
+			};
+		});
+
+		const receipt = await service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "Fix checkout",
+			summary: "Checkout fails.",
+			existingIssue: {
+				number: 17,
+				url: "https://github.com/acme/api/issues/17",
+				wasClosed: false,
+			},
+		});
+
+		expect(createIssue).not.toHaveBeenCalled();
+		expect(startWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ issueNumber: 17 }),
+		);
+		expect(receipt).toMatchObject({
+			issueNumber: 17,
+			issueCreationState: "created",
+			issueReused: true,
+		});
+	});
+
+	it("retries a durably persisted existing issue without requiring it in the retry input", async () => {
+		const first = setup();
+		let writes = 0;
+		(first.service as any).deps.persist = vi
+			.fn()
+			.mockImplementation(async (receipts: SlackEngineeringReceipt[]) => {
+				first.saves.push(receipts.map((item) => ({ ...item })));
+				writes++;
+				if (writes === 2) throw new Error("starting write interrupted");
+			});
+
+		await expect(
+			first.service.createAndStart(source, {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+				existingIssue: {
+					number: 17,
+					url: "https://github.com/acme/api/issues/17",
+					wasClosed: false,
+				},
+			}),
+		).rejects.toThrow("starting write interrupted");
+		const persisted = first.saves.at(-1)!;
+		expect(persisted[0]).toMatchObject({
+			issueNumber: 17,
+			issueUrl: "https://github.com/acme/api/issues/17",
+			issueCreationState: "created",
+			issueReused: true,
+		});
+
+		const retry = setup(persisted);
+		const receipt = await retry.service.createAndStart(source, {
+			issueRepository: "acme/api",
+			title: "ignored retry title",
+			summary: "ignored retry summary",
+		});
+
+		expect(retry.createIssue).not.toHaveBeenCalled();
+		expect(retry.startWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ issueNumber: 17 }),
+		);
+		expect(receipt.issueReused).toBe(true);
+	});
+
 	it("durably marks a database-sensitive child exactly once", async () => {
 		const { service, saves } = setup();
 		const receipt = await service.createAndStart(source, {

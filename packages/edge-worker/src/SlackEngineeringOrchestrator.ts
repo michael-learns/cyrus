@@ -37,6 +37,7 @@ export interface SlackEngineeringReceipt extends SlackEngineeringSource {
 	issueNumber?: number;
 	issueUrl?: string;
 	issueCreationState?: "not_attempted" | "attempting" | "uncertain" | "created";
+	issueReused?: boolean;
 	workItemId?: string;
 	sessionId?: string;
 	prUrls?: string[];
@@ -50,6 +51,7 @@ export interface SlackEngineeringCreateInput {
 	title: string;
 	summary: string;
 	targetRepositories?: string[];
+	existingIssue?: { number: number; url: string; wasClosed: boolean };
 }
 interface Dependencies {
 	repositories: () => SlackEngineeringRepository[];
@@ -308,7 +310,10 @@ export class SlackEngineeringOrchestrator {
 				title: input.title,
 				summary: input.summary,
 				targetRepositories: Array.from(new Set(targets)),
-				issueCreationState: "not_attempted",
+				issueNumber: input.existingIssue?.number,
+				issueUrl: input.existingIssue?.url,
+				issueCreationState: input.existingIssue ? "created" : "not_attempted",
+				issueReused: input.existingIssue ? true : undefined,
 				contextDirectories: source.contextDirectory
 					? [source.contextDirectory]
 					: [],
