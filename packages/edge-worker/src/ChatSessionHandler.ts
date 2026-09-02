@@ -1,6 +1,10 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { SDKMessage, SdkPluginConfig } from "cyrus-claude-runner";
+import type {
+	SandboxSettings,
+	SDKMessage,
+	SdkPluginConfig,
+} from "cyrus-claude-runner";
 import type {
 	AgentPendingWork,
 	AgentRunnerConfig,
@@ -80,6 +84,7 @@ export interface ChatPlatformAdapter<TEvent> {
 	fetchThreadTurn?(
 		event: TEvent,
 		sinceTs?: string,
+		workspacePath?: string,
 	): Promise<ChatThreadTurnContext | null>;
 
 	/**
@@ -163,6 +168,10 @@ export interface ChatSessionHandlerDeps {
 	 * no custom files load (native MCP servers still run as usual).
 	 */
 	getPlatformMcpConfigOverrides?: () => readonly string[] | undefined;
+	/** Live egress settings to merge into the mandatory chat sandbox. */
+	getSandboxSettings?: () => SandboxSettings | undefined;
+	/** Live CA bundle used by sandboxed chat subprocesses. */
+	getEgressCaCertPath?: () => string | undefined;
 	/** Resolve managed skill plugins and scoped skill names for a chat session. */
 	resolveSkillsConfig?: (input: {
 		repository?: RepositoryConfig;
@@ -667,6 +676,7 @@ export class ChatSessionHandler<TEvent> {
 			context = await this.adapter.fetchThreadTurn(
 				event,
 				session.metadata?.lastContextTs,
+				session.workspace.path,
 			);
 		} catch (error) {
 			this.logger.warn(
@@ -1205,6 +1215,8 @@ export class ChatSessionHandler<TEvent> {
 			repository,
 			repositoryPaths,
 			platformMcpConfigOverrides: this.deps.getPlatformMcpConfigOverrides?.(),
+			sandboxSettings: this.deps.getSandboxSettings?.(),
+			egressCaCertPath: this.deps.getEgressCaCertPath?.(),
 			plugins: skillsConfig.plugins,
 			skills: skillsConfig.skills,
 			logger: sessionLogger,
