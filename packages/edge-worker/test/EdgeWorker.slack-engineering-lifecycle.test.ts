@@ -78,7 +78,187 @@ function setupSlackFollowupCaptureWorker(
 	return { worker, addStreamTurn };
 }
 
+function setupSlackEngineeringCreateWorker(
+	options: {
+		issuesByScan?: unknown[][];
+		currentReceipt?: Record<string, unknown>;
+	} = {},
+) {
+	const receipt = { status: "in_progress", workItemId: "work" };
+	const createAndStart = vi.fn().mockResolvedValue(receipt);
+	const worker: any = Object.create(EdgeWorker.prototype);
+	worker.slackEngineeringOrchestrator = {
+		validateCreateInput: vi.fn().mockReturnValue({
+			primary: { fullName: "acme/api" },
+			targets: ["acme/api"],
+		}),
+		current: vi.fn().mockReturnValue(options.currentReceipt),
+		createAndStart,
+	};
+	worker.chatSessionHandler = {
+		getLatestEventForSession: vi.fn().mockReturnValue({
+			teamId: "T1",
+			payload: {
+				channel: "C1",
+				thread_ts: "100.0",
+				ts: "101.0",
+				user: "U1",
+			},
+		}),
+	};
+	worker.logger = { info: vi.fn() };
+	worker.listSlackEngineeringIssues = vi.fn();
+	for (const issues of options.issuesByScan ?? [[], []]) {
+		worker.listSlackEngineeringIssues.mockResolvedValueOnce(issues);
+	}
+	worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
+		source: { parentSessionId: "parent", kickoffTs: "101.0" },
+		manifest: { directory: "/context/new" },
+	});
+	worker.buildSlackEngineeringContextTurn = vi.fn().mockResolvedValue([]);
+	worker.cleanupSlackContextDirectories = vi.fn();
+	worker.reopenSlackEngineeringIssue = vi.fn(async (_repository, number) => ({
+		number,
+		url: `https://github.com/acme/api/issues/${number}`,
+	}));
+	worker.attachSlackSubscriber = vi.fn();
+	return { worker, createAndStart, receipt };
+}
+
 describe("EdgeWorker Slack engineering lifecycle", () => {
+	it("lists every GitHub issue page and excludes pull requests", async () => {
+		const priorFetch = globalThis.fetch;
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify([
+						{
+							number: 1,
+							title: "Open issue",
+							body: "open body",
+							state: "open",
+							html_url: "https://github.com/acme/api/issues/1",
+						},
+						{
+							number: 2,
+							title: "Pull request",
+							body: "pr body",
+							state: "open",
+							html_url: "https://github.com/acme/api/pull/2",
+							pull_request: {},
+						},
+					]),
+					{
+						status: 200,
+						headers: {
+							link: '<https://api.github.com/repos/acme/api/issues?state=all&per_page=100&page=2>; rel="next", <https://api.github.com/repos/acme/api/issues?state=all&per_page=100&page=2>; rel="last"',
+						},
+					},
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify([
+						{
+							number: 3,
+							title: "Closed issue",
+							body: null,
+							state: "closed",
+							html_url: "https://github.com/acme/api/issues/3",
+						},
+					]),
+					{ status: 200 },
+				),
+			);
+		globalThis.fetch = fetchMock;
+		try {
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("token");
+
+			await expect(
+				worker.listSlackEngineeringIssues("acme/api"),
+			).resolves.toEqual([
+				{
+					number: 1,
+					title: "Open issue",
+					body: "open body",
+					state: "open",
+					url: "https://github.com/acme/api/issues/1",
+				},
+				{
+					number: 3,
+					title: "Closed issue",
+					body: "",
+					state: "closed",
+					url: "https://github.com/acme/api/issues/3",
+				},
+			]);
+			expect(fetchMock.mock.calls[0]![0]).toContain(
+				"/repos/acme/api/issues?state=all&per_page=100",
+			);
+			expect(fetchMock.mock.calls[1]![0]).toBe(
+				"https://api.github.com/repos/acme/api/issues?state=all&per_page=100&page=2",
+			);
+		} finally {
+			globalThis.fetch = priorFetch;
+		}
+	});
+
+	it("fails closed when the GitHub duplicate listing is not successful", async () => {
+		const priorFetch = globalThis.fetch;
+		globalThis.fetch = vi
+			.fn()
+			.mockResolvedValue(new Response("no", { status: 503 }));
+		try {
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("token");
+
+			await expect(
+				worker.listSlackEngineeringIssues("acme/api"),
+			).rejects.toThrow("GitHub Issue duplicate check failed (503)");
+		} finally {
+			globalThis.fetch = priorFetch;
+		}
+	});
+
+	it("reopens a GitHub issue with the authenticated issue update API", async () => {
+		const priorFetch = globalThis.fetch;
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					number: 24,
+					html_url: "https://github.com/acme/api/issues/24",
+				}),
+				{ status: 200 },
+			),
+		);
+		globalThis.fetch = fetchMock;
+		try {
+			const worker: any = Object.create(EdgeWorker.prototype);
+			worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("token");
+
+			await expect(
+				worker.reopenSlackEngineeringIssue("acme/api", 24),
+			).resolves.toEqual({
+				number: 24,
+				url: "https://github.com/acme/api/issues/24",
+			});
+			expect(fetchMock).toHaveBeenCalledWith(
+				"https://api.github.com/repos/acme/api/issues/24",
+				expect.objectContaining({
+					method: "PATCH",
+					body: JSON.stringify({ state: "open" }),
+					headers: expect.objectContaining({
+						Authorization: "Bearer token",
+					}),
+				}),
+			);
+		} finally {
+			globalThis.fetch = priorFetch;
+		}
+	});
+
 	it("recovers by paginated repository issue listing and an exact hidden marker line", async () => {
 		const priorFetch = globalThis.fetch;
 		const marker = "<!-- cyrus-slack-source:exact-source -->";
@@ -408,9 +588,14 @@ Readable files:
 	it("cleans captured create artifacts when strict receipt persistence rejects", async () => {
 		const worker: any = Object.create(EdgeWorker.prototype);
 		worker.slackEngineeringOrchestrator = {
-			validateCreateInput: vi.fn(),
+			validateCreateInput: vi.fn().mockReturnValue({
+				primary: { fullName: "acme/api" },
+				targets: ["acme/api"],
+			}),
+			current: vi.fn(),
 			createAndStart: vi.fn().mockRejectedValue(new Error("disk unavailable")),
 		};
+		worker.listSlackEngineeringIssues = vi.fn().mockResolvedValue([]);
 		worker.captureSlackEngineeringSource = vi.fn().mockResolvedValue({
 			source: { parentSessionId: "parent" },
 			manifest: { directory: "/context/new" },
@@ -430,6 +615,301 @@ Readable files:
 			["/context/new"],
 		);
 	});
+
+	it("automatically reuses an exact open issue without creating another issue", async () => {
+		const duplicate = {
+			number: 17,
+			title: "fix CHECKOUT!",
+			body: "Existing report",
+			state: "open",
+			url: "https://github.com/acme/api/issues/17",
+		};
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[duplicate], [duplicate]],
+		});
+		worker.createSlackEngineeringIssue = vi.fn();
+
+		await worker.createAndStartSlackEngineering("parent", {
+			issueRepository: "acme/api",
+			title: "Fix checkout",
+			summary: "Checkout fails.",
+		});
+
+		expect(createAndStart).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({
+				existingIssue: {
+					number: 17,
+					url: duplicate.url,
+					wasClosed: false,
+				},
+			}),
+			expect.anything(),
+		);
+		expect(worker.createSlackEngineeringIssue).not.toHaveBeenCalled();
+	});
+
+	it("returns closed exact confirmation before capturing Slack context", async () => {
+		const duplicate = {
+			number: 18,
+			title: "Fix checkout",
+			body: "Existing report",
+			state: "closed",
+			url: "https://github.com/acme/api/issues/18",
+		};
+		const { worker } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[duplicate]],
+		});
+
+		await expect(
+			worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			}),
+		).resolves.toEqual({
+			status: "confirmation_required",
+			reason: "closed_exact",
+			issueRepository: "acme/api",
+			candidates: [
+				{
+					number: 18,
+					title: "Fix checkout",
+					state: "closed",
+					url: duplicate.url,
+					match: "exact_title",
+					score: 1,
+				},
+			],
+		});
+		expect(worker.captureSlackEngineeringSource).not.toHaveBeenCalled();
+	});
+
+	it("returns at most five similar open and closed candidates", async () => {
+		const duplicates = Array.from({ length: 7 }, (_, index) => ({
+			number: index + 1,
+			title: `Fix payroll export failure ${index}`,
+			body: "Payroll export fails for overtime records.",
+			state: index % 2 === 0 ? "open" : "closed",
+			url: `https://github.com/acme/api/issues/${index + 1}`,
+		}));
+		const { worker } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [duplicates],
+		});
+
+		const result = await worker.createAndStartSlackEngineering("parent", {
+			issueRepository: "acme/api",
+			title: "Fix payroll export failure",
+			summary: "Payroll export fails for overtime records.",
+		});
+
+		expect(result).toMatchObject({
+			status: "confirmation_required",
+			reason: "similar",
+			issueRepository: "acme/api",
+		});
+		expect(result.candidates).toHaveLength(5);
+		expect(new Set(result.candidates.map(({ state }: any) => state))).toEqual(
+			new Set(["open", "closed"]),
+		);
+	});
+
+	it("freshly validates, reopens, and starts a selected closed candidate", async () => {
+		const duplicate = {
+			number: 19,
+			title: "Fix checkout",
+			body: "Existing report",
+			state: "closed",
+			url: "https://github.com/acme/api/issues/19",
+		};
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[duplicate], [duplicate]],
+		});
+
+		await worker.createAndStartSlackEngineering("parent", {
+			issueRepository: "acme/api",
+			title: "Fix checkout",
+			summary: "Checkout fails.",
+			duplicateResolution: { action: "reuse_existing", issueNumber: 19 },
+		});
+
+		expect(worker.reopenSlackEngineeringIssue).toHaveBeenCalledWith(
+			"acme/api",
+			19,
+		);
+		expect(createAndStart).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({
+				existingIssue: {
+					number: 19,
+					url: duplicate.url,
+					wasClosed: true,
+				},
+			}),
+			expect.anything(),
+		);
+	});
+
+	it("creates a new issue after the user confirms a similar candidate", async () => {
+		const duplicate = {
+			number: 20,
+			title: "Fix checkout payment failure",
+			body: "Checkout fails.",
+			state: "open",
+			url: "https://github.com/acme/api/issues/20",
+		};
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[duplicate], [duplicate]],
+		});
+
+		await worker.createAndStartSlackEngineering("parent", {
+			issueRepository: "acme/api",
+			title: "Fix checkout payment errors",
+			summary: "Checkout fails.",
+			duplicateResolution: { action: "create_new", issueNumber: 20 },
+		});
+
+		expect(createAndStart.mock.calls[0]![1]).not.toHaveProperty(
+			"existingIssue",
+		);
+		expect(worker.reopenSlackEngineeringIssue).not.toHaveBeenCalled();
+	});
+
+	it("rejects a stale or forged reuse candidate before context capture", async () => {
+		const duplicate = {
+			number: 21,
+			title: "Fix checkout",
+			body: "Existing report",
+			state: "closed",
+			url: "https://github.com/acme/api/issues/21",
+		};
+		const { worker } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[duplicate]],
+		});
+
+		await expect(
+			worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+				duplicateResolution: { action: "reuse_existing", issueNumber: 999 },
+			}),
+		).rejects.toThrow("Selected duplicate issue is no longer available");
+		expect(worker.captureSlackEngineeringSource).not.toHaveBeenCalled();
+	});
+
+	it("lets a new exact open match from the second scan win over creation", async () => {
+		const duplicate = {
+			number: 22,
+			title: "Fix checkout",
+			body: "Raced into existence",
+			state: "open",
+			url: "https://github.com/acme/api/issues/22",
+		};
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[], [duplicate]],
+		});
+
+		await worker.createAndStartSlackEngineering("parent", {
+			issueRepository: "acme/api",
+			title: "Fix checkout",
+			summary: "Checkout fails.",
+		});
+
+		expect(createAndStart.mock.calls[0]![1]).toMatchObject({
+			existingIssue: { number: 22, wasClosed: false },
+		});
+	});
+
+	it("returns a new second-scan confirmation and cleans captured context", async () => {
+		const duplicate = {
+			number: 23,
+			title: "Fix checkout",
+			body: "Raced into existence",
+			state: "closed",
+			url: "https://github.com/acme/api/issues/23",
+		};
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+			issuesByScan: [[], [duplicate]],
+		});
+
+		await expect(
+			worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			}),
+		).resolves.toMatchObject({
+			status: "confirmation_required",
+			reason: "closed_exact",
+		});
+		expect(worker.cleanupSlackContextDirectories).toHaveBeenCalledWith(
+			undefined,
+			["/context/new"],
+		);
+		expect(createAndStart).not.toHaveBeenCalled();
+	});
+
+	it("fails closed before context capture when duplicate listing fails", async () => {
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker();
+		worker.listSlackEngineeringIssues.mockReset();
+		worker.listSlackEngineeringIssues.mockRejectedValue(
+			new Error("GitHub Issue duplicate check failed (503)"),
+		);
+		worker.createSlackEngineeringIssue = vi.fn();
+
+		await expect(
+			worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			}),
+		).rejects.toThrow("GitHub Issue duplicate check failed (503)");
+		expect(worker.captureSlackEngineeringSource).not.toHaveBeenCalled();
+		expect(createAndStart).not.toHaveBeenCalled();
+		expect(worker.createSlackEngineeringIssue).not.toHaveBeenCalled();
+	});
+
+	it("fails closed and cleans captured context when the second listing fails", async () => {
+		const { worker, createAndStart } = setupSlackEngineeringCreateWorker();
+		worker.listSlackEngineeringIssues.mockReset();
+		worker.listSlackEngineeringIssues
+			.mockResolvedValueOnce([])
+			.mockRejectedValueOnce(
+				new Error("GitHub Issue duplicate check failed (502)"),
+			);
+
+		await expect(
+			worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			}),
+		).rejects.toThrow("GitHub Issue duplicate check failed (502)");
+		expect(worker.cleanupSlackContextDirectories).toHaveBeenCalledWith(
+			undefined,
+			["/context/new"],
+		);
+		expect(createAndStart).not.toHaveBeenCalled();
+	});
+
+	for (const status of ["creating", "starting", "in_progress", "failed"]) {
+		it(`preserves ${status} receipt recovery for the latest verified Slack event`, async () => {
+			const currentReceipt = { status, kickoffTs: "101.0" };
+			const { worker, createAndStart } = setupSlackEngineeringCreateWorker({
+				currentReceipt,
+			});
+
+			await worker.createAndStartSlackEngineering("parent", {
+				issueRepository: "acme/api",
+				title: "Fix checkout",
+				summary: "Checkout fails.",
+			});
+
+			expect(worker.listSlackEngineeringIssues).not.toHaveBeenCalled();
+			expect(createAndStart).toHaveBeenCalledOnce();
+		});
+	}
 
 	it("removes only the new event subdirectory when a follow-up capture fails", async () => {
 		const cyrusHome = await mkdtemp(

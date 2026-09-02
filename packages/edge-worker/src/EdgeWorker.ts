@@ -204,6 +204,11 @@ import {
 import { markdownToSlackMrkdwn, SlackChatAdapter } from "./SlackChatAdapter.js";
 import { SlackConversationContextService } from "./SlackConversationContextService.js";
 import {
+	findSlackEngineeringDuplicates,
+	type SlackEngineeringDuplicateCandidate,
+	type SlackEngineeringIssueForDuplicateCheck,
+} from "./SlackEngineeringDuplicateMatcher.js";
+import {
 	SlackEngineeringOrchestrator,
 	type SlackEngineeringReceipt,
 } from "./SlackEngineeringOrchestrator.js";
@@ -237,6 +242,22 @@ type SlackEngineeringFollowupDirectoryOwnership = {
 	directoryDevice: number;
 	directoryInode: number;
 };
+
+export interface SlackEngineeringDuplicateResolution {
+	action: "reuse_existing" | "create_new";
+	issueNumber: number;
+}
+
+export interface SlackEngineeringDuplicateConfirmation {
+	status: "confirmation_required";
+	reason: "closed_exact" | "similar";
+	issueRepository: string;
+	candidates: SlackEngineeringDuplicateCandidate[];
+}
+
+export type SlackEngineeringCreateAndStartResult =
+	| SlackEngineeringReceipt
+	| SlackEngineeringDuplicateConfirmation;
 
 type GitHubIssueWorkItemSession = {
 	workItemId: string;
@@ -8340,10 +8361,14 @@ ${taskSection}`;
 			title: string;
 			summary: string;
 			targetRepositories?: string[];
+			duplicateResolution?: SlackEngineeringDuplicateResolution;
 		},
-	): Promise<SlackEngineeringReceipt> {
+	): Promise<SlackEngineeringCreateAndStartResult> {
+		let validated: ReturnType<
+			SlackEngineeringOrchestrator["validateCreateInput"]
+		>;
 		try {
-			this.slackEngineeringOrchestrator.validateCreateInput(input);
+			validated = this.slackEngineeringOrchestrator.validateCreateInput(input);
 		} catch (error) {
 			const event =
 				this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
@@ -8356,14 +8381,124 @@ ${taskSection}`;
 			});
 			throw error;
 		}
+		const issueRepository = validated.primary.fullName;
+		const event =
+			this.chatSessionHandler?.getLatestEventForSession(parentSessionId);
+		const current =
+			this.slackEngineeringOrchestrator.current?.(parentSessionId);
+		const recoveringLatestReceipt = Boolean(
+			current &&
+				event &&
+				current.kickoffTs === event.payload.ts &&
+				["creating", "starting", "in_progress", "failed"].includes(
+					current.status,
+				),
+		);
+		let selectedIssue: SlackEngineeringDuplicateCandidate | undefined;
+		if (!recoveringLatestReceipt) {
+			const firstMatch = findSlackEngineeringDuplicates(
+				{ title: input.title, summary: input.summary },
+				await this.listSlackEngineeringIssues(issueRepository),
+			);
+			if (firstMatch.exactOpen) {
+				selectedIssue = firstMatch.exactOpen;
+			} else if (firstMatch.confirmationReason) {
+				if (!input.duplicateResolution) {
+					return this.slackEngineeringDuplicateConfirmation(
+						issueRepository,
+						firstMatch.confirmationReason,
+						firstMatch.confirmationCandidates,
+					);
+				}
+				if (input.duplicateResolution.action === "reuse_existing") {
+					selectedIssue = firstMatch.confirmationCandidates.find(
+						(candidate) =>
+							candidate.number === input.duplicateResolution!.issueNumber,
+					);
+					if (!selectedIssue)
+						throw new Error("Selected duplicate issue is no longer available");
+				} else if (
+					!firstMatch.confirmationCandidates.some(
+						(candidate) =>
+							candidate.number === input.duplicateResolution!.issueNumber,
+					)
+				) {
+					throw new Error("Selected duplicate issue is no longer available");
+				}
+			} else if (input.duplicateResolution?.action === "reuse_existing") {
+				throw new Error("Selected duplicate issue is no longer available");
+			}
+		}
 		const { source, manifest } =
 			await this.captureSlackEngineeringSource(parentSessionId);
 		let receipt: SlackEngineeringReceipt;
 		try {
+			if (!recoveringLatestReceipt) {
+				const secondMatch = findSlackEngineeringDuplicates(
+					{ title: input.title, summary: input.summary },
+					await this.listSlackEngineeringIssues(issueRepository),
+				);
+				if (secondMatch.exactOpen) {
+					selectedIssue = secondMatch.exactOpen;
+				} else if (secondMatch.confirmationReason) {
+					if (input.duplicateResolution?.action === "reuse_existing") {
+						selectedIssue = secondMatch.confirmationCandidates.find(
+							(candidate) =>
+								candidate.number === input.duplicateResolution!.issueNumber,
+						);
+						if (!selectedIssue)
+							throw new Error(
+								"Selected duplicate issue is no longer available",
+							);
+					} else if (
+						input.duplicateResolution?.action !== "create_new" ||
+						!secondMatch.confirmationCandidates.some(
+							(candidate) =>
+								candidate.number === input.duplicateResolution!.issueNumber,
+						)
+					) {
+						await this.cleanupSlackContextDirectories(undefined, [
+							manifest.directory,
+						]);
+						return this.slackEngineeringDuplicateConfirmation(
+							issueRepository,
+							secondMatch.confirmationReason,
+							secondMatch.confirmationCandidates,
+						);
+					} else {
+						selectedIssue = undefined;
+					}
+				} else {
+					if (input.duplicateResolution?.action === "reuse_existing")
+						throw new Error("Selected duplicate issue is no longer available");
+					selectedIssue = undefined;
+				}
+			}
+			let existingIssue:
+				| { number: number; url: string; wasClosed: boolean }
+				| undefined;
+			if (selectedIssue) {
+				const wasClosed = selectedIssue.state === "closed";
+				const issue = wasClosed
+					? await this.reopenSlackEngineeringIssue(
+							issueRepository,
+							selectedIssue.number,
+						)
+					: { number: selectedIssue.number, url: selectedIssue.url };
+				existingIssue = { ...issue, wasClosed };
+			}
 			const initialTurn = await this.buildSlackEngineeringContextTurn(manifest);
 			receipt = await this.slackEngineeringOrchestrator.createAndStart(
 				source,
-				input,
+				{
+					issueRepository,
+					title: input.title,
+					summary: input.summary,
+					...(input.targetRepositories
+						? { targetRepositories: input.targetRepositories }
+						: {}),
+					...(existingIssue ? { existingIssue } : {}),
+				},
 				initialTurn,
 			);
 		} catch (error) {
@@ -8378,6 +8513,31 @@ ${taskSection}`;
 			this.slackEngineeringControlCapability,
 		);
 		return receipt;
+	}
+
+	private slackEngineeringDuplicateConfirmation(
+		issueRepository: string,
+		reason: "closed_exact" | "similar",
+		candidates: SlackEngineeringDuplicateCandidate[],
+	): SlackEngineeringDuplicateConfirmation {
+		this.logger.info("Slack engineering audit", {
+			decision: "duplicate_confirmation_required",
+			issueRepository,
+			reason,
+			candidateCount: candidates.length,
+			candidates: candidates.map(({ number, state, match, score }) => ({
+				number,
+				state,
+				match,
+				score,
+			})),
+		});
+		return {
+			status: "confirmation_required",
+			reason,
+			issueRepository,
+			candidates,
+		};
 	}
 
 	private async buildSlackEngineeringContextTurn(
@@ -8663,6 +8823,84 @@ ${paths.join("\n")}
 		);
 		if (!response.ok)
 			throw new Error(`GitHub Issue creation failed (${response.status})`);
+		const issue = (await response.json()) as {
+			number: number;
+			html_url: string;
+		};
+		return { number: issue.number, url: issue.html_url };
+	}
+
+	private async listSlackEngineeringIssues(
+		repository: string,
+	): Promise<SlackEngineeringIssueForDuplicateCheck[]> {
+		const token = await this.resolveGitHubTokenValue();
+		if (!token) throw new Error("GitHub authentication is unavailable");
+		const listed: SlackEngineeringIssueForDuplicateCheck[] = [];
+		let url: string | undefined =
+			`https://api.github.com/repos/${repository}/issues?state=all&per_page=100`;
+		while (url) {
+			const response = await fetch(url, {
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			});
+			if (!response.ok)
+				throw new Error(
+					`GitHub Issue duplicate check failed (${response.status})`,
+				);
+			const issues = (await response.json()) as Array<{
+				number: number;
+				title: string;
+				body?: string | null;
+				state: "open" | "closed";
+				html_url: string;
+				pull_request?: unknown;
+			}>;
+			for (const issue of issues) {
+				if (issue.pull_request) continue;
+				listed.push({
+					number: issue.number,
+					title: issue.title,
+					body: issue.body ?? "",
+					state: issue.state,
+					url: issue.html_url,
+				});
+			}
+			const next = response.headers
+				.get("link")
+				?.split(",")
+				.map((link) => link.trim())
+				.find((link) => /;\s*rel="next"$/.test(link));
+			url = next?.match(/^<([^>]+)>/)?.[1];
+		}
+		return listed;
+	}
+
+	private async reopenSlackEngineeringIssue(
+		repository: string,
+		number: number,
+	): Promise<{ number: number; url: string }> {
+		const token = await this.resolveGitHubTokenValue();
+		if (!token) throw new Error("GitHub authentication is unavailable");
+		const response = await fetch(
+			`https://api.github.com/repos/${repository}/issues/${number}`,
+			{
+				method: "PATCH",
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+					"User-Agent": "cyrus-ai",
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+				body: JSON.stringify({ state: "open" }),
+			},
+		);
+		if (!response.ok)
+			throw new Error(`GitHub Issue reopen failed (${response.status})`);
 		const issue = (await response.json()) as {
 			number: number;
 			html_url: string;
