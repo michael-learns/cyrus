@@ -340,6 +340,24 @@ describe("SlackMessageService", () => {
 			expect(error).not.toMatch(/xoxb-secret-token|private failure/);
 		});
 
+		it("does not expose a secret-shaped URL-request body error", async () => {
+			mockFetch.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: false, error: "xoxb-leaked-from-slack" }),
+			});
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toContain(
+				"[SlackMessageService] Slack API error during file upload URL request",
+			);
+			expect(error).not.toContain("xoxb-leaked-from-slack");
+		});
+
 		it.each([
 			"http://files.slack.com/upload/private-ticket",
 			"https://evil.example/upload/private-ticket",
@@ -445,8 +463,40 @@ describe("SlackMessageService", () => {
 				})
 				.catch((caught: unknown) => String(caught));
 			expect(error).toMatch(
-				/file upload completion failed|Slack API error during file upload completion: channel_not_found/,
+				/file upload completion failed|Slack API error during file upload completion/,
 			);
+		});
+
+		it("does not expose a one-time URL-shaped completion body error", async () => {
+			mockFetch
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: true,
+						file_id: "F1",
+						upload_url:
+							"https://files.slack.com/upload/F1?ticket=private-ticket",
+					}),
+				})
+				.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK" })
+				.mockResolvedValueOnce({
+					ok: true,
+					json: async () => ({
+						ok: false,
+						error: "https://files.slack.com/upload/F1?ticket=leaked-from-slack",
+					}),
+				});
+
+			const error = await service
+				.uploadFilesToThread({
+					...uploadParams,
+					files: [uploadParams.files[0]],
+				})
+				.catch((caught: unknown) => String(caught));
+			expect(error).toContain(
+				"[SlackMessageService] Slack API error during file upload completion",
+			);
+			expect(error).not.toContain("ticket=leaked-from-slack");
 		});
 	});
 

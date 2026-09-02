@@ -216,9 +216,7 @@ export class SlackMessageService {
 			);
 		}
 		if (!responseBody.ok) {
-			throw new Error(
-				`[SlackMessageService] Slack API error during ${stage}: ${responseBody.error ?? "unknown"}`,
-			);
+			throw new Error(`[SlackMessageService] Slack API error during ${stage}`);
 		}
 		return responseBody;
 	}
