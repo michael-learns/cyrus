@@ -2383,6 +2383,73 @@ File: IMG_4421.png — downloaded
 		}
 	});
 
+	it("keeps a generic-MIME PNG as a readable attachment instead of direct image input", async () => {
+		const cyrusHome = await mkdtemp(join(tmpdir(), "cyrus-slack-generic-png-"));
+		const workspace = join(cyrusHome, "slack-workspaces", "generic-png");
+		const png = Buffer.from([
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+			0x49, 0x48, 0x44, 0x52,
+		]);
+		const adapter = new SlackChatAdapter(createStaticProvider([]), undefined, {
+			cyrusHome,
+			contextFetch: vi.fn().mockResolvedValue(
+				new Response(png, {
+					headers: {
+						"content-type": "application/octet-stream",
+						"content-length": String(png.length),
+					},
+				}),
+			) as typeof fetch,
+		});
+		mockIdentity();
+		const event = mentionEvent(false);
+		event.payload.files = [
+			{
+				id: "F-GENERIC-PNG",
+				name: "screenshot.bin",
+				mimetype: "application/octet-stream",
+				url_private: "https://files.slack.com/screenshot.bin",
+			},
+		];
+		vi.spyOn(
+			SlackMessageService.prototype,
+			"fetchThreadThrough",
+		).mockResolvedValue({
+			permalink: "https://workspace.slack.com/archives/C1/p1700000000000500",
+			messages: [
+				{
+					user: "U1",
+					text: event.payload.text,
+					ts: TRIGGER_TS,
+					files: event.payload.files,
+				},
+			],
+		});
+
+		try {
+			const result = await adapter.fetchThreadTurn(event, undefined, workspace);
+			expect(result?.turn.some((part) => part.type === "local_image")).toBe(
+				false,
+			);
+			const text = result?.turn
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			const attachmentPath = join(
+				workspace,
+				"attachments",
+				"Ev2",
+				"file-001.png",
+			);
+			expect(text).toContain(
+				`File: screenshot.bin — image/png — downloaded — ${attachmentPath}`,
+			);
+			await expect(readFile(attachmentPath)).resolves.toEqual(png);
+		} finally {
+			await rm(cyrusHome, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps an image attached to the triggering follow-up without duplicating its text", async () => {
 		const cyrusHome = await mkdtemp(
 			join(tmpdir(), "cyrus-slack-followup-image-"),

@@ -731,14 +731,14 @@ Supported mrkdwn syntax:
 				if (
 					file.status !== "downloaded" ||
 					!file.localPath ||
-					!this.isAgentImageMediaType(file.mimeType)
+					!file.directImageEligible
 				)
 					continue;
 				if (text) turn.push({ type: "text", text });
 				turn.push({
 					type: "local_image",
 					path: join(directory, file.localPath),
-					mediaType: file.mimeType,
+					mediaType: file.mimeType as AgentImageMediaType,
 				});
 				text = "";
 			}
@@ -787,17 +787,6 @@ Supported mrkdwn syntax:
     <content>
 ${content.filter(Boolean).join("\n")}
     </content>`;
-	}
-
-	private isAgentImageMediaType(
-		value: string | undefined,
-	): value is AgentImageMediaType {
-		return (
-			value === "image/jpeg" ||
-			value === "image/png" ||
-			value === "image/gif" ||
-			value === "image/webp"
-		);
 	}
 
 	async postReply(

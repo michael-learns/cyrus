@@ -33,6 +33,7 @@ export interface SlackCapturedFile {
 	mimeType?: string;
 	size?: number;
 	status: "downloaded" | "skipped" | "failed";
+	directImageEligible: boolean;
 	reason?: string;
 	localPath?: string;
 }
@@ -154,6 +155,7 @@ function messageTextFootprint(message: SlackConversationMessage): number {
 				file.name.length +
 				(file.mimeType?.length ?? 0) +
 				file.status.length +
+				String(file.directImageEligible).length +
 				(file.reason?.length ?? 0) +
 				(file.localPath?.length ?? 0),
 			0,
@@ -209,6 +211,7 @@ function fitMessageToTextBudget(
 			...(file.mimeType !== undefined && { mimeType: take(file.mimeType) }),
 			...(file.size !== undefined && { size: file.size }),
 			status: file.status,
+			directImageEligible: file.directImageEligible,
 			...(file.reason !== undefined && { reason: take(file.reason) }),
 			...(file.localPath !== undefined && { localPath: take(file.localPath) }),
 		});
@@ -618,6 +621,7 @@ export class SlackConversationContextService {
 				...(file.mimetype && { mimeType: redact(file.mimetype, token) }),
 				...(typeof file.size === "number" && { size: file.size }),
 				status: "skipped" as const,
+				directImageEligible: false,
 				reason: "not_processed",
 			})),
 		};
@@ -689,6 +693,7 @@ export class SlackConversationContextService {
 			...(file.mimetype && { mimeType: redact(file.mimetype, token) }),
 			...(typeof file.size === "number" && { size: file.size }),
 			status: "skipped",
+			directImageEligible: false,
 		};
 		if (
 			hasSlackMediaSignal({
@@ -867,6 +872,7 @@ export class SlackConversationContextService {
 					...result,
 					...(effectiveMime && { mimeType: effectiveMime }),
 					status: "downloaded",
+					directImageEligible: isImage,
 					reason: undefined,
 					localPath: isImage
 						? `${imagesRelativeDirectory}/${localName}`

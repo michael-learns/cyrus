@@ -439,6 +439,57 @@ describe("SlackConversationContextService", () => {
 		]);
 	});
 
+	it("keeps a byte-detected PNG with generic declared MIME as a regular attachment", async () => {
+		fetchMock.mockResolvedValue(
+			new Response(PNG, {
+				headers: {
+					"content-type": "application/octet-stream",
+					"content-length": String(PNG.length),
+				},
+			}),
+		);
+
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1.000",
+			kickoffTs: "1.000",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			captureRoot: cyrusHome,
+			eventId: "generic-image",
+			messages: [
+				{
+					user: "U1",
+					text: "generic image",
+					ts: "1.000",
+					files: [
+						{
+							id: "F-PNG",
+							name: "image.bin",
+							mimetype: "application/octet-stream",
+							url_private: "https://files.slack.com/image.bin",
+						},
+					],
+				},
+			],
+		});
+
+		const file = result.manifest.messages[0].files[0];
+		expect(file).toEqual({
+			id: "F-PNG",
+			name: "image.bin",
+			mimeType: "image/png",
+			status: "downloaded",
+			directImageEligible: false,
+			reason: undefined,
+			localPath: "attachments/generic-image/file-001.png",
+		});
+		await expect(
+			readFile(join(result.directory, file.localPath!)),
+		).resolves.toEqual(PNG);
+	});
+
 	it("captures regular non-media files into a caller-owned safe attachment directory", async () => {
 		const files = [
 			["report.pdf", "application/pdf", Buffer.from("%PDF-1.7")],
