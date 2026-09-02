@@ -332,6 +332,113 @@ describe("SlackConversationContextService", () => {
 		);
 	});
 
+	it("keeps successive caller-owned image captures immutable by event", async () => {
+		const firstImage = Buffer.concat([PNG, Buffer.from("first")]);
+		const secondImage = Buffer.concat([PNG, Buffer.from("second")]);
+		fetchMock
+			.mockResolvedValueOnce(
+				new Response(firstImage, {
+					headers: { "content-type": "image/png" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(secondImage, {
+					headers: { "content-type": "image/png" },
+				}),
+			);
+		const captureRoot = join(cyrusHome, "slack-workspaces", "C1_1");
+		const capture = (eventId: string, ts: string) =>
+			service().capture({
+				teamId: "T1",
+				channelId: "C1",
+				threadTs: "1.000",
+				kickoffTs: ts,
+				threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+				token: "xoxb-secret",
+				captureRoot,
+				eventId,
+				messages: [
+					{
+						user: "U1",
+						text: eventId,
+						ts,
+						files: [
+							{
+								id: `F-${eventId}`,
+								name: "screen.png",
+								mimetype: "image/png",
+								url_private: `https://files.slack.com/${eventId}.png`,
+							},
+						],
+					},
+				],
+			});
+
+		const first = await capture("event-one", "1.000");
+		const firstPath = first.manifest.messages[0].files[0].localPath;
+		expect(firstPath).toBe("images/event-one/image-001.png");
+		expect(await readFile(join(captureRoot, firstPath!))).toEqual(firstImage);
+
+		const second = await capture("event-two", "2.000");
+		const secondPath = second.manifest.messages[0].files[0].localPath;
+		expect(secondPath).toBe("images/event-two/image-001.png");
+		expect(await readFile(join(captureRoot, firstPath!))).toEqual(firstImage);
+		expect(await readFile(join(captureRoot, secondPath!))).toEqual(secondImage);
+	});
+
+	it("persists trusted effective MIME for missing and inaccurate Slack metadata", async () => {
+		const pdf = Buffer.from("%PDF-1.7\n");
+		fetchMock.mockImplementation(async (url) => {
+			const missing = String(url).endsWith("notes.txt");
+			const bytes = missing ? Buffer.from("hello") : pdf;
+			return new Response(bytes, {
+				headers: {
+					"content-type": missing ? "text/plain" : "application/octet-stream",
+					"content-length": String(bytes.length),
+				},
+			});
+		});
+
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1.000",
+			kickoffTs: "1.000",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "files",
+					ts: "1.000",
+					files: [
+						{
+							id: "F-TEXT",
+							name: "notes.txt",
+							url_private: "https://files.slack.com/notes.txt",
+						},
+						{
+							id: "F-PDF",
+							name: "report.pdf",
+							mimetype: "text/plain",
+							url_private: "https://files.slack.com/report.pdf",
+						},
+					],
+				},
+			],
+		});
+
+		expect(
+			result.manifest.messages[0].files.map(({ status, mimeType }) => ({
+				status,
+				mimeType,
+			})),
+		).toEqual([
+			{ status: "downloaded", mimeType: "text/plain" },
+			{ status: "downloaded", mimeType: "application/pdf" },
+		]);
+	});
+
 	it("captures regular non-media files into a caller-owned safe attachment directory", async () => {
 		const files = [
 			["report.pdf", "application/pdf", Buffer.from("%PDF-1.7")],

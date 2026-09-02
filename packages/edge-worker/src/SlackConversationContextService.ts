@@ -472,11 +472,14 @@ export class SlackConversationContextService {
 			.slice(0, 24);
 		const directory =
 			input.captureRoot ?? join(this.cyrusHome, "slack-context", key);
-		const imagesDirectory = join(directory, "images");
 		const safeEvent =
 			redact(input.eventId ?? key, input.token)
 				.replace(/[^a-zA-Z0-9_-]+/g, "-")
 				.replace(/^-+|-+$/g, "") || "event";
+		const imagesRelativeDirectory = input.captureRoot
+			? `images/${safeEvent}`
+			: "images";
+		const imagesDirectory = join(directory, imagesRelativeDirectory);
 		const attachmentsDirectory = join(directory, "attachments", safeEvent);
 		await mkdir(imagesDirectory, { recursive: true, mode: 0o700 });
 		await mkdir(attachmentsDirectory, { recursive: true, mode: 0o700 });
@@ -499,6 +502,7 @@ export class SlackConversationContextService {
 								original,
 								input.token,
 								imagesDirectory,
+								imagesRelativeDirectory,
 								attachmentsDirectory,
 								imageCount,
 								receivedBytes,
@@ -673,6 +677,7 @@ export class SlackConversationContextService {
 		file: SlackFile,
 		token: string,
 		imagesDirectory: string,
+		imagesRelativeDirectory: string,
 		attachmentsDirectory: string,
 		imageCount: number,
 		receivedBytes: number,
@@ -847,6 +852,8 @@ export class SlackConversationContextService {
 				};
 			}
 			const isImage = declaredImage && classified.isImage;
+			const effectiveMime =
+				classified.detectedMime ?? headerMime ?? file.mimetype?.toLowerCase();
 			const localName = isImage
 				? `image-${String(imageCount + 1).padStart(3, "0")}.${SUPPORTED_SLACK_IMAGES.get(classified.detectedMime!)}`
 				: `file-${String(fileCount + 1).padStart(3, "0")}.${classified.extension.replace(/[^a-z0-9]/gi, "") || "bin"}`;
@@ -858,10 +865,11 @@ export class SlackConversationContextService {
 			return {
 				file: {
 					...result,
+					...(effectiveMime && { mimeType: effectiveMime }),
 					status: "downloaded",
 					reason: undefined,
 					localPath: isImage
-						? `images/${localName}`
+						? `${imagesRelativeDirectory}/${localName}`
 						: `attachments/${attachmentsDirectory.split("/").at(-1)}/${localName}`,
 				},
 				bytesReceived: body.bytesReceived,
