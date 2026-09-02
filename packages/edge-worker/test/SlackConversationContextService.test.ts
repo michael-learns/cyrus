@@ -981,6 +981,51 @@ describe("SlackConversationContextService", () => {
 		);
 	});
 
+	it("charges the full oversized stream chunk against the aggregate receive budget", async () => {
+		const oversizedChunk = Buffer.alloc(30 * 1024 * 1024);
+		fetchMock.mockImplementation(
+			async () =>
+				new Response(oversizedChunk, {
+					headers: { "content-type": "application/octet-stream" },
+				}),
+		);
+		const result = await service().capture({
+			teamId: "T1",
+			channelId: "C1",
+			threadTs: "1",
+			kickoffTs: "1",
+			threadPermalink: "https://workspace.slack.com/archives/C1/p1",
+			token: "xoxb-secret",
+			messages: [
+				{
+					user: "U1",
+					text: "files",
+					ts: "1",
+					files: [
+						...Array.from({ length: 3 }, (_, index) => ({
+							id: `large-${index}`,
+							name: `${index}.bin`,
+							mimetype: "application/octet-stream",
+							url_private: `https://files.slack.com/${index}`,
+						})),
+						{
+							id: "would-exceed-total",
+							name: "four.bin",
+							mimetype: "application/octet-stream",
+							size: 15 * 1024 * 1024,
+							url_private: "https://files.slack.com/four",
+						},
+					],
+				},
+			],
+		});
+
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(result.manifest.messages[0].files[3]).toEqual(
+			expect.objectContaining({ reason: "total_download_limit" }),
+		);
+	});
+
 	it("degrades unsupported, oversized, MIME-mismatched, and over-limit images honestly", async () => {
 		fetchMock.mockImplementation(
 			async () =>

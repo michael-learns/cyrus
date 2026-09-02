@@ -86,3 +86,52 @@ The suite was run with localhost-binding permission because `EgressProxy` tests 
 ## Concerns
 
 None.
+
+## Fix Round 1
+
+### Corrections
+
+- Replaced the broad ISO Base Media `ftyp` rejection with a small set of known video container brands. AVIF/HEIF-style brands are no longer classified as audio/video merely because they use ISO Base Media.
+- Added the required common media extensions: `m4v`, `3gp`, `3g2`, `aiff`, `mid`, `midi`, `mka`, `ts`, and `mts`, along with their closely related established audio/video forms.
+- Changed bounded stream accounting to record the full size of an over-limit chunk actually received, while retaining only the permitted prefix for buffer storage. The aggregate budget now blocks follow-up downloads based on actual received bytes.
+
+### RED
+
+Command:
+
+```sh
+corepack pnpm --filter cyrus-edge-worker test:run -- SlackFilePolicy SlackConversationContextService
+```
+
+Relevant output:
+
+```text
+FAIL SlackFilePolicy > does not reject an AVIF ISO Base Media file as audio or video
+Expected allowed: true; received allowed: false.
+
+FAIL SlackFilePolicy > rejects every required known audio or video extension
+Expected allowed: false; received allowed: true.
+
+FAIL SlackConversationContextService > charges the full oversized stream chunk against the aggregate receive budget
+Expected fetch mock to be called 3 times; received 4.
+```
+
+### GREEN and package verification
+
+Commands:
+
+```sh
+corepack pnpm --filter cyrus-edge-worker test:run -- SlackFilePolicy SlackConversationContextService
+corepack pnpm --filter cyrus-edge-worker typecheck
+corepack pnpm --filter cyrus-edge-worker test:run
+```
+
+Relevant output:
+
+```text
+Focused: Test Files 80 passed (80); Tests 918 passed (918)
+Typecheck: passed
+Full suite: Test Files 80 passed (80); Tests 918 passed (918)
+```
+
+The test commands ran with localhost-binding permission because the package includes EgressProxy tests that bind local ports.

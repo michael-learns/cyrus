@@ -87,6 +87,43 @@ describe("SlackFilePolicy", () => {
 		}
 	});
 
+	it("does not reject an AVIF ISO Base Media file as audio or video", async () => {
+		const avif = Buffer.from([
+			0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66,
+		]);
+		expect(
+			await classifySlackFile({
+				declaredMime: "image/avif",
+				responseMime: "image/avif",
+				name: "photo.avif",
+				bytes: avif,
+			}),
+		).toMatchObject({ allowed: true });
+	});
+
+	it("rejects every required known audio or video extension", async () => {
+		for (const extension of [
+			"m4v",
+			"3gp",
+			"3g2",
+			"aiff",
+			"mid",
+			"midi",
+			"mka",
+			"ts",
+			"mts",
+		]) {
+			expect(
+				await classifySlackFile({
+					declaredMime: "application/octet-stream",
+					responseMime: "application/octet-stream",
+					name: `attachment.${extension}`,
+					bytes: Buffer.from("ordinary bytes"),
+				}),
+			).toMatchObject({ allowed: false, reason: "media_type" });
+		}
+	});
+
 	it("identifies a supported image from its actual bytes", async () => {
 		expect(
 			await classifySlackFile({

@@ -238,10 +238,10 @@ async function readBodyWithinLimit(
 			const available = limit - bytesReceived;
 			if (chunk.length > available) {
 				if (available > 0) chunks.push(chunk.subarray(0, available));
-				bytesReceived = limit;
+				bytesReceived += chunk.length;
 				await reader.cancel().catch(() => undefined);
 				return {
-					buffer: Buffer.concat(chunks, bytesReceived),
+					buffer: Buffer.concat(chunks),
 					bytesReceived,
 					exceeded: true,
 				};

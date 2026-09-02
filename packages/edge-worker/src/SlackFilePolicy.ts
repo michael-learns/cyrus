@@ -15,22 +15,66 @@ export const SUPPORTED_SLACK_IMAGES = new Map([
 
 const MEDIA_EXTENSIONS = new Set([
 	"aac",
+	"aif",
+	"aiff",
+	"aifc",
+	"amr",
+	"asf",
 	"avi",
+	"3g2",
+	"3gp",
+	"3gpp",
+	"au",
+	"caf",
+	"f4v",
 	"flac",
+	"m2ts",
+	"m2v",
 	"m4a",
+	"m4b",
+	"m4p",
+	"m4v",
+	"mid",
+	"midi",
+	"mka",
 	"mkv",
 	"mov",
 	"mp3",
 	"mp4",
+	"mpe",
 	"mpeg",
 	"mpg",
+	"mpv",
 	"ogg",
 	"oga",
 	"ogv",
 	"opus",
+	"ra",
+	"rm",
+	"ts",
+	"mts",
+	"vob",
 	"wav",
 	"webm",
+	"wma",
 	"wmv",
+	"wv",
+]);
+
+const ISO_MEDIA_BRANDS = new Set([
+	"3gp4",
+	"3gp5",
+	"3gp6",
+	"avc1",
+	"dash",
+	"iso2",
+	"isom",
+	"M4V ",
+	"M4VH",
+	"M4VP",
+	"mp41",
+	"mp42",
+	"qt  ",
 ]);
 
 function mediaMime(value: string | undefined): boolean {
@@ -55,7 +99,8 @@ function mediaMagic(bytes: Buffer): boolean {
 		(bytes.subarray(0, 4).equals(Buffer.from("RIFF")) &&
 			bytes.subarray(8, 12).equals(Buffer.from("WAVE"))) ||
 		bytes.subarray(0, 4).equals(Buffer.from("OggS")) ||
-		bytes.subarray(4, 8).equals(Buffer.from("ftyp"))
+		(bytes.subarray(4, 8).equals(Buffer.from("ftyp")) &&
+			ISO_MEDIA_BRANDS.has(bytes.subarray(8, 12).toString("ascii")))
 	);
 }
 
