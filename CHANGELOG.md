@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Self-hosted Cyrus now loads configured SSH database connections immediately on startup instead of exposing them only after a later config-file reload.
 - PostgreSQL SSH database queries now return their SELECT output instead of being discarded by the transaction cleanup statement.
 - Slack-started engineering sessions now post when they are waiting on background work, stop orphaned background-only tasks from holding a completed session open indefinitely, and refresh GitHub authentication before reporting the final pull request.
 - Cyrus now reads issue cards, attachment-only parent messages, and screenshots whether they are attached to a new Slack mention or sent inside an existing thread, instead of reporting that the message or image was missing.

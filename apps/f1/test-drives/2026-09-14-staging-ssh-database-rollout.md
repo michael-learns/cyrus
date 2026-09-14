@@ -42,15 +42,15 @@ Result: 5 files and 29 tests passed.
 - [x] Both gateway host keys are pinned locally and match fingerprints obtained through the pre-existing authenticated admin connections.
 - [x] The gateway profile is root-owned and group-readable only by `cyrus-db`; the configured PostgreSQL executable is the root-owned versioned binary rather than Ubuntu's environment-dependent `pg_wrapper`.
 - [x] Both SSH daemons enforce public-key-only authentication, no TTY, no forwarding, and no X11 for `cyrus-db`; syntax and admin access were verified after reload.
-- [ ] Cyrus has `databaseConnections` configured. The nine connections still need to be added.
+- [x] Cyrus has nine schema-valid `databaseConnections`, all scoped to Slack team `T0ATUR70Y3C` and channel `C0BQ6FETXH6`.
 
 ### Database privilege gate
 
-The exact Cyrus privilege preflight currently rejects all nine target databases. The discovered causes include database `TEMP` inherited from `PUBLIC`, tables with `PUBLIC UPDATE`, user routines with `PUBLIC EXECUTE`, and `PUBLIC CREATE` on some `public` schemas. The reader roles can also connect to databases outside the stated allowlist because those databases grant `PUBLIC CONNECT`.
+The first exact Cyrus privilege preflight rejected all nine target databases. The discovered causes included database `TEMP` inherited from `PUBLIC`, tables with `PUBLIC UPDATE`, user routines with `PUBLIC EXECUTE`, and `PUBLIC CREATE` on some `public` schemas. The reader roles could also connect to databases outside the stated allowlist because those databases granted `PUBLIC CONNECT`.
 
 The metadata-only impact review found one non-superuser login on YTO (`yto_viewer`) and no non-superuser application login on YBO. No application sessions were active during the change. `yto_viewer` received explicit equivalents of its inherited privileges before `PUBLIC` access was removed. The readers now connect only to their declared databases.
 
-All nine target databases pass Cyrus's unchanged privilege preflight and a real forced-key identity query. The verified identities are `cyrus_yto_staging_reader` on `staging_db4` through `staging_db7` and `cyrus_ybo_staging_reader` on `staging_db` through `staging_db5`. A real attempted `UPDATE` was rejected locally as `QUERY_REJECTED` before SSH.
+All nine target databases pass Cyrus's unchanged privilege preflight and a real forced-key identity query. The verified identities are `cyrus_yto_staging_reader` on `staging_db4` through `staging_db7` and `cyrus_ybo_staging_reader` on `staging_db` through `staging_db5`. A final cluster-wide check found that PostgreSQL's template databases still inherited `PUBLIC CONNECT`; that access was removed on both staging clusters. The resulting effective `CONNECT` set is exactly four YTO and five YBO application databases, with every other database denied. Each target database also reports no `CREATE` privilege on `public` and no effective table-write privilege for its Cyrus reader. A real attempted `UPDATE` was rejected locally as `QUERY_REJECTED` before SSH.
 
 ### Real-host defect found and fixed
 
@@ -64,12 +64,22 @@ the patched commit was signed, pushed, built, and activated on both gateways.
 
 ### Activation gate
 
-A schema-valid candidate containing all nine channel/repository-scoped
-`databaseConnections` is stored in the dated local backup directory. It has not
-replaced the live config. The Slack app-management browser was not authenticated,
-so the bot token previously exposed during process inspection still requires
-rotation before the candidate config is activated and PM2 is restarted.
+The old Slack OAuth tokens were revoked, the app was reinstalled with its
+existing scopes, and the replacement bot token passed Slack `auth.test` for
+team `T0ATUR70Y3C`. The nine-connection candidate replaced the live config,
+passed `EdgeConfigSchema`, and retains mode `0600`. PM2 was restarted once with
+the updated environment, saved, and remains online on Cyrus `0.2.68`.
+
+After Cyrus was added to `C0BQ6FETXH6`, the first approved-channel smoke found
+that a clean CLI startup dropped `databaseConnections` while assembling the
+initial `EdgeWorkerConfig`. The existing hot-reload path handled the field, but
+the CLI's startup path did not, so the Slack session correctly failed closed and
+registered no database tools. A CLI regression test reproduced the omission,
+then `WorkerService` was updated to pass the parsed connections into the worker.
+The regression test, all package tests, typecheck, build, and the selected
+29-test F1 run passed. The metadata-only Slack smoke must be repeated after the
+fixed CLI is committed, pushed, and restarted.
 
 ## Verdict
 
-**PASS for implementation, synthetic F1, gateway runtime, SSH hardening, database scope, and all nine forced-key identity queries. Activation remains blocked only on Slack bot-token rotation, live config installation, PM2 restart, and the approved-channel Slack smoke.**
+**PASS for implementation, synthetic F1, gateway runtime, SSH hardening, exact database scope, all nine forced-key identity queries, Slack token rotation, live config installation, and PM2 activation. The first approved-channel smoke found and regression-tested a clean-start configuration bug; the only remaining acceptance check is repeating that smoke after deploying the fix.**
