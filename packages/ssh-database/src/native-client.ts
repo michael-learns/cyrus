@@ -31,7 +31,10 @@ export function buildNativeClientInvocation(
 		);
 	}
 	if (input.engine === "postgres") {
-		const batch = `BEGIN READ ONLY;\nSET LOCAL statement_timeout = '${input.queryTimeoutMs}ms';\n${input.boundedSql};\nROLLBACK;`;
+		// Keep the SELECT as the final statement because psql only prints the
+		// final result from one --command batch. Closing the connection with the
+		// read-only transaction still open makes PostgreSQL roll it back.
+		const batch = `BEGIN READ ONLY;\nSET LOCAL statement_timeout = '${input.queryTimeoutMs}ms';\n${input.boundedSql};`;
 		return {
 			file: input.executable,
 			args: [

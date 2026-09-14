@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildNativeClientInvocation } from "../src/index.js";
 
 describe("native database client invocation", () => {
-	it("builds a fixed no-startup-file PostgreSQL command and read-only batch", () => {
+	it("keeps the PostgreSQL SELECT last so psql returns its rows", () => {
 		const invocation = buildNativeClientInvocation({
 			engine: "postgres",
 			executable: "/usr/bin/psql",
@@ -27,7 +27,7 @@ describe("native database client invocation", () => {
 				"--port=5432",
 				"--username=cyrus_payroll_ro",
 				"--dbname=payroll",
-				"--command=BEGIN READ ONLY;\nSET LOCAL statement_timeout = '15000ms';\nSELECT * FROM (SELECT id FROM employees) AS cyrus_bounded LIMIT 101;\nROLLBACK;",
+				"--command=BEGIN READ ONLY;\nSET LOCAL statement_timeout = '15000ms';\nSELECT * FROM (SELECT id FROM employees) AS cyrus_bounded LIMIT 101;",
 			],
 			env: {
 				LANG: "C.UTF-8",

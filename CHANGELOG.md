@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- PostgreSQL SSH database queries now return their SELECT output instead of being discarded by the transaction cleanup statement.
 - Slack-started engineering sessions now post when they are waiting on background work, stop orphaned background-only tasks from holding a completed session open indefinitely, and refresh GitHub authentication before reporting the final pull request.
 - Cyrus now reads issue cards, attachment-only parent messages, and screenshots whether they are attached to a new Slack mention or sent inside an existing thread, instead of reporting that the message or image was missing.
 - Direct Slack mentions now start Cyrus reliably even when Slack delivers the ordinary message event before the app-mention event. ([#3](https://github.com/michael-learns/cyrus/pull/3))
