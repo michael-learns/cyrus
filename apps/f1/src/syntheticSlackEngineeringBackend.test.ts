@@ -260,9 +260,12 @@ describe("SyntheticSlackEngineeringBackend", () => {
 					method: "POST",
 					headers: {
 						...(authorization && { Authorization: authorization }),
-						"Content-Type": "application/json",
+						"Content-Type": "application/x-www-form-urlencoded",
 					},
-					body: JSON.stringify({ filename: "forbidden.csv", length: 7 }),
+					body: new URLSearchParams({
+						filename: "forbidden.csv",
+						length: "7",
+					}).toString(),
 				},
 			);
 			expect(response.status).toBe(401);
@@ -278,9 +281,12 @@ describe("SyntheticSlackEngineeringBackend", () => {
 				method: "POST",
 				headers: {
 					Authorization: "Bearer xoxb-f1-synthetic",
-					"Content-Type": "application/json",
+					"Content-Type": "application/x-www-form-urlencoded",
 				},
-				body: JSON.stringify({ filename: "result.csv", length: 7 }),
+				body: new URLSearchParams({
+					filename: "result.csv",
+					length: "7",
+				}).toString(),
 			},
 		);
 		const ticket = (await ticketResponse.json()) as {
@@ -325,13 +331,13 @@ describe("SyntheticSlackEngineeringBackend", () => {
 				method: "POST",
 				headers: {
 					Authorization: "Bearer xoxb-f1-synthetic",
-					"Content-Type": "application/json",
+					"Content-Type": "application/x-www-form-urlencoded",
 				},
-				body: JSON.stringify({
-					files: [{ id: ticket.file_id, title: "Result" }],
+				body: new URLSearchParams({
+					files: JSON.stringify([{ id: ticket.file_id, title: "Result" }]),
 					channel_id: "C_ORIGINAL",
 					thread_ts: "100.1",
-				}),
+				}).toString(),
 			},
 		);
 		expect(await completion.json()).toEqual({ ok: true });

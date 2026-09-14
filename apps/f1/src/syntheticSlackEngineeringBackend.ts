@@ -49,6 +49,10 @@ function requestHeader(
 	return new Headers(init?.headers).get(name);
 }
 
+function slackFormBody(init: RequestInit | undefined): URLSearchParams {
+	return new URLSearchParams(String(init?.body ?? ""));
+}
+
 export class SyntheticSlackEngineeringBackend {
 	readonly threads = new Map<string, SlackThreadMessage[]>();
 	readonly files = new Map<string, { bytes: Buffer; mimeType: string }>();
@@ -154,15 +158,14 @@ export class SyntheticSlackEngineeringBackend {
 			if (url.pathname === "/api/files.getUploadURLExternal") {
 				if (requestHeader(init, "Authorization") !== "Bearer xoxb-f1-synthetic")
 					return json({ ok: false, error: "not_authed" }, 401);
-				const body = JSON.parse(String(init?.body ?? "{}")) as {
-					filename?: string;
-					length?: number;
-				};
+				const body = slackFormBody(init);
+				const filename = body.get("filename") ?? undefined;
+				const length = Number(body.get("length"));
 				if (
 					method !== "POST" ||
-					!body.filename ||
-					!Number.isSafeInteger(body.length) ||
-					(body.length ?? -1) < 0
+					!filename ||
+					!Number.isSafeInteger(length) ||
+					length < 0
 				)
 					return json({ ok: false, error: "invalid_arguments" });
 				const id = `F_F1_UPLOAD_${this.nextUploadId}`;
@@ -170,8 +173,8 @@ export class SyntheticSlackEngineeringBackend {
 				this.nextUploadId += 1;
 				this.uploadTickets.set(ticket, {
 					id,
-					filename: body.filename,
-					length: body.length!,
+					filename,
+					length,
 				});
 				return json({
 					ok: true,
@@ -182,20 +185,17 @@ export class SyntheticSlackEngineeringBackend {
 			if (url.pathname === "/api/files.completeUploadExternal") {
 				if (requestHeader(init, "Authorization") !== "Bearer xoxb-f1-synthetic")
 					return json({ ok: false, error: "not_authed" }, 401);
-				const body = JSON.parse(String(init?.body ?? "{}")) as {
-					files?: Array<{ id: string; title: string }>;
-					channel_id?: string;
-					thread_ts?: string;
-					initial_comment?: string;
-				};
-				if (
-					method !== "POST" ||
-					!body.channel_id ||
-					!body.thread_ts ||
-					!body.files?.length
-				)
+				const body = slackFormBody(init);
+				const files = JSON.parse(body.get("files") ?? "[]") as Array<{
+					id: string;
+					title: string;
+				}>;
+				const channelId = body.get("channel_id") ?? undefined;
+				const threadTs = body.get("thread_ts") ?? undefined;
+				const initialComment = body.get("initial_comment") ?? undefined;
+				if (method !== "POST" || !channelId || !threadTs || !files.length)
 					return json({ ok: false, error: "invalid_arguments" });
-				const completed = body.files.map(({ id, title }) => {
+				const completed = files.map(({ id, title }) => {
 					const file = this.uploadedFiles.get(id);
 					if (!file) throw new Error(`synthetic upload ${id} is incomplete`);
 					return {
@@ -206,10 +206,10 @@ export class SyntheticSlackEngineeringBackend {
 					};
 				});
 				this.fileDeliveries.push({
-					channelId: body.channel_id,
-					threadTs: body.thread_ts,
-					...(body.initial_comment !== undefined && {
-						initialComment: body.initial_comment,
+					channelId,
+					threadTs,
+					...(initialComment !== undefined && {
+						initialComment,
 					}),
 					files: completed,
 				});

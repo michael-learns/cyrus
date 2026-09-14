@@ -8,6 +8,10 @@ This changelog documents internal development changes, refactors, tooling update
 
 - Added typed GitHub `issues` webhook intake for issue creation and lifecycle updates, including setup support for subscribing Cyrus GitHub Apps to the event. ([#1](https://github.com/michael-learns/cyrus/pull/1))
 
+### Fixed
+
+- Updated the synthetic Slack F1 backend to accept the same URL-encoded external-upload requests used by the production Slack transport.
+
 ## [0.2.68] - 2026-08-05
 
 ### Added
