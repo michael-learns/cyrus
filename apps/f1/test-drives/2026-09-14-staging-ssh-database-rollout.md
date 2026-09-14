@@ -77,9 +77,19 @@ the CLI's startup path did not, so the Slack session correctly failed closed and
 registered no database tools. A CLI regression test reproduced the omission,
 then `WorkerService` was updated to pass the parsed connections into the worker.
 The regression test, all package tests, typecheck, build, and the selected
-29-test F1 run passed. The metadata-only Slack smoke must be repeated after the
-fixed CLI is committed, pushed, and restarted.
+29-test F1 run passed. Commit
+`332814eec819b885351b1877d5c8839e37dd71da` was pushed directly to `main`, the
+CLI was rebuilt, and PM2 was restarted with the fixed startup path.
+
+The repeated approved-channel smoke passed. Cyrus listed exactly nine
+connections and returned one database/reader-role identity from each target:
+four YTO databases as `cyrus_yto_staging_reader` and five YBO databases as
+`cyrus_ybo_staging_reader`. The metadata-only audit recorded one successful
+`database_connections_list` with `connectionCount: 9` and nine successful
+`database_query` events with `rowCount: 1` and `truncated: false`. SQL variants
+that did not satisfy the local bounded-query policy were rejected before SSH;
+Cyrus corrected the query and completed every connection successfully.
 
 ## Verdict
 
-**PASS for implementation, synthetic F1, gateway runtime, SSH hardening, exact database scope, all nine forced-key identity queries, Slack token rotation, live config installation, and PM2 activation. The first approved-channel smoke found and regression-tested a clean-start configuration bug; the only remaining acceptance check is repeating that smoke after deploying the fix.**
+**PASS. Implementation, synthetic F1, gateway runtime, SSH hardening, exact database scope, all nine forced-key identity queries, Slack token rotation, live config installation, clean-start propagation, PM2 activation, and the approved-channel Slack smoke are complete.**
