@@ -956,6 +956,83 @@ Never copy connection IDs, SQL text, raw rows, or sensitive database values into
 		expect(worker.slackWorkItemEvents.has("work-item-17")).toBe(false);
 	});
 
+	it("posts pending background work to each delegated Slack thread", async () => {
+		const event = { payload: { channel: "C1", ts: "1", user: "U1" } };
+		const pendingWork = {
+			sessionCrons: [],
+			backgroundTasks: [
+				{
+					id: "task-1",
+					type: "shell",
+					status: "running",
+					description: "Run verification",
+				},
+			],
+		};
+		const postPendingStatus = vi.fn().mockResolvedValue(undefined);
+		const updateActivityStatus = vi.fn().mockResolvedValue(undefined);
+		worker.slackChatAdapter = { postPendingStatus, updateActivityStatus };
+		worker.slackWorkItemEvents = new Map([
+			["work-item-17", new Map([["slack-session-1", event]])],
+		]);
+		worker.agentSessionManager.getSession = vi.fn().mockReturnValue({
+			agentRunner: { getPendingWork: vi.fn().mockReturnValue(pendingWork) },
+		});
+		worker.updateSlackWorkItemActivity =
+			EdgeWorker.prototype.updateSlackWorkItemActivity;
+
+		await worker.updateSlackWorkItemActivity(
+			{ workItemId: "work-item-17", sessionId: "github-session-17" },
+			{ type: "result", subtype: "success", result: "done" },
+		);
+
+		expect(postPendingStatus).toHaveBeenCalledWith(event, pendingWork);
+		expect(updateActivityStatus).not.toHaveBeenCalled();
+	});
+
+	it("refreshes GitHub authentication before terminal PR discovery", async () => {
+		worker.runGitHubIssueWorkItem = EdgeWorker.prototype.runGitHubIssueWorkItem;
+		runner.start = vi.fn().mockResolvedValue(undefined);
+		worker.resolveGitHubTokenValue = vi.fn().mockResolvedValue("fresh-token");
+		worker.findGitHubIssuePullRequests = vi
+			.fn()
+			.mockResolvedValue(["https://github.com/cyrusagents/cyrus/pull/18"]);
+		worker.gitHubCommentService = { postIssueComment: vi.fn() };
+		worker.finishSlackWorkItem = vi.fn().mockResolvedValue(undefined);
+		worker.slackEngineeringOrchestrator = {
+			setStatus: vi.fn(),
+			byWorkItem: vi.fn().mockReturnValue(undefined),
+		};
+		const workItem: any = {
+			workItemId: "work-item-17",
+			sessionId: "github-issue-work-item-17",
+			repository,
+			repositories: [repository],
+			repositoryFullName: "cyrusagents/cyrus",
+			issueNumber: 17,
+			prUrls: [],
+			runnerType: "claude",
+			issue: { id: "42", identifier: "GH-cyrus-17", title: "Fix" },
+			status: "starting",
+		};
+		worker.gitHubIssueWorkItemSessions.set(workItem.workItemId, workItem);
+
+		await worker.runGitHubIssueWorkItem(
+			workItem,
+			runner,
+			"implement issue 17",
+			"startup-token",
+		);
+
+		expect(worker.findGitHubIssuePullRequests).toHaveBeenCalledWith(
+			workItem,
+			"fresh-token",
+		);
+		expect(worker.gitHubCommentService.postIssueComment).toHaveBeenCalledWith(
+			expect.objectContaining({ token: "fresh-token" }),
+		);
+	});
+
 	it("never persists a raw provider summary after database access", () => {
 		runner.getMessages.mockReturnValue([
 			{

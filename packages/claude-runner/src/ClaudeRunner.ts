@@ -120,6 +120,8 @@ const SUPPORTED_LOCAL_IMAGE_MEDIA_TYPES = new Set([
 	"image/webp",
 ]);
 
+const DEFAULT_PENDING_BACKGROUND_TASK_TIMEOUT_MS = 15 * 60 * 1000;
+
 function buildSanitizedQueryOptions(
 	queryOptions: Parameters<typeof query>[0],
 ): SanitizedQueryOptions {
@@ -294,6 +296,8 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	private keepSessionWarm: boolean;
 	private pendingSessionCrons: SessionCronSummary[] = [];
 	private pendingBackgroundTasks: BackgroundTaskSummary[] = [];
+	private pendingBackgroundTaskTimeout: ReturnType<typeof setTimeout> | null =
+		null;
 	private temporaryImageDirectoryLeases = new Map<string, Set<symbol>>();
 
 	constructor(config: ClaudeRunnerConfig, keepSessionWarm = false) {
@@ -583,6 +587,7 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	 * Complete the streaming prompt (no more messages will be added)
 	 */
 	completeStream(): void {
+		this.clearPendingBackgroundTaskTimeout();
 		if (this.streamingPrompt) {
 			this.streamingPrompt.complete();
 		}
@@ -1000,7 +1005,9 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 							backgroundTaskCount: this.pendingBackgroundTasks.length,
 							claudeSessionId: this.sessionInfo?.sessionId,
 						});
+						this.armPendingBackgroundTaskTimeout();
 					} else {
+						this.clearPendingBackgroundTaskTimeout();
 						this.streamingPrompt.complete();
 					}
 				}
@@ -1190,6 +1197,35 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 		);
 	}
 
+	private armPendingBackgroundTaskTimeout(): void {
+		if (
+			this.keepSessionWarm ||
+			this.pendingSessionCrons.length > 0 ||
+			this.pendingBackgroundTasks.length === 0 ||
+			this.pendingBackgroundTaskTimeout
+		) {
+			return;
+		}
+		const timeoutMs =
+			this.config.pendingBackgroundTaskTimeoutMs ??
+			DEFAULT_PENDING_BACKGROUND_TASK_TIMEOUT_MS;
+		this.pendingBackgroundTaskTimeout = setTimeout(() => {
+			this.pendingBackgroundTaskTimeout = null;
+			this.logger.event("pending_background_work_timed_out", {
+				backgroundTaskCount: this.pendingBackgroundTasks.length,
+				timeoutMs,
+				claudeSessionId: this.sessionInfo?.sessionId,
+			});
+			this.streamingPrompt?.complete();
+		}, timeoutMs);
+	}
+
+	private clearPendingBackgroundTaskTimeout(): void {
+		if (!this.pendingBackgroundTaskTimeout) return;
+		clearTimeout(this.pendingBackgroundTaskTimeout);
+		this.pendingBackgroundTaskTimeout = null;
+	}
+
 	/**
 	 * Merge the caller-provided hooks with an internal Stop hook that records
 	 * the SDK's pending-work snapshot (`session_crons` + `background_tasks`).
@@ -1211,6 +1247,9 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 					const stopInput = input as StopHookInput;
 					this.pendingSessionCrons = stopInput.session_crons ?? [];
 					this.pendingBackgroundTasks = stopInput.background_tasks ?? [];
+					if (this.pendingBackgroundTasks.length === 0) {
+						this.clearPendingBackgroundTaskTimeout();
+					}
 					if (this.hasPendingWork()) {
 						this.logger.event("pending_work_recorded", {
 							sessionCronCount: this.pendingSessionCrons.length,
@@ -1233,6 +1272,7 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 	 * Stop the current Claude session
 	 */
 	stop(): void {
+		this.clearPendingBackgroundTaskTimeout();
 		if (this.abortController) {
 			this.logger.event("session_stop_requested", {
 				claudeSessionId: this.sessionInfo?.sessionId,

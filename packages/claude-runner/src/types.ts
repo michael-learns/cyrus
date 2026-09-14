@@ -47,6 +47,12 @@ export interface ClaudeRunnerConfig {
 	model?: string; // Claude model to use (e.g., "opus", "sonnet", "haiku")
 	fallbackModel?: string; // Fallback model if primary model is unavailable
 	maxTurns?: number; // Maximum number of turns before completing the session
+	/**
+	 * Maximum time a cold session may remain open solely for SDK-tracked
+	 * background tasks after the model has returned a successful result.
+	 * Scheduled wakeups are not bounded by this timer.
+	 */
+	pendingBackgroundTaskTimeoutMs?: number;
 	tools?: string[]; // Built-in tools available in model context (empty array disables all tools)
 	cyrusHome: string; // Cyrus home directory
 	logger?: ILogger; // Optional logger instance

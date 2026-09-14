@@ -307,6 +307,51 @@ describe("ClaudeRunner pending-work lifecycle (CYPACK-1310)", () => {
 		await sessionPromise;
 	});
 
+	it("bounds background-only pending work so a lost task cannot hold the session forever", async () => {
+		vi.useFakeTimers();
+		try {
+			const state = installMockQuery(mockQuery);
+			const runner = new ClaudeRunner(
+				{
+					...defaultConfig,
+					pendingBackgroundTaskTimeoutMs: 100,
+				} as ClaudeRunnerConfig,
+				false,
+			);
+			const firstResult = waitForMessageCount(runner, 2);
+			const sessionPromise = runner.startStreaming("run a background command");
+			await vi.waitFor(() => {
+				expect(state.queryOptions).not.toBeNull();
+			});
+
+			await state.endTurnWithWork(
+				{
+					backgroundTasks: [
+						{
+							id: "lost-task",
+							type: "shell",
+							status: "running",
+							description: "Search the whole home directory",
+							command: "find /Users/example",
+						},
+					],
+				},
+				"implementation complete",
+			);
+			await firstResult;
+			expect(runner.isRunning()).toBe(true);
+
+			await vi.advanceTimersByTimeAsync(100);
+			const runningAfterGracePeriod = runner.isRunning();
+			if (runningAfterGracePeriod) runner.completeStream();
+			await sessionPromise;
+
+			expect(runningAfterGracePeriod).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps warm-mode behavior unchanged (stream stays open regardless)", async () => {
 		const state = installMockQuery(mockQuery);
 		const runner = new ClaudeRunner(defaultConfig, true);

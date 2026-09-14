@@ -320,6 +320,7 @@ export class EdgeWorker extends EventEmitter {
 		string,
 		Map<string, SlackWebhookEvent>
 	>();
+	private slackPendingWorkSnapshots = new Map<string, string>();
 	private slackRuntimeTokens = new Map<string, string>();
 	private slackDeliveryReplays = new Map<string, Promise<void>>();
 	private slackDeliveryRetryTimers = new Map<
@@ -1667,6 +1668,34 @@ export class EdgeWorker extends EventEmitter {
 	): Promise<void> {
 		const events = this.slackWorkItemEvents?.get(workItem.workItemId);
 		if (!events || !this.slackChatAdapter) return;
+		if (message.type === "result") {
+			const pendingWork = this.agentSessionManager
+				.getSession(workItem.sessionId)
+				?.agentRunner?.getPendingWork?.();
+			if (
+				pendingWork &&
+				(pendingWork.sessionCrons.length > 0 ||
+					pendingWork.backgroundTasks.length > 0)
+			) {
+				const snapshot = JSON.stringify({
+					sessionCrons: pendingWork.sessionCrons.map((item) => item.id),
+					backgroundTasks: pendingWork.backgroundTasks.map((item) => item.id),
+				});
+				this.slackPendingWorkSnapshots ??= new Map();
+				if (
+					this.slackPendingWorkSnapshots.get(workItem.workItemId) === snapshot
+				)
+					return;
+				this.slackPendingWorkSnapshots.set(workItem.workItemId, snapshot);
+				await Promise.allSettled(
+					Array.from(events.values()).map((event) =>
+						this.slackChatAdapter!.postPendingStatus(event, pendingWork),
+					),
+				);
+				return;
+			}
+			this.slackPendingWorkSnapshots?.delete(workItem.workItemId);
+		}
 		await Promise.allSettled(
 			Array.from(events.values()).map((event) =>
 				this.slackChatAdapter!.updateActivityStatus(event, message),
@@ -1751,6 +1780,7 @@ export class EdgeWorker extends EventEmitter {
 			);
 		}
 		this.slackWorkItemEvents?.delete(workItem.workItemId);
+		this.slackPendingWorkSnapshots?.delete(workItem.workItemId);
 		await this.savePersistedState();
 	}
 
@@ -2694,7 +2724,11 @@ export class EdgeWorker extends EventEmitter {
 			} else {
 				await runner.start(prompt);
 			}
-			const prUrls = await this.findGitHubIssuePullRequests(workItem, token);
+			const completionToken = (await this.resolveGitHubTokenValue()) ?? token;
+			const prUrls = await this.findGitHubIssuePullRequests(
+				workItem,
+				completionToken,
+			);
 			if (
 				workItem.status === "stopped" ||
 				!this.gitHubIssueWorkItemSessions.has(workItem.workItemId)
@@ -2716,7 +2750,7 @@ export class EdgeWorker extends EventEmitter {
 				return;
 			}
 			await this.gitHubCommentService.postIssueComment({
-				token,
+				token: completionToken,
 				owner: workItem.repositoryFullName.split("/")[0]!,
 				repo: workItem.repositoryFullName.split("/")[1]!,
 				issueNumber: workItem.issueNumber,
