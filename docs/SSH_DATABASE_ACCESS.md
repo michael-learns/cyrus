@@ -195,7 +195,7 @@ PostgreSQL example `/etc/cyrus/database-gateway.json`:
       "port": 5432,
       "user": "cyrus_payroll_reader",
       "expectedRole": "cyrus_payroll_reader",
-      "executable": "/usr/bin/psql",
+      "executable": "/usr/lib/postgresql/14/bin/psql",
       "credentialsFile": "/etc/cyrus/payroll.pgpass",
       "limits": {
         "queryTimeoutMs": 15000,
@@ -232,15 +232,22 @@ MySQL profile entry:
 Install it with:
 
 ```sh
-sudo install -o root -g root -m 0600 database-gateway.json /etc/cyrus/database-gateway.json
-sudo chown root:root /usr/local/bin/cyrus /usr/bin/psql /usr/bin/mysql
-sudo chmod go-w /usr/local/bin/cyrus /usr/bin/psql /usr/bin/mysql
+sudo install -o root -g cyrus-db -m 0640 database-gateway.json /etc/cyrus/database-gateway.json
+sudo chown root:root /usr/local/bin/cyrus /usr/lib/postgresql/14/bin/psql /usr/bin/mysql
+sudo chmod go-w /usr/local/bin/cyrus /usr/lib/postgresql/14/bin/psql /usr/bin/mysql
 ```
 
 The loader requires the profile file to be root-owned and not group/other
-writable. It requires the native client to be root-owned and not group/other
-writable. The credentials file must be owned by the gateway process user and
-have no group/other permissions.
+writable; the forced-command user must also be able to read it, so a dedicated
+`cyrus-db` group and mode `0640` are appropriate. It requires the native client
+to be root-owned and not group/other writable. The credentials file must be
+owned by the gateway process user and have no group/other permissions.
+
+On Debian and Ubuntu, point `executable` at the versioned PostgreSQL client
+reported by `pg_config --bindir` (for example,
+`/usr/lib/postgresql/14/bin/psql`). Do not use `/usr/bin/psql`: that path is the
+`pg_wrapper` helper, which depends on environment lookup that Cyrus deliberately
+removes when launching the database client.
 
 ## 5. Install one forced SSH key per connection
 
