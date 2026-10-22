@@ -112,9 +112,35 @@ describe("RunnerConfigBuilder.buildChatConfig", () => {
 					"/repos/two",
 				],
 				denyRead: ["~/"],
-				allowWrite: ["/var/cyrus/slack-workspaces/C1_1700"],
+				allowWrite: [
+					"/var/cyrus/slack-workspaces/C1_1700",
+					"/repos/one",
+					"/repos/two",
+				],
 			},
 		});
+	});
+
+	it("grants write access to configured clones so chat sessions can pull", () => {
+		const builder = makeBuilder(() => ({}), undefined, ["Bash(git -C * pull)"]);
+		const config = builder.buildChatConfig({
+			workspacePath: "/tmp/slack-workspace",
+			workspaceName: undefined,
+			systemPrompt: "test",
+			sessionId: "sess-1",
+			cyrusHome: "/tmp/cyrus-home-test",
+			platformName: "slack",
+			repositoryPaths: ["/repos/one", "/repos/two"],
+			logger: silentLogger,
+			onMessage: () => {},
+			onError: () => {},
+		});
+
+		expect(config.sandbox.filesystem?.allowWrite).toEqual([
+			"/tmp/slack-workspace",
+			"/repos/one",
+			"/repos/two",
+		]);
 	});
 
 	it("enables the mandatory sandbox even when no egress proxy is configured", () => {

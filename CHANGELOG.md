@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Slack chats can now pull the latest changes into a configured repository when asked. Cyrus was permitted to run the command but blocked from writing to the repository folder, so the update always failed.
+
 ### Added
 
 - Slack-started engineering now checks every GitHub issue in the selected repository before creating one, automatically reuses exact open matches, and asks before reusing closed or similar issues.

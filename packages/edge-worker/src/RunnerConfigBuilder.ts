@@ -289,7 +289,11 @@ export class RunnerConfigBuilder {
 				...input.sandboxSettings?.filesystem,
 				allowRead: readableDirectories,
 				denyRead: ["~/"],
-				allowWrite: [input.workspacePath],
+				// Clone paths are writable so chat sessions can refresh them in
+				// place (`git -C <repo> pull`). The tool allowlist already permits
+				// that command; without a matching OS-level write grant the pull
+				// fails on a sandbox denial instead.
+				allowWrite: [input.workspacePath, ...repositoryPaths],
 			},
 		};
 
