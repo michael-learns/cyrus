@@ -1289,6 +1289,7 @@ export class EdgeWorker extends EventEmitter {
 				getPlatformMcpConfigOverrides: () => this.config.slackMcpConfigs,
 				getSandboxSettings: () => this.sdkSandboxSettings ?? undefined,
 				getEgressCaCertPath: () => this.egressCaCertPath ?? undefined,
+				resolveGitHubToken: () => this.resolveGitHubTokenValue(),
 				resolveSkillsConfig: async ({ repository, repositoryPaths }) => {
 					const plugins = await this.skillsPluginResolver.resolve();
 					const skills = await this.skillsPluginResolver.discoverSkillNames(

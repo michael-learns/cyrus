@@ -172,6 +172,12 @@ export interface ChatSessionHandlerDeps {
 	getSandboxSettings?: () => SandboxSettings | undefined;
 	/** Live CA bundle used by sandboxed chat subprocesses. */
 	getEgressCaCertPath?: () => string | undefined;
+	/**
+	 * Mint a short-lived GitHub token for the chat session. Chat sandboxes can
+	 * only reach github.com over HTTPS, so git needs a token rather than the
+	 * operator's SSH key.
+	 */
+	resolveGitHubToken?: () => Promise<string | undefined>;
 	/** Resolve managed skill plugins and scoped skill names for a chat session. */
 	resolveSkillsConfig?: (input: {
 		repository?: RepositoryConfig;
@@ -1202,6 +1208,17 @@ export class ChatSessionHandler<TEvent> {
 		const skillsConfig = this.deps.resolveSkillsConfig
 			? await this.deps.resolveSkillsConfig({ repository, repositoryPaths })
 			: {};
+		// A failure here must not sink the session: without a token git simply
+		// cannot reach github.com, which is no worse than before.
+		let githubToken: string | undefined;
+		try {
+			githubToken = await this.deps.resolveGitHubToken?.();
+		} catch (error) {
+			sessionLogger.warn(
+				"Failed to resolve a GitHub token for this chat session; git operations against github.com will not authenticate",
+				error instanceof Error ? error : new Error(String(error)),
+			);
+		}
 
 		return this.deps.runnerConfigBuilder.buildChatConfig({
 			workspacePath,
@@ -1217,6 +1234,7 @@ export class ChatSessionHandler<TEvent> {
 			platformMcpConfigOverrides: this.deps.getPlatformMcpConfigOverrides?.(),
 			sandboxSettings: this.deps.getSandboxSettings?.(),
 			egressCaCertPath: this.deps.getEgressCaCertPath?.(),
+			githubToken,
 			plugins: skillsConfig.plugins,
 			skills: skillsConfig.skills,
 			logger: sessionLogger,

@@ -1,4 +1,6 @@
 import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
 	HookCallbackMatcher,
@@ -23,6 +25,66 @@ import { buildPrMarkerHook } from "./hooks/PrMarkerHook.js";
 import { appendBrowserUseAddendum } from "./prompts/browserUsePromptAddendum.js";
 import { appendCloudRuntimeAddendum } from "./prompts/cloudRuntimePromptAddendum.js";
 import { appendFailureModeAddendum } from "./prompts/failureModePromptAddendum.js";
+
+/**
+ * Global Git config files that exist on this host.
+ *
+ * Git reads these on every invocation. Chat sandboxes deny the home directory
+ * wholesale, so without naming them explicitly every `git` call dies with
+ * "unable to access '~/.gitconfig': Operation not permitted" before it runs.
+ * Only existing paths are returned — the sandbox has no use for a path that
+ * isn't there.
+ */
+export function globalGitConfigPaths(): string[] {
+	const home = homedir();
+	return [
+		join(home, ".gitconfig"),
+		join(home, ".config", "git", "config"),
+	].filter((path) => existsSync(path));
+}
+
+/**
+ * Hosts a chat session must reach to run git and the GitHub CLI.
+ *
+ * The sandbox prompts before any outbound connection, and a headless session
+ * has nobody to answer, so an unlisted host is denied outright
+ * ("deny network-outbound github.com:443 (user denied)"). Listing these
+ * pre-approves them; every other host keeps the existing behaviour.
+ */
+const GITHUB_ALLOWED_DOMAINS = [
+	"github.com",
+	"api.github.com",
+	"codeload.github.com",
+	"objects.githubusercontent.com",
+] as const;
+
+/**
+ * Environment that lets a sandboxed chat session reach github.com.
+ *
+ * The sandbox proxy carries HTTPS but refuses SSH ("This proxy requires
+ * authentication"), so `git@github.com:` remotes can never connect. Rather
+ * than rewrite the operator's clones, this rewrites those URLs to HTTPS for
+ * the session only and supplies the short-lived token through a credential
+ * helper, so the token is never written to any repository's config.
+ */
+function buildGitHubHttpsEnvironment(token: string): Record<string, string> {
+	return {
+		CYRUS_GITHUB_TOKEN: token,
+		GIT_CONFIG_COUNT: "4",
+		// Clear inherited helpers first. On macOS the osxkeychain helper is
+		// configured system-wide and cannot reach the keychain from inside the
+		// sandbox, so it prints "failed to store: -60008" on every call.
+		GIT_CONFIG_KEY_0: "credential.helper",
+		GIT_CONFIG_VALUE_0: "",
+		GIT_CONFIG_KEY_1: "url.https://github.com/.insteadOf",
+		GIT_CONFIG_VALUE_1: "git@github.com:",
+		GIT_CONFIG_KEY_2: "url.https://github.com/.insteadOf",
+		GIT_CONFIG_VALUE_2: "ssh://git@github.com/",
+		GIT_CONFIG_KEY_3: "credential.https://github.com.helper",
+		GIT_CONFIG_VALUE_3:
+			'!f() { echo username=x-access-token; echo "password=$CYRUS_GITHUB_TOKEN"; }; f',
+	};
+}
 
 /**
  * Subset of McpConfigService consumed by RunnerConfigBuilder.
@@ -91,6 +153,12 @@ export interface ChatRunnerConfigInput {
 	sandboxSettings?: SandboxSettings;
 	/** CA bundle used by subprocesses routed through the egress proxy. */
 	egressCaCertPath?: string;
+	/**
+	 * Short-lived GitHub token used to reach github.com over HTTPS from inside
+	 * the chat sandbox. The sandbox proxy carries HTTPS but refuses SSH, so
+	 * `git@github.com:` remotes are rewritten to HTTPS for the session.
+	 */
+	githubToken?: string;
 	/**
 	 * Filesystem paths to custom-integration `.mcp.json` files to load for
 	 * this chat session (sourced from `EdgeWorkerConfig.slackMcpConfigs` for
@@ -278,6 +346,10 @@ export class RunnerConfigBuilder {
 			input.workspacePath,
 			autoMemoryDirectory,
 			...repositoryPaths,
+			// Git reads the global config on every invocation; denyRead("~/")
+			// otherwise makes every git command fail with "Operation not
+			// permitted" before it does any work.
+			...globalGitConfigPaths(),
 		];
 		const sandbox: SandboxSettings = {
 			...input.sandboxSettings,
@@ -285,6 +357,15 @@ export class RunnerConfigBuilder {
 			failIfUnavailable: true,
 			autoAllowBashIfSandboxed: true,
 			allowUnsandboxedCommands: false,
+			network: {
+				...input.sandboxSettings?.network,
+				allowedDomains: [
+					...new Set([
+						...(input.sandboxSettings?.network?.allowedDomains ?? []),
+						...GITHUB_ALLOWED_DOMAINS,
+					]),
+				],
+			},
 			filesystem: {
 				...input.sandboxSettings?.filesystem,
 				allowRead: readableDirectories,
@@ -297,6 +378,17 @@ export class RunnerConfigBuilder {
 			},
 		};
 
+		const chatEnv: Record<string, string> = {
+			...(input.egressCaCertPath
+				? this.buildEgressEnvironment(input.egressCaCertPath)
+				: {}),
+			...(input.githubToken
+				? buildGitHubHttpsEnvironment(input.githubToken)
+				: {}),
+		};
+		const chatAdditionalEnv =
+			Object.keys(chatEnv).length > 0 ? chatEnv : undefined;
+
 		const config: AgentRunnerConfig & { sandbox: SandboxSettings } = {
 			workingDirectory: input.workspacePath,
 			allowedTools,
@@ -306,9 +398,7 @@ export class RunnerConfigBuilder {
 			cyrusHome: input.cyrusHome,
 			autoMemoryDirectory,
 			sandbox,
-			...(input.egressCaCertPath && {
-				additionalEnv: this.buildEgressEnvironment(input.egressCaCertPath),
-			}),
+			...(chatAdditionalEnv && { additionalEnv: chatAdditionalEnv }),
 			appendSystemPrompt: appendCloudRuntimeAddendum(
 				appendBrowserUseAddendum(appendFailureModeAddendum(input.systemPrompt)),
 			),
