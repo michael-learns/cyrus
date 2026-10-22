@@ -760,6 +760,9 @@
 				"type": "string"
 			}
 		},
+		"slackAppendPrompt": {
+			"type": "string"
+		},
 		"linearMcpConfigs": {
 			"type": "array",
 			"items": {

@@ -244,6 +244,8 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.githubAllowedTools || this.config.githubAllowedTools,
 				slackMcpConfigs:
 					parsedConfig.slackMcpConfigs || this.config.slackMcpConfigs,
+				slackAppendPrompt:
+					parsedConfig.slackAppendPrompt || this.config.slackAppendPrompt,
 				linearMcpConfigs:
 					parsedConfig.linearMcpConfigs || this.config.linearMcpConfigs,
 				githubMcpConfigs:
@@ -370,6 +372,7 @@ export class ConfigManager extends EventEmitter {
 			"slackAllowedTools",
 			"githubAllowedTools",
 			"slackMcpConfigs",
+			"slackAppendPrompt",
 			"linearMcpConfigs",
 			"githubMcpConfigs",
 			"databaseConnections",

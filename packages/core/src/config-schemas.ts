@@ -514,6 +514,21 @@ export const EdgeConfigSchema = z.object({
 	slackMcpConfigs: z.array(z.string()).optional(),
 
 	/**
+	 * Operator-defined policy appended to the Slack chat system prompt.
+	 *
+	 * Tool permissions control what a chat session can *do*; they cannot
+	 * express how it should answer. A scoped bot (e.g. one serving a
+	 * client-facing workspace) often needs to narrow what it will say —
+	 * "never output code or infrastructure detail", say — while still
+	 * reading repositories to work out an answer.
+	 *
+	 * Appended last, after the adapter's capability description, and marked
+	 * as server-side configuration so message content cannot lift it. When
+	 * omitted the system prompt is unchanged.
+	 */
+	slackAppendPrompt: z.string().optional(),
+
+	/**
 	 * Filesystem paths to custom-integration MCP config JSON files for
 	 * Linear-triggered agent sessions. NOT a blanket override — this list
 	 * is only consulted when the routed repo does NOT have its own

@@ -18,6 +18,7 @@ import type {
 import { createLogger, SensitiveToolMessageFilter } from "cyrus-core";
 import { AgentSessionManager } from "./AgentSessionManager.js";
 import type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
+import { appendOperatorPolicyAddendum } from "./prompts/operatorPolicyPromptAddendum.js";
 import type { RunnerConfigBuilder } from "./RunnerConfigBuilder.js";
 
 /**
@@ -168,6 +169,12 @@ export interface ChatSessionHandlerDeps {
 	 * no custom files load (native MCP servers still run as usual).
 	 */
 	getPlatformMcpConfigOverrides?: () => readonly string[] | undefined;
+	/**
+	 * Live read of the operator policy appended to this platform's chat
+	 * system prompt (e.g. `config.slackAppendPrompt` for Slack). Applied
+	 * last so it takes precedence over the adapter's capability description.
+	 */
+	getOperatorPolicy?: () => string | undefined;
 	/** Live egress settings to merge into the mandatory chat sandbox. */
 	getSandboxSettings?: () => SandboxSettings | undefined;
 	/** Live CA bundle used by sandboxed chat subprocesses. */
@@ -449,7 +456,7 @@ export class ChatSessionHandler<TEvent> {
 			}
 
 			// Build the system prompt
-			const systemPrompt = this.adapter.buildSystemPrompt(event);
+			const systemPrompt = this.buildSystemPromptWithPolicy(event);
 			// Make the verified platform event available while MCP callbacks are
 			// assembled; Slack-only tools must be gated before the runner connects.
 			this.enqueueReply(sessionId, event);
@@ -826,7 +833,7 @@ export class ChatSessionHandler<TEvent> {
 		resumeSessionId: string,
 		taskInstructions: string,
 	): Promise<void> {
-		const systemPrompt = this.adapter.buildSystemPrompt(event);
+		const systemPrompt = this.buildSystemPromptWithPolicy(event);
 		this.enqueueReply(sessionId, event);
 
 		const runnerConfig = await this.buildRunnerConfig(
@@ -1150,6 +1157,22 @@ export class ChatSessionHandler<TEvent> {
 			`Discarding ${queue.length} pending ${this.adapter.platformName} reply event(s) for session ${sessionId} after runner error`,
 		);
 		this.pendingReplyEvents.delete(sessionId);
+	}
+
+	/**
+	 * Build the chat system prompt, appending the operator policy when one is
+	 * configured.
+	 *
+	 * The adapter's prompt describes every capability the runtime can offer.
+	 * An operator running a scoped bot needs to constrain what it says on top
+	 * of what tool permissions already constrain it from doing, so the policy
+	 * is appended last.
+	 */
+	private buildSystemPromptWithPolicy(event: TEvent): string {
+		return appendOperatorPolicyAddendum(
+			this.adapter.buildSystemPrompt(event),
+			this.deps.getOperatorPolicy?.(),
+		);
 	}
 
 	/**
