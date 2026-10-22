@@ -1287,6 +1287,7 @@ export class EdgeWorker extends EventEmitter {
 				// Live read so hot-reloaded config (`setConfig`) picks up new
 				// per-platform MCP paths without rebuilding the handler.
 				getPlatformMcpConfigOverrides: () => this.config.slackMcpConfigs,
+				getOperatorPolicy: () => this.config.slackAppendPrompt,
 				getSandboxSettings: () => this.sdkSandboxSettings ?? undefined,
 				getEgressCaCertPath: () => this.egressCaCertPath ?? undefined,
 				resolveSkillsConfig: async ({ repository, repositoryPaths }) => {

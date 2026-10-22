@@ -438,11 +438,19 @@ The agent automatically moves issues to the "started" state when assigned. Linea
 
 9. **Adding a new top-level `EdgeWorkerConfig` field**: Adding a property to the `EdgeWorkerConfig` Zod schema in `packages/core/src/config-schemas.ts` is **not enough** to make it available at runtime. `ConfigManager.loadConfigSafely()` in `packages/edge-worker/src/ConfigManager.ts` reads `config.json`, then explicitly merges a **hardcoded whitelist** of fields onto its in-memory config — every field not on that list is silently dropped on each reload. Likewise, `detectGlobalConfigChanges()` only fires a `configChanged` event when one of a hardcoded list of keys differs from the previous reload.
 
-   When you add a new top-level field you **must update both lists**:
+   There is also a **third** whitelist upstream of both, in the CLI:
+   `WorkerService.buildEdgeWorkerConfig()` in `apps/cli/src/services/WorkerService.ts`
+   constructs the `EdgeWorkerConfig` handed to `EdgeWorker` by enumerating
+   fields explicitly (`slackAllowedTools: edgeConfig.slackAllowedTools`, etc.).
+   A field missing there never reaches `EdgeWorker` at all, so the two
+   `ConfigManager` lists below never get a chance to matter.
+
+   When you add a new top-level field you **must update all three lists**:
+   - The explicit field copy in `WorkerService.buildEdgeWorkerConfig()` — add `<newField>: edgeConfig.<newField>`.
    - The merge in `loadConfigSafely()` (around line ~200) — add `<newField>: parsedConfig.<newField> || this.config.<newField>`.
    - The `globalKeys` array in `detectGlobalConfigChanges()` — add the field name so changes to it trigger downstream `setConfig` calls on dependent services (e.g., `ToolPermissionResolver`).
 
-   Symptom of forgetting this: the field appears in `~/.cyrus/config.json`, the cyrus process is restarted, but downstream code keeps seeing the default (or never picks up hot-reloads). This bit us with `slackAllowedTools` / `githubAllowedTools` / `slackMcpConfigs` / `linearMcpConfigs` / `githubMcpConfigs` during CYHOST-967.
+   Symptom of forgetting this: the field appears in `~/.cyrus/config.json`, the cyrus process is restarted, but downstream code keeps seeing the default (or never picks up hot-reloads). This bit us with `slackAllowedTools` / `githubAllowedTools` / `slackMcpConfigs` / `linearMcpConfigs` / `githubMcpConfigs` during CYHOST-967, and again with `slackAppendPrompt`, which was registered in both `ConfigManager` lists but omitted from `WorkerService` — the config parsed, the process started healthy, and the field was silently `undefined` at every use site with no error anywhere.
 
 10. **Changing the `cyrus-tools` MCP server's exposed tools**: When you add or remove a tool from the inline `cyrus-tools` MCP server (the one served by `apps/proxy` / wired up in `McpConfigService.buildMcpConfig`), you **must also update the catalog `cyrus-hosted` keeps for the `/settings/tools` UI**. cyrus-hosted maintains a per-server tool list so its grid can render a row per tool (with the right per-platform toggle) without having to introspect a live MCP server. Today that catalog lives in `apps/app/src/lib/cyrus-config/builder.ts` under the `KNOWN_MCP_TOOLS` map (look for the `"mcp__cyrus-tools"` key); update that array in the same PR — the same constants are also imported by the platform-default lists in `packages/core/src/allowed-tools-defaults.ts` when a particular `cyrus-tools` tool is enabled by default, so reflect that there too if the new tool should be on out of the box.
 

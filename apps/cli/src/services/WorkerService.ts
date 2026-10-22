@@ -206,6 +206,7 @@ export class WorkerService {
 			slackAllowedTools: edgeConfig.slackAllowedTools,
 			githubAllowedTools: edgeConfig.githubAllowedTools,
 			slackMcpConfigs: edgeConfig.slackMcpConfigs,
+			slackAppendPrompt: edgeConfig.slackAppendPrompt,
 			linearMcpConfigs: edgeConfig.linearMcpConfigs,
 			githubMcpConfigs: edgeConfig.githubMcpConfigs,
 			databaseConnections: edgeConfig.databaseConnections,

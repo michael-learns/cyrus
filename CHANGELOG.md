@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Self-hosted deployments can now set a house policy for Slack replies. A new `slackAppendPrompt` setting is added to the end of the Slack system prompt, so an operator running a client-facing bot can tell it what it may and may not say — for example to answer feature and how-to questions without revealing code or infrastructure — while still letting it read the configured repositories to work out an answer. Deployments that do not set it are unaffected.
+
+### Added
+
 - Slack-started engineering now checks every GitHub issue in the selected repository before creating one, automatically reuses exact open matches, and asks before reusing closed or similar issues.
 - Slack conversations can now securely read non-audio/video attachments, create files in an isolated thread workspace, and return validated files to the original Slack thread.
 - Self-hosted Cyrus can now use operator-configured, strictly read-only PostgreSQL or MySQL connections from approved Slack channels and Slack-started engineering work. Access is routed by channel and repository through a restricted SSH gateway, with bounded queries, pinned host keys, privilege checks, sensitive-payload redaction, and no general SSH capability.
