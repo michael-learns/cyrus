@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Slack chats can now pull the latest changes into a configured repository when asked. Four separate restrictions were blocking it: the repository folder was read-only to the chat session, the global Git settings file could not be read, SSH connections are refused inside the sandbox, and GitHub was not on the network allow-list. Repositories whose remote uses SSH are now reached over HTTPS using Cyrus's own GitHub credentials for the duration of the session — the repository's own settings are left untouched.
+
 ### Added
 
 - Slack-started engineering now checks every GitHub issue in the selected repository before creating one, automatically reuses exact open matches, and asks before reusing closed or similar issues.
